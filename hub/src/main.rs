@@ -1,8 +1,12 @@
 //! term-hub
 //!
-//! HTTPS frontend + WebAuthn-gated WS proxy to one or more agents.
-//! TLS certs via Let's Encrypt (TLS-ALPN-01) using rustls-acme.
+//! HTTPS frontend + WebAuthn-gated WS proxy that fans tabs out to
+//! agents over their persistent reverse-tunnel connections. TLS certs
+//! via Let's Encrypt (TLS-ALPN-01) using rustls-acme; the same cert
+//! resolver is shared with the agent listener so renewals propagate
+//! to both endpoints.
 
+mod agent_link;
 mod api_routes;
 mod auth;
 mod config;
@@ -25,7 +29,7 @@ use tracing::{error, info};
 use webauthn_rs::prelude::Url;
 use webauthn_rs::WebauthnBuilder;
 
-use config::HubConfig;
+use config::{HubConfig, TlsMode};
 use state::AppState;
 use term_common::creds;
 
@@ -43,11 +47,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("create data_dir {}", cfg.data_dir.display()))?;
     std::fs::create_dir_all(creds::acme_cache_path(&cfg.data_dir))
         .with_context(|| "create acme cache dir")?;
-
     let secret = creds::load_or_create_secret(&cfg.data_dir).context("load/create secret.key")?;
 
-    // Build a default rustls crypto provider exactly once (rustls 0.23+
-    // requires this; rustls-acme's default-features pulls aws-lc-rs).
+    // Default rustls crypto provider (rustls 0.23+ requires installation).
     let _ = rustls_acme::futures_rustls::rustls::crypto::aws_lc_rs::default_provider()
         .install_default();
 
@@ -62,8 +64,6 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(cfg);
     let app_state = AppState::new(cfg.clone(), secret, webauthn);
 
-    // Find static dir at runtime: env override, else $exe_dir/static, else
-    // ./hub/static (dev).
     let static_dir = resolve_static_dir();
     info!("serving static assets from {}", static_dir.display());
 
@@ -77,15 +77,16 @@ async fn main() -> Result<()> {
         .route("/ws/term/{machine_id}",    get(proxy::term_ws))
         .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true))
         .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
-    let bind: SocketAddr = cfg
+    let browser_bind: SocketAddr = cfg
         .effective_bind()
         .parse()
         .with_context(|| format!("parse bind {}", cfg.effective_bind()))?;
+
     match cfg.tls {
-        config::TlsMode::Acme => serve_acme(bind, cfg, app).await,
-        config::TlsMode::Off => serve_plain(bind, cfg, app).await,
+        TlsMode::Acme => serve_acme(app_state, cfg, browser_bind, app).await,
+        TlsMode::Off  => serve_plain(app_state, cfg, browser_bind, app).await,
     }
 }
 
@@ -93,15 +94,21 @@ fn load_config() -> Result<HubConfig> {
     let path = std::env::var("TERM_HUB_CONFIG").unwrap_or_else(|_| "/etc/term-hub/hub.toml".into());
     let s = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
     let cfg: HubConfig = toml::from_str(&s).with_context(|| format!("parse {path}"))?;
+
     if !cfg.domain.ends_with(&cfg.rp_id) && cfg.rp_id != cfg.domain {
-        anyhow::bail!(
-            "rp_id ({}) must be a suffix of domain ({})",
-            cfg.rp_id,
-            cfg.domain
-        );
+        anyhow::bail!("rp_id ({}) must be a suffix of domain ({})", cfg.rp_id, cfg.domain);
     }
-    if matches!(cfg.tls, config::TlsMode::Acme) && cfg.acme_email.is_none() {
+    if matches!(cfg.tls, TlsMode::Acme) && cfg.acme_email.is_none() {
         anyhow::bail!("tls = \"acme\" requires acme_email");
+    }
+    // Validate per-machine config up front.
+    for m in &cfg.machines {
+        if !config::is_valid_machine_id(&m.id) {
+            anyhow::bail!("invalid machine id {:?} ([A-Za-z0-9_-]{{1,32}})", m.id);
+        }
+        if m.psk.trim().is_empty() {
+            anyhow::bail!("machine {} missing psk", m.id);
+        }
     }
     Ok(cfg)
 }
@@ -113,58 +120,86 @@ fn resolve_static_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let candidate = parent.join("static");
-            if candidate.is_dir() {
-                return candidate;
-            }
+            if candidate.is_dir() { return candidate; }
         }
     }
     PathBuf::from("hub/static")
 }
 
-async fn serve_acme(bind: SocketAddr, cfg: Arc<HubConfig>, app: Router) -> Result<()> {
+async fn serve_acme(
+    state: AppState,
+    cfg: Arc<HubConfig>,
+    browser_bind: SocketAddr,
+    app: Router,
+) -> Result<()> {
     let cache = DirCache::new(creds::acme_cache_path(&cfg.data_dir));
-    let email = cfg
-        .acme_email
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("acme_email required"))?;
-    let mut state = AcmeConfig::new([cfg.domain.clone()])
+    let email = cfg.acme_email.clone().ok_or_else(|| anyhow::anyhow!("acme_email required"))?;
+    let mut acme_state = AcmeConfig::new([cfg.domain.clone()])
         .contact_push(format!("mailto:{}", email))
         .cache(cache)
         .directory_lets_encrypt(cfg.acme_production)
         .state();
-    let acceptor = state.axum_acceptor(state.default_rustls_config());
+    let rustls_config = acme_state.default_rustls_config();
+    let browser_acceptor = acme_state.axum_acceptor(rustls_config.clone());
 
+    // Drive ACME state machine in the background.
     tokio::spawn(async move {
         loop {
-            match state.next().await {
-                Some(Ok(ev)) => info!("acme event: {ev:?}"),
-                Some(Err(e)) => error!("acme error: {e:?}"),
-                None => break,
+            match acme_state.next().await {
+                Some(Ok(ev))  => info!("acme event: {ev:?}"),
+                Some(Err(e))  => error!("acme error: {e:?}"),
+                None          => break,
             }
         }
     });
 
+    // Agent listener over TLS using the same rustls config.
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(rustls_config);
+    let agent_state = state.clone();
+    let agent_cfg = cfg.clone();
+    tokio::spawn(async move {
+        if let Err(e) = agent_link::run_acceptor(agent_state, agent_cfg, Some(tls_acceptor)).await {
+            error!("agent acceptor exited: {e:?}");
+        }
+    });
+
     info!(
-        "term-hub listening on https://{} (acme {} for {})",
-        bind,
+        "term-hub listening on https://{} (acme {} for {}); agent_bind={}",
+        browser_bind,
         if cfg.acme_production { "PROD" } else { "STAGING" },
-        cfg.domain
+        cfg.domain,
+        cfg.agent_bind,
     );
-    axum_server::bind(bind)
-        .acceptor(acceptor)
+    axum_server::bind(browser_bind)
+        .acceptor(browser_acceptor)
         .serve(app.into_make_service())
         .await
         .context("axum_server")
 }
 
-async fn serve_plain(bind: SocketAddr, cfg: Arc<HubConfig>, app: Router) -> Result<()> {
+async fn serve_plain(
+    state: AppState,
+    cfg: Arc<HubConfig>,
+    browser_bind: SocketAddr,
+    app: Router,
+) -> Result<()> {
     info!(
-        "term-hub listening on http://{} (TLS OFF; assume reverse proxy at https://{})",
-        bind, cfg.domain
+        "term-hub listening on http://{} (TLS OFF; assume reverse proxy at https://{}); agent_bind={}",
+        browser_bind, cfg.domain, cfg.agent_bind,
     );
-    let listener = tokio::net::TcpListener::bind(bind)
+
+    // Agent listener over plain TCP.
+    let agent_state = state.clone();
+    let agent_cfg = cfg.clone();
+    tokio::spawn(async move {
+        if let Err(e) = agent_link::run_acceptor(agent_state, agent_cfg, None).await {
+            error!("agent acceptor exited: {e:?}");
+        }
+    });
+
+    let listener = tokio::net::TcpListener::bind(browser_bind)
         .await
-        .with_context(|| format!("bind {}", bind))?;
+        .with_context(|| format!("bind {}", browser_bind))?;
     axum::serve(listener, app.into_make_service())
         .await
         .context("axum::serve")

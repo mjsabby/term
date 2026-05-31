@@ -9,10 +9,11 @@ use serde::Deserialize;
 #[serde(rename_all = "lowercase")]
 pub enum TlsMode {
     /// Terminate TLS in the hub via Let's Encrypt (TLS-ALPN-01).
+    /// Same ACME-managed cert is reused for the agent listener.
     #[default]
     Acme,
-    /// Serve plain HTTP. ONLY for local development or behind a
-    /// reverse proxy that terminates TLS.
+    /// Serve plain HTTP (and plain TCP for agents). ONLY for local
+    /// development or behind a reverse proxy that terminates TLS.
     Off,
 }
 
@@ -20,9 +21,8 @@ pub enum TlsMode {
 pub struct HubConfig {
     /// Public DNS name. Used by ACME and as the WebAuthn origin host.
     pub domain: String,
-    /// WebAuthn RP id. Usually the eTLD+1 (e.g. "xyz.com") so credentials
-    /// can be reused across siblings. Must be a registrable suffix of
-    /// `domain`.
+    /// WebAuthn RP id. Usually the eTLD+1 (e.g. "xyz.com"). Must be a
+    /// registrable suffix of `domain`.
     pub rp_id: String,
     /// Human-readable RP name shown in the authenticator UI.
     #[serde(default = "default_rp_name")]
@@ -41,44 +41,55 @@ pub struct HubConfig {
     /// Where credentials.json, secret.key, and the ACME cache live.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// Bind address. Default "[::]:443" for ACME, "[::]:8080" for off.
+    /// Browser-facing bind. Default `[::]:443` (acme) / `[::]:8080` (off).
     #[serde(default)]
     pub bind: Option<String>,
+    /// Agent-facing bind. Default `[::]:7700`. TLS (same cert) when
+    /// `tls = "acme"`, plain TCP when `tls = "off"`.
+    #[serde(default = "default_agent_bind")]
+    pub agent_bind: String,
 
     /// Machines the hub knows about. Each entry produces a row in the UI.
+    /// Agents identify themselves by `id` + `psk` in the Hello frame.
     #[serde(default)]
     pub machines: Vec<MachineConfig>,
 }
 
-fn default_rp_name() -> String {
-    "term".into()
-}
-fn default_data_dir() -> PathBuf {
-    PathBuf::from("/var/lib/term-hub")
-}
+fn default_rp_name() -> String { "term".into() }
+fn default_data_dir() -> PathBuf { PathBuf::from("/var/lib/term-hub") }
+fn default_agent_bind() -> String { "[::]:7700".into() }
 
 impl HubConfig {
-    pub fn origin(&self) -> String {
-        format!("https://{}", self.domain)
-    }
+    pub fn origin(&self) -> String { format!("https://{}", self.domain) }
     pub fn effective_bind(&self) -> String {
-        if let Some(b) = &self.bind {
-            return b.clone();
-        }
+        if let Some(b) = &self.bind { return b.clone(); }
         match self.tls {
             TlsMode::Acme => "[::]:443".into(),
-            TlsMode::Off => "[::]:8080".into(),
+            TlsMode::Off  => "[::]:8080".into(),
         }
     }
 }
 
 #[derive(Debug, Deserialize, Clone, serde::Serialize)]
 pub struct MachineConfig {
-    /// Short id used in URLs and the URL fragment (e.g. "alpha").
-    /// Must match `[A-Za-z0-9_-]{1,32}`.
+    /// Short id used in URLs, in the URL fragment, and in the agent's
+    /// Hello frame. `[A-Za-z0-9_-]{1,32}`.
     pub id: String,
     /// Human-readable label shown in the sidebar.
     pub label: String,
-    /// `host:port` of the agent's TCP listener.
-    pub address: String,
+    /// Pre-shared key the agent must present in its Hello frame.
+    /// 32 random bytes, base64-encoded (44 chars with padding, 43
+    /// without). Generate per agent with:
+    ///   `head -c 32 /dev/urandom | base64`
+    /// Not serialised back out via the /api/machines response.
+    #[serde(skip_serializing)]
+    pub psk: String,
+}
+
+/// Validate that machine id matches `[A-Za-z0-9_-]{1,32}` so we can
+/// safely embed it in URLs and the URL fragment.
+pub fn is_valid_machine_id(s: &str) -> bool {
+    let n = s.len();
+    if n == 0 || n > 32 { return false; }
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }

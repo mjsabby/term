@@ -371,6 +371,7 @@ function openTab(machineId, sessionId, activate) {
   const tab = {
     machineId, sessionId, term, fit, paneEl, tabEl, statusEl: status,
     ws: null, dataDisposable: null, resizeDisposable: null,
+    closing: false, reconnectAttempt: 0, reconnectTimer: 0,
   };
   tabs.push(tab);
   writeFragment(tabs);
@@ -390,19 +391,29 @@ function openTab(machineId, sessionId, activate) {
 }
 
 function connectTab(tab) {
+  if (tab.closing) return;
+  if (tab.reconnectTimer) { clearTimeout(tab.reconnectTimer); tab.reconnectTimer = 0; }
+
   const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term/${encodeURIComponent(tab.machineId)}`;
-  const ws = new WebSocket(wsUrl, ['bearer.' + token]);
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl, ['bearer.' + token]);
+  } catch (e) {
+    setStatus(tab, 'error');
+    scheduleReconnect(tab);
+    return;
+  }
   ws.binaryType = 'arraybuffer';
   tab.ws = ws;
   setStatus(tab, 'connecting');
 
   ws.addEventListener('open', () => {
+    tab.reconnectAttempt = 0;
     setStatus(tab, 'ok');
-    // First frame: Open(session_id).
+    // First frame: Open(session_id) — tmux on the agent reattaches the
+    // session by this id so scrollback is preserved across reconnects.
     ws.send(encodeOpen(tab.sessionId));
-    // Then send initial size (fit will recompute lazily after activation).
     sendResizeIfReady(tab);
-    // Hook xterm input -> data frames.
     tab.dataDisposable = tab.term.onData((str) => {
       if (ws.readyState !== WebSocket.OPEN) return;
       ws.send(encodeData(new TextEncoder().encode(str)));
@@ -419,14 +430,32 @@ function connectTab(tab) {
     if (f.type === FRAME_DATA) {
       tab.term.write(f.payload);
     }
-    // Hub never sends resize/open to browser; ignore everything else.
+    // Other frame types coming from hub are not currently used in this
+    // direction; ignore.
   });
   ws.addEventListener('close', () => {
-    setStatus(tab, 'error');
-    if (tab.dataDisposable) { tab.dataDisposable.dispose(); tab.dataDisposable = null; }
+    if (tab.dataDisposable)   { tab.dataDisposable.dispose();   tab.dataDisposable = null; }
     if (tab.resizeDisposable) { tab.resizeDisposable.dispose(); tab.resizeDisposable = null; }
+    tab.ws = null;
+    if (!tab.closing) {
+      setStatus(tab, 'connecting');
+      scheduleReconnect(tab);
+    }
   });
-  ws.addEventListener('error', () => setStatus(tab, 'error'));
+  ws.addEventListener('error', () => {
+    // The close event will follow and do the reconnect.
+    setStatus(tab, 'error');
+  });
+}
+
+function scheduleReconnect(tab) {
+  if (tab.closing) return;
+  tab.reconnectAttempt = (tab.reconnectAttempt || 0) + 1;
+  // 500ms, 1s, 2s, 4s, 8s, 16s, capped at 30s; with jitter to avoid
+  // thundering-herd when many tabs reconnect at once.
+  const base = Math.min(500 * Math.pow(2, tab.reconnectAttempt - 1), 30_000);
+  const delay = Math.floor(base * (0.7 + Math.random() * 0.6));
+  tab.reconnectTimer = setTimeout(() => connectTab(tab), delay);
 }
 
 function sendResizeIfReady(tab) {
@@ -459,6 +488,8 @@ function activateTab(idx) {
 
 function closeTab(tab, persist) {
   const idx = tabs.indexOf(tab); if (idx < 0) return;
+  tab.closing = true;
+  if (tab.reconnectTimer) { clearTimeout(tab.reconnectTimer); tab.reconnectTimer = 0; }
   try { tab.ws && tab.ws.close(); } catch (_) {}
   try { tab.term.dispose(); } catch (_) {}
   try { tab.paneEl.remove(); } catch (_) {}

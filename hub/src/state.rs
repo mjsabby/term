@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use webauthn_rs::prelude::*;
 use webauthn_rs::Webauthn;
 
+use crate::agent_link::AgentLink;
 use crate::config::HubConfig;
 
 /// Bearer-token lifetime (no refresh; user re-auths via passkey).
@@ -26,6 +27,11 @@ pub struct AppStateInner {
     pub webauthn: Webauthn,
     pub pending_logins: Mutex<HashMap<String, PendingLogin>>,
     pub sessions: Mutex<HashMap<String, Session>>,
+    /// Currently-connected agents, keyed by `machine_id`. Replaced atomically
+    /// on reconnect: if an agent reconnects while a previous link is still
+    /// "alive" from the hub's view, the new link takes over and the old
+    /// streams are dropped.
+    pub agents: Mutex<HashMap<String, Arc<AgentLink>>>,
 }
 
 pub struct PendingLogin {
@@ -45,15 +51,14 @@ impl AppState {
             webauthn,
             pending_logins: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            agents: Mutex::new(HashMap::new()),
         }))
     }
 }
 
 impl std::ops::Deref for AppState {
     type Target = AppStateInner;
-    fn deref(&self) -> &AppStateInner {
-        &self.0
-    }
+    fn deref(&self) -> &AppStateInner { &self.0 }
 }
 
 /// Remove expired entries from a `HashMap<K, V>` based on a closure that

@@ -1,43 +1,59 @@
-//! term-agent
+//! term-agent (push mode)
 //!
-//! TCP server. One connection = one terminal. Each connection's first frame
-//! must be a `FrameType::Open` carrying the tmux session id; the agent then
-//! spawns `tmux new-session -A -s <id> -- <shell>` attached to a PTY and
-//! shuttles bytes both ways. Resize frames adjust the PTY winsize.
-//!
-//! No authentication: by contract the agent is reachable only from the
-//! trusted hub. Default bind is loopback (`127.0.0.1`); operators
-//! deliberately bind it to an internal/WireGuard interface.
+//! Dials the hub on `hub` (host:port), authenticates with PSK in a
+//! `Hello` frame, then runs the multiplex demuxer. Each `Open` frame on
+//! a new stream spawns a tmux+PTY task whose stdout flows back as
+//! `Data` frames on the same stream. Reconnects with exponential
+//! backoff on any failure.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use rustls::pki_types::ServerName;
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, error, info, warn};
-
-use term_common::frame::{Frame, FrameError, HEADER_LEN};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, info, warn};
+use term_common::frame::{
+    Body, Frame, FrameError, HelloPayload, HEADER_LEN, HELLO_VERSION,
+};
 
 #[derive(Debug, Deserialize)]
 struct AgentConfig {
-    /// Address to bind, e.g. "127.0.0.1:7777". Defaults to 127.0.0.1:7777.
-    #[serde(default = "default_bind")]
-    bind: String,
-    /// Shell program to run inside tmux. Defaults to $SHELL or /bin/sh.
+    /// "host:port" of the hub's agent_bind.
+    hub: String,
+    /// Machine id presented in the Hello frame; must match a `[[machines]]`
+    /// entry on the hub.
+    machine_id: String,
+    /// Pre-shared key (base64-encoded 32 random bytes) matching hub config.
+    psk: String,
+    /// "on" (default) or "off". Must match hub's tls mode.
+    #[serde(default = "default_tls")]
+    tls: String,
+    /// SNI / cert-verification target. Defaults to the host part of `hub`.
+    #[serde(default)]
+    server_name: Option<String>,
+    /// Shell program inside tmux. Defaults to $SHELL or /bin/sh.
     #[serde(default)]
     shell: Option<String>,
-    /// tmux binary. Defaults to "tmux" (resolved via $PATH).
+    /// tmux binary path.
     #[serde(default = "default_tmux")]
     tmux: String,
 }
-fn default_bind() -> String {
-    "127.0.0.1:7777".to_string()
-}
-fn default_tmux() -> String {
-    "tmux".to_string()
-}
+fn default_tls() -> String { "on".into() }
+fn default_tmux() -> String { "tmux".into() }
+
+const WRITE_CHAN_CAP:    usize    = 256;
+const STREAM_CHAN_CAP:   usize    = 64;
+const PING_INTERVAL:     Duration = Duration::from_secs(30);
+const IDLE_DEADLINE:     Duration = Duration::from_secs(90);
+const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
+const RECONNECT_MAX:     Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,194 +64,280 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Crypto provider for rustls (no default with default-features=off).
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("install rustls crypto provider"))?;
+
     let cfg_path = std::env::var("TERM_AGENT_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/term-agent/agent.toml"));
-    let cfg: AgentConfig = match std::fs::read_to_string(&cfg_path) {
-        Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", cfg_path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!("config {} missing; using defaults", cfg_path.display());
-            AgentConfig {
-                bind: default_bind(),
-                shell: None,
-                tmux: default_tmux(),
-            }
-        }
-        Err(e) => return Err(e).with_context(|| format!("reading {}", cfg_path.display())),
+    let cfg: AgentConfig = {
+        let s = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("reading {}", cfg_path.display()))?;
+        toml::from_str(&s).with_context(|| format!("parsing {}", cfg_path.display()))?
     };
 
-    let shell = cfg
-        .shell
-        .clone()
+    let shell = cfg.shell.clone()
         .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/sh".to_string());
+        .unwrap_or_else(|| "/bin/sh".into());
 
-    let cfg = Arc::new(ResolvedConfig {
-        bind: cfg.bind,
+    let server_name = cfg.server_name.clone().unwrap_or_else(|| {
+        cfg.hub.split(':').next().unwrap_or("").to_string()
+    });
+
+    let tls_on = match cfg.tls.as_str() {
+        "on"  | "true"  => true,
+        "off" | "false" => false,
+        other => bail!("invalid tls = {other:?}; use \"on\" or \"off\""),
+    };
+
+    let resolved = Arc::new(ResolvedConfig {
+        hub: cfg.hub,
+        machine_id: cfg.machine_id,
+        psk: cfg.psk,
+        tls_on,
+        server_name,
         shell,
         tmux: cfg.tmux,
     });
 
-    let listener = TcpListener::bind(&cfg.bind)
-        .await
-        .with_context(|| format!("bind {}", cfg.bind))?;
     info!(
-        "term-agent listening on {} (tmux={}, shell={})",
-        cfg.bind, cfg.tmux, cfg.shell
+        "term-agent: hub={} machine_id={} tls={} server_name={} tmux={} shell={}",
+        resolved.hub, resolved.machine_id, if resolved.tls_on { "on" } else { "off" },
+        resolved.server_name, resolved.tmux, resolved.shell,
     );
 
+    let tls_connector = if resolved.tls_on { Some(build_tls_connector()?) } else { None };
+
+    let mut backoff = RECONNECT_INITIAL;
     loop {
-        let (sock, peer) = match listener.accept().await {
-            Ok(s) => s,
+        match run_once(resolved.clone(), tls_connector.clone()).await {
+            Ok(()) => {
+                info!("hub closed connection cleanly; reconnecting");
+                backoff = RECONNECT_INITIAL;
+            }
             Err(e) => {
-                error!(error = %e, "accept failed");
+                warn!(error = %e, "connection failed; backoff {:?}", backoff);
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX);
                 continue;
             }
-        };
-        let cfg = cfg.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(sock, cfg).await {
-                warn!(peer = %peer, error = %e, "connection closed with error");
-            } else {
-                debug!(peer = %peer, "connection closed cleanly");
-            }
-        });
+        }
+        sleep(Duration::from_millis(250)).await;
     }
 }
 
 struct ResolvedConfig {
-    bind: String,
+    hub: String,
+    machine_id: String,
+    psk: String,
+    tls_on: bool,
+    server_name: String,
     shell: String,
     tmux: String,
 }
 
-async fn read_frame(sock: &mut TcpStream) -> Result<Option<Frame>, FrameError> {
+fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
+}
+
+async fn run_once(
+    cfg: Arc<ResolvedConfig>,
+    tls: Option<tokio_rustls::TlsConnector>,
+) -> Result<()> {
+    debug!("dialing {}", cfg.hub);
+    let tcp = TcpStream::connect(&cfg.hub)
+        .await
+        .with_context(|| format!("dial {}", cfg.hub))?;
+    tcp.set_nodelay(true).ok();
+
+    if let Some(connector) = tls {
+        let sn = ServerName::try_from(cfg.server_name.clone())
+            .context("server_name must be a valid DNS name")?;
+        let tls_stream = connector
+            .connect(sn, tcp)
+            .await
+            .context("tls handshake")?;
+        let (r, w) = tokio::io::split(tls_stream);
+        run_session(cfg, r, w).await
+    } else {
+        let (r, w) = tcp.into_split();
+        run_session(cfg, r, w).await
+    }
+}
+
+async fn run_session<R, W>(
+    cfg: Arc<ResolvedConfig>,
+    mut reader: R,
+    mut writer: W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Build writer mpsc + spawn writer task.
+    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_CHAN_CAP);
+    let writer_task = tokio::spawn(async move {
+        while let Some(bytes) = write_rx.recv().await {
+            if writer.write_all(&bytes).await.is_err() { break; }
+        }
+        let _ = writer.shutdown().await;
+    });
+
+    // Send Hello.
+    let hello = HelloPayload {
+        version: HELLO_VERSION,
+        machine_id: cfg.machine_id.clone(),
+        psk_b64: cfg.psk.clone(),
+    };
+    let hello_bytes = serde_json::to_vec(&hello).context("serialize hello")?;
+    write_tx.send(Frame::hello(hello_bytes).encode())
+        .await
+        .map_err(|_| anyhow!("writer closed before hello"))?;
+
+    // Per-stream registry.
+    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Body>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Pinger.
+    let ping_writer = write_tx.clone();
+    let pinger = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PING_INTERVAL);
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            if ping_writer.send(Frame::ping(vec![]).encode()).await.is_err() { return; }
+        }
+    });
+
+    // Reader loop. Returns on any unrecoverable error.
+    let read_result: Result<()> = async {
+        loop {
+            let f = match timeout(IDLE_DEADLINE, read_frame(&mut reader)).await {
+                Ok(Ok(Some(f))) => f,
+                Ok(Ok(None))    => return Ok(()),
+                Ok(Err(e))      => return Err(e.into()),
+                Err(_)          => bail!("idle timeout (>{IDLE_DEADLINE:?})"),
+            };
+            match (f.stream_id, f.body) {
+                (0, Body::Ping(p))  => { let _ = write_tx.send(Frame::pong(p).encode()).await; }
+                (0, Body::Pong(_))  => {}
+                (0, Body::Hello(_)) => bail!("hub sent hello (protocol error)"),
+                (0, _)              => bail!("unexpected control-stream frame"),
+                (sid, Body::Open(session_id)) => {
+                    // Spawn a per-session task.
+                    let (s_tx, s_rx) = mpsc::channel::<Body>(STREAM_CHAN_CAP);
+                    streams.lock().await.insert(sid, s_tx);
+                    let cfg = cfg.clone();
+                    let writer = write_tx.clone();
+                    let streams = streams.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = run_session_stream(cfg, sid, session_id.clone(), s_rx, writer.clone()).await {
+                            warn!(stream_id = sid, session = %session_id, error = %e, "session ended with error");
+                        }
+                        // Best-effort: tell hub the stream is done and
+                        // remove ourselves from the registry.
+                        let _ = writer.send(Frame::close(sid).encode()).await;
+                        streams.lock().await.remove(&sid);
+                    });
+                }
+                (sid, body @ (Body::Data(_) | Body::Resize { .. })) => {
+                    let tx = { streams.lock().await.get(&sid).cloned() };
+                    if let Some(tx) = tx { let _ = tx.send(body).await; }
+                    else { debug!(sid, "frame for unknown stream; ignoring"); }
+                }
+                (sid, Body::Close) => {
+                    let _ = streams.lock().await.remove(&sid); // drops sender -> session sees recv None
+                }
+                _ => debug!("ignored frame"),
+            }
+        }
+    }
+    .await;
+
+    // Tear down everything for this connection.
+    streams.lock().await.clear(); // drops all per-stream txes -> sessions terminate
+    pinger.abort();
+    drop(write_tx);
+    let _ = writer_task.await;
+
+    read_result
+}
+
+async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>, FrameError> {
     let mut hdr = [0u8; HEADER_LEN];
-    match sock.read_exact(&mut hdr).await {
+    match r.read_exact(&mut hdr).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(FrameError::Io(e)),
-    };
-    let ty_byte = hdr[0];
-    let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
-    let (ty, len) = Frame::validate_header(ty_byte, len)?;
-    let mut payload = vec![0u8; len as usize];
-    if len > 0 {
-        sock.read_exact(&mut payload).await.map_err(FrameError::Io)?;
     }
-    Frame::from_payload(ty, payload).map(Some)
+    let stream_id = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let ty_byte   = hdr[4];
+    let len       = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]);
+    let (ty, len) = Frame::validate_header(stream_id, ty_byte, len)?;
+    let mut payload = vec![0u8; len as usize];
+    if len > 0 { r.read_exact(&mut payload).await?; }
+    Frame::from_payload(stream_id, ty, payload).map(Some)
 }
 
-async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, f: &Frame) -> std::io::Result<()> {
-    let bytes = f.encode();
-    w.write_all(&bytes).await
-}
-
-async fn handle_connection(mut sock: TcpStream, cfg: Arc<ResolvedConfig>) -> Result<()> {
-    // First frame must be Open(session_id).
-    let first = read_frame(&mut sock)
-        .await
-        .context("reading open frame")?
-        .ok_or_else(|| anyhow!("peer closed before open frame"))?;
-    let session_id = match first {
-        Frame::Open(id) => id,
-        other => bail!("expected open frame, got {:?}", FrameKind::from(&other)),
-    };
-    info!(session = %session_id, "starting tmux session");
-
-    // Allocate a PTY and spawn tmux attached to it.
+/// Spawn tmux+PTY and pump data both ways for one stream.
+async fn run_session_stream(
+    cfg: Arc<ResolvedConfig>,
+    sid: u32,
+    session_id: String,
+    mut rx: mpsc::Receiver<Body>,
+    writer: mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
     let (pty, pts) = pty_process::open().context("pty_process::open")?;
-    // Default initial size; client will send a Resize right away.
-    pty.resize(pty_process::Size::new(24, 80))
-        .context("initial resize")?;
-
+    pty.resize(pty_process::Size::new(24, 80)).context("initial resize")?;
     let mut child = pty_process::Command::new(&cfg.tmux)
         .args(["new-session", "-A", "-s", &session_id, "--", &cfg.shell])
         .spawn(pts)
-        .context("spawning tmux")?;
+        .context("spawn tmux")?;
 
     let (mut pty_r, mut pty_w) = pty.into_split();
-    let (mut sock_r, mut sock_w) = sock.split();
+    info!(stream_id = sid, session = %session_id, "tmux session started");
 
-    // pty -> sock
-    let pty_to_sock = async {
+    let pty_to_writer = async {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             let n = pty_r.read(&mut buf).await?;
-            if n == 0 {
-                return Ok::<(), anyhow::Error>(());
+            if n == 0 { return Ok::<(), anyhow::Error>(()); }
+            let f = Frame::data(sid, buf[..n].to_vec());
+            if writer.send(f.encode()).await.is_err() {
+                return Err(anyhow!("writer closed"));
             }
-            let frame = Frame::Data(buf[..n].to_vec());
-            write_frame(&mut sock_w, &frame).await?;
         }
     };
-
-    // sock -> pty
-    let sock_to_pty = async {
-        loop {
-            let mut hdr = [0u8; HEADER_LEN];
-            match sock_r.read_exact(&mut hdr).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Ok::<(), anyhow::Error>(())
+    let rx_to_pty = async {
+        while let Some(body) = rx.recv().await {
+            match body {
+                Body::Data(b) => {
+                    pty_w.write_all(&b).await?;
                 }
-                Err(e) => return Err(e.into()),
-            }
-            let ty_byte = hdr[0];
-            let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
-            let (ty, len) = Frame::validate_header(ty_byte, len)?;
-            let mut payload = vec![0u8; len as usize];
-            if len > 0 {
-                sock_r.read_exact(&mut payload).await?;
-            }
-            let frame = Frame::from_payload(ty, payload)?;
-            match frame {
-                Frame::Data(buf) => {
-                    pty_w.write_all(&buf).await?;
-                }
-                Frame::Resize { rows, cols } => {
+                Body::Resize { rows, cols } => {
                     if let Err(e) = pty_w.resize(pty_process::Size::new(rows, cols)) {
                         warn!(error = %e, "pty resize failed");
                     }
                 }
-                Frame::Open(_) => {
-                    // Open after the first frame is a protocol violation.
-                    bail!("open frame after initial handshake");
-                }
+                Body::Close => return Ok::<(), anyhow::Error>(()),
+                _ => debug!("ignored body on session stream"),
             }
         }
+        Ok::<(), anyhow::Error>(())
     };
 
     tokio::select! {
-        r = pty_to_sock => {
-            if let Err(e) = r { debug!(error=%e, "pty->sock ended"); }
-        }
-        r = sock_to_pty => {
-            if let Err(e) = r { debug!(error=%e, "sock->pty ended"); }
-        }
+        _ = pty_to_writer => {}
+        _ = rx_to_pty => {}
     };
 
-    // Best-effort: kill the tmux client process so the tmux session itself
-    // outlives this connection but our `tmux attach` returns. (Our tmux
-    // process is the client, not the tmux server — the server detaches and
-    // keeps the session around for future re-attach.)
     let _ = child.start_kill();
     let _ = child.wait().await;
     Ok(())
-}
-
-#[derive(Debug)]
-enum FrameKind {
-    Data,
-    Resize,
-    Open,
-}
-impl From<&Frame> for FrameKind {
-    fn from(f: &Frame) -> Self {
-        match f {
-            Frame::Data(_) => FrameKind::Data,
-            Frame::Resize { .. } => FrameKind::Resize,
-            Frame::Open(_) => FrameKind::Open,
-        }
-    }
 }

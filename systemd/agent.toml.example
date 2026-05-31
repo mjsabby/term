@@ -1,13 +1,32 @@
 ## Agent config — copy to /etc/term-agent/agent.toml and edit.
+##
+## The agent dials the hub. No inbound port is opened on this host.
 
-## Address the agent listens on. Default 127.0.0.1:7777 — change to the
-## internal interface that the hub reaches you on (WireGuard, VPC, LAN).
-bind  = "0.0.0.0:7777"
+## "host:port" of the hub's agent_bind.
+hub         = "term.xyz.com:7700"
 
-## Shell to run inside tmux. Defaults to $SHELL of the unit user, else
-## /bin/sh. For a login shell, add the flag in your .tmux.conf instead:
+## Must match a [[machines]] entry on the hub.
+machine_id  = "alpha"
+
+## Pre-shared key, base64-encoded 32 random bytes. Must match the hub's
+## [[machines]] entry for `machine_id`. Generate on the hub host with:
+##   head -c 32 /dev/urandom | base64
+psk         = "MATCHING_BASE64_FROM_HUB"
+
+## TLS mode. Must match the hub's `tls` setting.
+##   "on"  — verify hub's cert against `server_name` (default: host of `hub`)
+##   "off" — plain TCP (dev only)
+tls         = "on"
+
+## Cert-verification target. Defaults to the host portion of `hub`.
+## Override if you need to point at the hub by IP while validating its
+## DNS-named cert.
+# server_name = "term.xyz.com"
+
+## Shell run inside tmux. Defaults to $SHELL of the unit user, else /bin/sh.
+## For a login shell, set in ~/.tmux.conf instead:
 ##     set -g default-command "/bin/bash -l"
-shell = "/bin/bash"
+shell       = "/bin/bash"
 
 ## tmux binary. Defaults to "tmux" looked up in $PATH.
-tmux  = "/usr/bin/tmux"
+tmux        = "/usr/bin/tmux"

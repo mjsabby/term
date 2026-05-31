@@ -1,7 +1,6 @@
 ## Hub config — copy to /etc/term-hub/hub.toml and edit.
 
-## Public DNS name. Used by ACME (when `tls = "acme"`) and is the
-## host portion of the WebAuthn origin.
+## Public DNS name. Used by ACME and as the WebAuthn origin host.
 domain         = "term.xyz.com"
 
 ## WebAuthn Relying Party id. Must be a registrable suffix of `domain`.
@@ -13,9 +12,10 @@ rp_id          = "xyz.com"
 rp_name        = "term"
 
 ## TLS mode:
-##   "acme" — terminate TLS in the hub via Let's Encrypt (TLS-ALPN-01)
-##   "off"  — plain HTTP only; ONLY for local dev or behind a reverse
-##            proxy (nginx/Caddy/etc.) that terminates TLS for you
+##   "acme" — terminate TLS in the hub via Let's Encrypt (TLS-ALPN-01).
+##            The same cert is reused for the agent listener.
+##   "off"  — plain HTTP/TCP on both ports. ONLY for local dev or
+##            behind a reverse proxy.
 tls            = "acme"
 
 ## ACME contact email (required when tls = "acme").
@@ -28,18 +28,25 @@ acme_production = false
 ## Data + cache. credentials.json, secret.key, acme/ live here.
 data_dir       = "/var/lib/term-hub"
 
-## Bind address. Defaults to "[::]:443" when tls = "acme",
-## "[::]:8080" when tls = "off". Override here if needed.
+## Browser-facing bind. Default "[::]:443" (acme) / "[::]:8080" (off).
 # bind         = "[::]:443"
 
-## One block per agent machine. `id` shows in the URL fragment so keep it
-## short ([A-Za-z0-9_-]{1,32}).
+## Agent-facing bind. Agents dial this address. TLS (same ACME cert) when
+## tls = "acme", plain TCP when tls = "off". Default "[::]:7700".
+agent_bind     = "[::]:7700"
+
+## One block per machine. The hub *waits* for an agent presenting this
+## machine id + matching PSK to connect; until then the machine's tabs
+## get a "service unavailable" response.
+##
+## Generate a fresh 32-byte PSK with:
+##   head -c 32 /dev/urandom | base64
 [[machines]]
-id      = "alpha"
-label   = "alpha.lan"
-address = "10.0.0.10:7777"
+id    = "alpha"
+label = "alpha.lan"
+psk   = "REPLACE_WITH_BASE64_32_RANDOM"
 
 [[machines]]
-id      = "beta"
-label   = "beta.lan"
-address = "10.0.0.11:7777"
+id    = "wsl-laptop"
+label = "WSL laptop"
+psk   = "REPLACE_WITH_ANOTHER_BASE64_32_RANDOM"
