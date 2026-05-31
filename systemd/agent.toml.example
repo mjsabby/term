@@ -1,0 +1,13 @@
+## Agent config — copy to /etc/term-agent/agent.toml and edit.
+
+## Address the agent listens on. Default 127.0.0.1:7777 — change to the
+## internal interface that the hub reaches you on (WireGuard, VPC, LAN).
+bind  = "0.0.0.0:7777"
+
+## Shell to run inside tmux. Defaults to $SHELL of the unit user, else
+## /bin/sh. For a login shell, add the flag in your .tmux.conf instead:
+##     set -g default-command "/bin/bash -l"
+shell = "/bin/bash"
+
+## tmux binary. Defaults to "tmux" looked up in $PATH.
+tmux  = "/usr/bin/tmux"

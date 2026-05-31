@@ -1,0 +1,48 @@
+[Unit]
+Description=term hub (HTTPS + WebAuthn + ws->agent proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=term-hub
+Group=term-hub
+ExecStart=/usr/local/bin/term-hub
+Environment=TERM_HUB_CONFIG=/etc/term-hub/hub.toml
+# RUST_LOG=info,rustls_acme=info  # uncomment for verbose logging
+
+# Bind 80/443 without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# State and config:
+#   /var/lib/term-hub/  -> credentials.json, secret.key, acme/
+#   /etc/term-hub/      -> hub.toml
+StateDirectory=term-hub
+StateDirectoryMode=0750
+ConfigurationDirectory=term-hub
+ConfigurationDirectoryMode=0750
+ReadOnlyPaths=/etc/term-hub
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

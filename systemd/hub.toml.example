@@ -1,0 +1,45 @@
+## Hub config — copy to /etc/term-hub/hub.toml and edit.
+
+## Public DNS name. Used by ACME (when `tls = "acme"`) and is the
+## host portion of the WebAuthn origin.
+domain         = "term.xyz.com"
+
+## WebAuthn Relying Party id. Must be a registrable suffix of `domain`.
+## Using "xyz.com" lets the credentials be reused across siblings of
+## term.xyz.com. Set this to `domain` for the strictest scoping.
+rp_id          = "xyz.com"
+
+## Human-readable name shown by the authenticator UI.
+rp_name        = "term"
+
+## TLS mode:
+##   "acme" — terminate TLS in the hub via Let's Encrypt (TLS-ALPN-01)
+##   "off"  — plain HTTP only; ONLY for local dev or behind a reverse
+##            proxy (nginx/Caddy/etc.) that terminates TLS for you
+tls            = "acme"
+
+## ACME contact email (required when tls = "acme").
+acme_email     = "ops@xyz.com"
+
+## Set to true to use the production Let's Encrypt directory. Start with
+## false (staging) until you've confirmed the setup works.
+acme_production = false
+
+## Data + cache. credentials.json, secret.key, acme/ live here.
+data_dir       = "/var/lib/term-hub"
+
+## Bind address. Defaults to "[::]:443" when tls = "acme",
+## "[::]:8080" when tls = "off". Override here if needed.
+# bind         = "[::]:443"
+
+## One block per agent machine. `id` shows in the URL fragment so keep it
+## short ([A-Za-z0-9_-]{1,32}).
+[[machines]]
+id      = "alpha"
+label   = "alpha.lan"
+address = "10.0.0.10:7777"
+
+[[machines]]
+id      = "beta"
+label   = "beta.lan"
+address = "10.0.0.11:7777"

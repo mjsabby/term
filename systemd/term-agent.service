@@ -1,0 +1,31 @@
+[Unit]
+Description=term agent (tmux-backed shell over TCP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# IMPORTANT: this is the user whose shell sessions will be exposed via the
+# hub. Override via systemd drop-in (`systemctl edit term-agent`) for the
+# unprivileged operator account on each machine.
+User=root
+Group=root
+ExecStart=/usr/local/bin/term-agent
+Environment=TERM_AGENT_CONFIG=/etc/term-agent/agent.toml
+# RUST_LOG=info  # uncomment for verbose logging
+
+ConfigurationDirectory=term-agent
+ConfigurationDirectoryMode=0750
+ReadOnlyPaths=/etc/term-agent
+
+# Minimal hardening — but the agent intentionally spawns interactive
+# shells, so we leave the filesystem reachable for that user.
+NoNewPrivileges=false
+RestrictSUIDSGID=false
+
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

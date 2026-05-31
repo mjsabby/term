@@ -1,0 +1,20 @@
+[package]
+name = "term-agent"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "term-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+serde              = { workspace = true }
+toml               = { workspace = true }
+pty-process        = { version = "0.5", features = ["async"] }
+term-common        = { path = "../common" }

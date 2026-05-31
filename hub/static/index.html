@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>term</title>
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <noscript>This page requires JavaScript and WebAuthn.</noscript>
+
+  <div id="loading" class="screen">loading…</div>
+
+  <section id="auth-screen" class="screen" hidden>
+    <div class="panel">
+      <h1>term</h1>
+      <p class="muted">Sign in with a passkey.</p>
+      <button id="login-btn" class="primary">Authenticate</button>
+      <p id="login-msg" class="msg"></p>
+
+      <details id="register-details">
+        <summary>Register a new passkey</summary>
+        <p class="muted">
+          Create a credential on this device, then paste the blob into
+          <code>hub-admin add-passkey '&lt;blob&gt;'</code> on the hub host.
+        </p>
+        <label>Label
+          <input id="label-input" type="text" placeholder="yubikey-blue" maxlength="64">
+        </label>
+        <button id="register-btn">Generate registration blob</button>
+        <p id="register-msg" class="msg"></p>
+        <textarea id="blob-output" readonly hidden rows="6"
+          spellcheck="false" autocomplete="off"></textarea>
+        <pre id="blob-instructions" hidden></pre>
+      </details>
+    </div>
+  </section>
+
+  <section id="app" class="screen" hidden>
+    <aside id="machine-list">
+      <header><span>machines</span></header>
+      <ul id="machines"></ul>
+      <footer>
+        <button id="logout-btn" class="ghost">log out</button>
+      </footer>
+    </aside>
+    <main>
+      <div id="tab-bar" role="tablist"></div>
+      <div id="terminal-container"></div>
+    </main>
+  </section>
+
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/addon-fit.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
