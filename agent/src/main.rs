@@ -6,6 +6,7 @@
 //! stdout flows back as `Data` frames on the same stream. Reconnects
 //! with exponential backoff on any failure.
 
+mod pty;
 mod session;
 
 use std::collections::HashMap;

@@ -24,11 +24,11 @@ tls         = "on"
 # server_name = "term.xyz.com"
 
 ## Shell spawned in a fresh PTY by the in-agent session manager.
-## Defaults to $SHELL of the unit user, else /bin/sh. Use an absolute
-## path. For a login shell, point at a wrapper script that exec's your
-## shell with -l, e.g.:
-##   #!/bin/sh
-##   exec /bin/bash -l "$@"
+## Defaults to /bin/sh. Supports an argv-style string — the first word
+## is the program, the rest are passed as arguments. For a login shell:
+##   shell = "/bin/bash -l"
+## Argv is split on ASCII whitespace; no quoting/escaping. If you need
+## spaces in arguments, point this at a wrapper script.
 shell       = "/bin/bash"
 
 ## (Legacy, ignored as of Phase 4.2: the agent no longer wraps in tmux.)

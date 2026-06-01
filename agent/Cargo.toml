@@ -20,6 +20,6 @@ anyhow             = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 toml               = { workspace = true }
-pty-process        = { version = "0.5", features = ["async"] }
+portable-pty       = "0.9"
 libc               = "0.2"
 term-common        = { path = "../common" }

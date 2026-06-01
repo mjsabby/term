@@ -40,9 +40,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use term_common::frame::{
     DOWNLOAD_STATUS_CANCEL, DOWNLOAD_STATUS_OK, MAX_PASTE_CHUNK_BYTES,
@@ -120,8 +120,7 @@ pub struct Session {
     #[allow(dead_code)]
     pub created_at:   Instant,
     broadcast_tx:     broadcast::Sender<SessionEvent>,
-    pty_w:            Mutex<pty_process::OwnedWritePty>,
-    child:            Mutex<tokio::process::Child>,
+    pty:              crate::pty::AsyncPty,
     inner:            Mutex<SessionInner>,
     next_download_id: AtomicU32,
 }
@@ -150,32 +149,31 @@ pub struct AttachResult {
 }
 
 impl Session {
-    /// Spawn `$SHELL` in a fresh PTY, no tmux wrapper. Replaces
+    /// Spawn the configured shell in a fresh PTY (no tmux wrapper)
+    /// via the cross-platform [`crate::pty::AsyncPty`]. Replaces
     /// `tmux new-session -A -s <id> -- <shell>`.
     pub fn spawn(id: SessionId, shell: &str, initial_size: (u16, u16)) -> Result<Arc<Self>> {
-        let (pty, pts) = pty_process::open().context("pty_process::open")?;
+        let (program, args) = crate::pty::split_shell(shell);
         let (rows, cols) = initial_size;
-        pty.resize(pty_process::Size::new(rows, cols)).context("initial resize")?;
         // systemd service units inherit no TERM and no locale. Set a
         // terminfo-capable TERM, advertise truecolor, pick a UTF-8
         // locale. Same env we used to pass to tmux.
-        let child = pty_process::Command::new(shell)
-            .env("TERM",      "xterm-256color")
-            .env("COLORTERM", "truecolor")
-            .env("LANG",      "C.UTF-8")
-            .env("LC_ALL",    "C.UTF-8")
-            .spawn(pts)
-            .with_context(|| format!("spawn {shell}"))?;
+        let env: &[(&str, &str)] = &[
+            ("TERM",      "xterm-256color"),
+            ("COLORTERM", "truecolor"),
+            ("LANG",      "C.UTF-8"),
+            ("LC_ALL",    "C.UTF-8"),
+        ];
+        let pty = crate::pty::AsyncPty::spawn(&program, &args, env, rows, cols)
+            .with_context(|| format!("spawn {program}"))?;
 
-        let (mut pty_r, pty_w) = pty.into_split();
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAP);
 
         let session = Arc::new(Session {
             id:               id.clone(),
             created_at:       Instant::now(),
             broadcast_tx:     tx.clone(),
-            pty_w:            Mutex::new(pty_w),
-            child:            Mutex::new(child),
+            pty,
             next_download_id: AtomicU32::new(1),
             inner:            Mutex::new(SessionInner {
                 controller:       None,
@@ -187,21 +185,23 @@ impl Session {
             }),
         });
 
-        // PTY reader task — per session, NOT per stream. Reads PTY,
-        // OSC-scans, dispatches 5111;dl; OSCs as DownloadRequest events,
-        // forwards the rest as Data events + scrollback appends.
+        // PTY reader task — per session, NOT per stream. The AsyncPty
+        // bridge thread has already moved bytes off the blocking
+        // handle into `out_rx`; we just drain, OSC-scan, broadcast.
         let session_for_reader = session.clone();
         let session_id_for_log = id;
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 16 * 1024];
             let mut osc = OscScanner::new();
             loop {
-                let n = match pty_r.read(&mut buf).await {
-                    Ok(0)  => break, // shell exited
-                    Ok(n)  => n,
-                    Err(e) => { debug!(session=%session_id_for_log, error=%e, "pty read"); break; }
+                let chunk = {
+                    let mut rx = session_for_reader.pty.out_rx.lock().await;
+                    rx.recv().await
                 };
-                let (fwd, captured) = osc.feed(&buf[..n]);
+                let buf = match chunk {
+                    Some(b) => b,
+                    None    => break, // shell exited / bridge closed
+                };
+                let (fwd, captured) = osc.feed(&buf);
                 if !fwd.is_empty() {
                     let chunk = Arc::new(fwd);
                     session_for_reader.inner.lock().await.scrollback.extend(&chunk);
@@ -238,7 +238,7 @@ impl Session {
                     }
                 }
             }
-            // Shell exited (read returned 0 or errored).
+            // Shell exited (bridge closed). Mark + notify.
             info!(session=%session_id_for_log, "shell exited; closing session");
             session_for_reader.inner.lock().await.exited = true;
             let _ = session_for_reader.broadcast_tx.send(SessionEvent::Closed);
@@ -266,8 +266,7 @@ impl Session {
         drop(inner);
 
         if became_controller {
-            let _ = self.pty_w.lock().await
-                .resize(pty_process::Size::new(size.0, size.1));
+            let _ = self.pty.resize(size.0, size.1).await;
             let _ = self.broadcast_tx.send(
                 SessionEvent::ControllerChanged { controller: sid });
         }
@@ -295,14 +294,22 @@ impl Session {
     /// belt-and-braces).
     pub async fn write_input_from(&self, sid: StreamId, bytes: &[u8]) {
         if self.inner.lock().await.controller != Some(sid) { return; }
-        let _ = self.pty_w.lock().await.write_all(bytes).await;
+        let _ = self.pty.in_tx.send(bytes.to_vec()).await;
     }
 
     /// Direct PTY write (bypasses controller check). Used for
     /// agent-internal injections — bracketed-paste path strings on
     /// PasteEnd, term-dl error lines, etc.
     pub async fn write_internal(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.pty_w.lock().await.write_all(bytes).await
+        // The bridge channel only fails when the writer thread has
+        // exited, which only happens after the shell process dies.
+        // Map that to a BrokenPipe so callers can log gracefully.
+        self.pty.in_tx.send(bytes.to_vec())
+            .await
+            .map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pty writer thread has exited",
+            ))
     }
 
     pub async fn resize_for(&self, sid: StreamId, rows: u16, cols: u16) {
@@ -315,7 +322,7 @@ impl Session {
             }
         };
         if do_resize {
-            let _ = self.pty_w.lock().await.resize(pty_process::Size::new(rows, cols));
+            let _ = self.pty.resize(rows, cols).await;
         }
     }
 
@@ -331,7 +338,7 @@ impl Session {
             inner.last_size = size;
             (true, size)
         };
-        let _ = self.pty_w.lock().await.resize(pty_process::Size::new(new_size.0, new_size.1));
+        let _ = self.pty.resize(new_size.0, new_size.1).await;
         let _ = self.broadcast_tx.send(SessionEvent::ControllerChanged { controller: sid });
         success
     }
@@ -360,7 +367,7 @@ impl Session {
             inner.last_size = size;
             size
         };
-        let _ = self.pty_w.lock().await.resize(pty_process::Size::new(new_size.0, new_size.1));
+        let _ = self.pty.resize(new_size.0, new_size.1).await;
         let _ = self.broadcast_tx.send(SessionEvent::ControllerChanged { controller: sid });
         true
     }
@@ -386,9 +393,7 @@ impl Session {
 
     /// Force the shell to exit. Used by KillSession + idle-TTL drop.
     pub async fn kill(&self) {
-        let mut child = self.child.lock().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        self.pty.kill().await;
     }
 }
 
