@@ -35,20 +35,31 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use term_common::frame::{
-    Body, Frame, FrameError, HelloPayload, HEADER_LEN, HELLO_VERSION,
+    Body, Frame, FrameError, FrameType, HelloPayload, HEADER_LEN, HELLO_VERSION,
 };
+use term_common::prio::{prio_channel, PrioTx};
 
-use crate::config::{is_valid_machine_id, HubConfig, TlsMode};
+use crate::config::{is_valid_machine_id, HubConfig};
 use crate::state::AppState;
 
-const WRITE_CHAN_CAP:    usize    = 256;
+// --- writer queue budgets (bytes, per agent connection) -------------------
+//
+// hi: small control/interactive frames (Data, Resize, Open, Close, Ping,
+//     Pong, Hello, PasteReject). All ≤ 64 KiB; 4 MiB headroom is far
+//     more than any realistic backlog of these.
+// lo: paste chunks (PasteBegin/PasteChunk/PasteEnd). PasteChunk is up to
+//     1 MiB; 16 MiB total lets ~16 chunks queue before the WS reader
+//     pauses, which TCP-backpressures the browser. Old item-based cap
+//     (256 items × 1 MiB) was 256 MiB worst case.
+const HUB_WRITER_HI_BYTES: usize =  4 * 1024 * 1024;
+const HUB_WRITER_LO_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_CHAN_CAP:   usize    = 64;
 const HELLO_DEADLINE:    Duration = Duration::from_secs(10);
 const IDLE_DEADLINE:     Duration = Duration::from_secs(90);
 
 /// Handle the hub keeps for one connected agent.
 pub struct AgentLink {
-    writer:         mpsc::Sender<Vec<u8>>,
+    writer:         PrioTx,
     next_stream_id: AtomicU32,
     streams:        Mutex<HashMap<u32, mpsc::Sender<Body>>>,
     /// Fired when the link is evicted from the agents map (e.g. by a
@@ -93,7 +104,16 @@ impl AgentLink {
     }
 
     async fn send_frame(&self, f: Frame) -> Result<(), ()> {
-        self.writer.send(f.encode()).await.map_err(|_| ())
+        // Route bulk paste chunks through `lo` so they never wedge
+        // interactive Data/Resize/Ping/etc behind 1 MiB chunks. The new
+        // PasteReject (agent → browser) is small and time-sensitive →
+        // hi.
+        let ty = f.ty();
+        let half = match ty {
+            FrameType::PasteBegin | FrameType::PasteChunk | FrameType::PasteEnd => &self.writer.lo,
+            _ => &self.writer.hi,
+        };
+        half.send(f.encode()).await.map_err(|_| ())
     }
 }
 
@@ -184,7 +204,7 @@ where
     info!(machine = %hello.machine_id, peer = %peer, "agent registered");
 
     // ---- link + writer ----------------------------------------------------
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_CHAN_CAP);
+    let (write_tx, mut write_rx) = prio_channel(HUB_WRITER_HI_BYTES, HUB_WRITER_LO_BYTES);
     let link = Arc::new(AgentLink {
         writer:         write_tx.clone(),
         next_stream_id: AtomicU32::new(1),
@@ -333,7 +353,7 @@ pub async fn run_acceptor(
     info!(
         "agent listener up on {} ({})",
         cfg.agent_bind,
-        if matches!(cfg.tls, TlsMode::Acme) { "TLS via ACME cert" } else { "plain TCP" },
+        if tls.is_some() { "TLS" } else { "plain TCP" },
     );
 
     loop {

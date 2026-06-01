@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["common", "agent", "hub", "hub-admin"]
+members = ["common", "agent", "hub", "hub-admin", "term-dl"]
 
 [workspace.package]
 edition = "2021"

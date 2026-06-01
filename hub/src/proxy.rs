@@ -16,7 +16,7 @@ use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use tracing::{debug, info, warn};
 
-use term_common::frame::{Frame, HEADER_LEN};
+use term_common::frame::{Frame, HEADER_LEN, MAX_PASTE_CHUNK_LEN};
 
 use crate::auth::{check_origin, token_from_ws_protocol, validate_token};
 use crate::state::AppState;
@@ -57,7 +57,18 @@ pub async fn term_ws(
 
     let machine_id = machine_id.clone();
     info!(machine = %machine_id, "ws upgrade -> agent link");
-    ws.protocols([subprotocol])
+
+    // Cap WS messages just above the largest legal stream-scoped frame
+    // (a maximally-sized PasteChunk). The browser sends a paste as
+    // (Begin, Chunk × N, End) with chunks of at most MAX_PASTE_CHUNK_LEN
+    // payload bytes; this bound covers the worst case with plenty of
+    // header room. axum 0.8 defaults to 64 MiB / 16 MiB; the explicit
+    // cap protects us if those defaults change and keeps a malicious
+    // browser from ballooning per-connection memory.
+    const WS_MAX_BYTES: usize = HEADER_LEN + MAX_PASTE_CHUNK_LEN as usize + 1024;
+    ws.max_message_size(WS_MAX_BYTES)
+        .max_frame_size(WS_MAX_BYTES)
+        .protocols([subprotocol])
         .on_upgrade(move |ws| async move { run_proxy(ws, link, machine_id).await })
 }
 

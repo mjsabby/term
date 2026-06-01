@@ -14,3 +14,5 @@ pub mod creds;
 pub mod envelope;
 pub mod flock;
 pub mod frame;
+pub mod osc;
+pub mod prio;

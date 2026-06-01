@@ -12,10 +12,12 @@ rp_id          = "xyz.com"
 rp_name        = "term"
 
 ## TLS mode:
-##   "acme" — terminate TLS in the hub via Let's Encrypt (TLS-ALPN-01).
-##            The same cert is reused for the agent listener.
-##   "off"  — plain HTTP/TCP on both ports. ONLY for local dev or
-##            behind a reverse proxy.
+##   "acme"  — terminate TLS in the hub via Let's Encrypt (TLS-ALPN-01).
+##             Same cert is reused for the agent listener.
+##   "files" — load PEM cert+key from disk; re-read them on a cadence so
+##             an external ACME bot can renew without restarting the hub.
+##   "off"   — plain HTTP/TCP on both ports. ONLY for local dev or
+##             behind a reverse proxy.
 tls            = "acme"
 
 ## ACME contact email (required when tls = "acme").
@@ -24,6 +26,13 @@ acme_email     = "ops@xyz.com"
 ## Set to true to use the production Let's Encrypt directory. Start with
 ## false (staging) until you've confirmed the setup works.
 acme_production = false
+
+## When tls = "files", point at the PEM bundle that your cert bot
+## (lego / certbot / acme.sh / certupdater) maintains. Convention used
+## by /etc/ssl/certupdater: <domain>.fullchain.pem + <domain>.key.pem.
+# cert_path                = "/etc/ssl/certupdater/term.xyz.com.fullchain.pem"
+# key_path                 = "/etc/ssl/certupdater/term.xyz.com.key.pem"
+# tls_reload_interval_secs = 3600                  # match your bot's cron
 
 ## Data + cache. credentials.json, secret.key, acme/ live here.
 data_dir       = "/var/lib/term-hub"

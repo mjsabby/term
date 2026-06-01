@@ -14,3 +14,4 @@ hmac        = { workspace = true }
 sha2        = { workspace = true }
 webauthn-rs = { workspace = true }
 libc        = "0.2"
+tokio       = { workspace = true }

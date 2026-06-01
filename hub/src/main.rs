@@ -12,10 +12,11 @@ mod auth;
 mod config;
 mod proxy;
 mod state;
+mod static_assets;
+mod tls_files;
 mod webauthn_routes;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -23,7 +24,6 @@ use axum::routing::{get, post};
 use axum::Router;
 use rustls_acme::{caches::DirCache, AcmeConfig};
 use tokio_stream::StreamExt;
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use webauthn_rs::prelude::Url;
@@ -64,9 +64,6 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(cfg);
     let app_state = AppState::new(cfg.clone(), secret, webauthn);
 
-    let static_dir = resolve_static_dir();
-    info!("serving static assets from {}", static_dir.display());
-
     let app = Router::new()
         .route("/webauthn/register/start", post(webauthn_routes::register_start))
         .route("/webauthn/login/start",    post(webauthn_routes::login_start))
@@ -75,7 +72,7 @@ async fn main() -> Result<()> {
         .route("/api/me",                  get(api_routes::me))
         .route("/api/logout",              post(api_routes::logout))
         .route("/ws/term/{machine_id}",    get(proxy::term_ws))
-        .fallback_service(ServeDir::new(&static_dir).append_index_html_on_directories(true))
+        .fallback(static_assets::handler)
         .layer(TraceLayer::new_for_http())
         .with_state(app_state.clone());
 
@@ -85,8 +82,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("parse bind {}", cfg.effective_bind()))?;
 
     match cfg.tls {
-        TlsMode::Acme => serve_acme(app_state, cfg, browser_bind, app).await,
-        TlsMode::Off  => serve_plain(app_state, cfg, browser_bind, app).await,
+        TlsMode::Acme  => serve_acme(app_state, cfg, browser_bind, app).await,
+        TlsMode::Files => serve_files(app_state, cfg, browser_bind, app).await,
+        TlsMode::Off   => serve_plain(app_state, cfg, browser_bind, app).await,
     }
 }
 
@@ -111,19 +109,6 @@ fn load_config() -> Result<HubConfig> {
         }
     }
     Ok(cfg)
-}
-
-fn resolve_static_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("TERM_HUB_STATIC_DIR") {
-        return PathBuf::from(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("static");
-            if candidate.is_dir() { return candidate; }
-        }
-    }
-    PathBuf::from("hub/static")
 }
 
 async fn serve_acme(
@@ -203,4 +188,59 @@ async fn serve_plain(
     axum::serve(listener, app.into_make_service())
         .await
         .context("axum::serve")
+}
+
+async fn serve_files(
+    state: AppState,
+    cfg: Arc<HubConfig>,
+    browser_bind: SocketAddr,
+    app: Router,
+) -> Result<()> {
+    use std::time::Duration;
+
+    let cert_path = cfg
+        .cert_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("tls = \"files\" requires cert_path"))?;
+    let key_path = cfg
+        .key_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("tls = \"files\" requires key_path"))?;
+    let period = Duration::from_secs(cfg.tls_reload_interval_secs.unwrap_or(3600));
+
+    let resolver = tls_files::DynamicResolver::load(&cert_path, &key_path)
+        .context("loading initial TLS cert from disk")?;
+    tls_files::spawn_reloader(resolver.clone(), cert_path.clone(), key_path.clone(), period);
+    info!(
+        "tls=files: cert={} key={} reload_every={}s",
+        cert_path.display(),
+        key_path.display(),
+        period.as_secs()
+    );
+
+    let server_config = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
+    );
+
+    // Agent listener over TLS using the same dynamic-cert config.
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config.clone());
+    let agent_state = state.clone();
+    let agent_cfg = cfg.clone();
+    tokio::spawn(async move {
+        if let Err(e) = agent_link::run_acceptor(agent_state, agent_cfg, Some(tls_acceptor)).await {
+            error!("agent acceptor exited: {e:?}");
+        }
+    });
+
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(server_config);
+    info!(
+        "term-hub listening on https://{} (tls=files); agent_bind={}",
+        browser_bind, cfg.agent_bind
+    );
+    axum_server::bind_rustls(browser_bind, rustls_config)
+        .serve(app.into_make_service())
+        .await
+        .context("axum_server::bind_rustls")
 }

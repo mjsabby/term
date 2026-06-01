@@ -48,11 +48,23 @@
     <main>
       <div id="tab-bar" role="tablist"></div>
       <div id="terminal-container"></div>
+      <div id="search-bar" hidden>
+        <input id="search-input" type="text" placeholder="search (Enter=next, Shift+Enter=prev, Esc=close)"
+               spellcheck="false" autocomplete="off">
+        <span id="search-count" class="muted"></span>
+      </div>
     </main>
   </section>
 
   <script src="/vendor/xterm/xterm.js"></script>
   <script src="/vendor/xterm/addon-fit.js"></script>
+  <script src="/vendor/xterm/addon-webgl.js"></script>
+  <script src="/vendor/xterm/addon-web-links.js"></script>
+  <script src="/vendor/xterm/addon-unicode11.js"></script>
+  <script src="/vendor/xterm/addon-search.js"></script>
+  <script src="/vendor/xterm/addon-image.js"></script>
+  <script src="/vendor/xterm/addon-serialize.js"></script>
+  <script src="/vendor/xterm/addon-clipboard.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

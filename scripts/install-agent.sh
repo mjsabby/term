@@ -115,6 +115,11 @@ install -m 755 "$BUILD_DIR/term-agent" "$BIN_DIR/"
 # --- config dir
 mkdir -p "$CONFIG_DIR"
 chmod 0750 "$CONFIG_DIR"
+if [[ -n "$RUN_USER" ]]; then
+  # The agent (running as RUN_USER) needs to be able to enter the dir
+  # and read agent.toml; nobody else needs to.
+  chown -R "$RUN_USER:$RUN_USER" "$CONFIG_DIR"
+fi
 
 # --- agent.toml
 CONFIG_PATH="$CONFIG_DIR/agent.toml"
@@ -135,6 +140,9 @@ shell       = "$SHELL_BIN"
 tmux        = "$TMUX_BIN"
 EOF
   sed -i '/^$/N;/^\n$/D' "$CONFIG_PATH"
+  if [[ -n "$RUN_USER" ]]; then
+    chown "$RUN_USER:$RUN_USER" "$CONFIG_PATH"
+  fi
   chmod 0600 "$CONFIG_PATH"
 fi
 
@@ -157,8 +165,9 @@ fi
 
 systemctl daemon-reload
 if ! $NO_ENABLE; then
-  note "enabling + starting term-agent.service"
-  systemctl enable --now term-agent.service
+  note "enabling + (re)starting term-agent.service"
+  systemctl enable term-agent.service
+  systemctl restart term-agent.service
   sleep 1
   systemctl --no-pager --full status term-agent.service | head -15 || true
 fi

@@ -20,14 +20,19 @@ Browser  --HTTPS/WSS-->  Hub  <==TLS+mux+PSK==  Agent  --PTY-->  tmux -- $SHELL
 |------------|--------------|-------------------------------------------------|
 | `common`   | —            | wire frame (mux), credential store, envelope    |
 | `agent`    | `term-agent` | dials hub, runs mux, tmux+PTY per stream        |
-| `hub`      | `term-hub`   | HTTPS+ACME, WebAuthn, agent acceptor, WS proxy  |
+| `hub`      | `term-hub`   | HTTPS+ACME, WebAuthn, agent acceptor, WS proxy, embedded SPA |
 | `hub-admin`| `hub-admin`  | OOB passkey registration CLI on the hub host    |
+| `term-dl`  | `term-dl`    | helper run inside the shell to ship a file from the agent host to the browser as a download |
 
 ```sh
 cargo build --release
 ```
 
-Binaries land at `target/release/{term-hub,term-agent,hub-admin}`.
+Binaries land at `target/release/{term-hub,term-agent,hub-admin,term-dl}`.
+The SPA is embedded into `term-hub` (no separate static-asset directory
+to ship); each binary is fully self-contained. Install `term-dl`
+anywhere on the agent's shell `$PATH` (e.g. `/usr/local/bin/`) so users
+can run `term-dl ~/build.log` from their session.
 
 ## Wire protocol
 
@@ -38,18 +43,81 @@ with `stream_id` pinned to 0 (the WS itself demultiplexes).
 ```
 [stream_id:u32 BE][type:u8][len:u32 BE][payload:len]    (9-byte header)
 
-type 0 = data    (raw PTY bytes, both directions, stream > 0)
-type 1 = resize  (rows:u16 BE, cols:u16 BE; hub->agent; stream > 0)
-type 2 = open    (utf-8 session_id; hub->agent; FIRST frame of stream)
-type 3 = close   (no payload; either direction; signals stream end)
-type 4 = ping    (<= 64B; either direction; stream = 0)
-type 5 = pong    (echo of ping payload; stream = 0)
-type 6 = hello   (json; agent->hub; FIRST frame; stream = 0)
+type 0  = data            (raw PTY bytes, both directions, stream > 0)
+type 1  = resize          (rows:u16 BE, cols:u16 BE; hub->agent; stream > 0)
+type 2  = open            (utf-8 session_id; hub->agent; FIRST frame of stream)
+type 3  = close           (no payload; either direction; signals stream end)
+type 4  = ping            (<= 64B; either direction; stream = 0)
+type 5  = pong            (echo of ping payload; stream = 0)
+type 6  = hello           (json; agent->hub; FIRST frame; stream = 0)
+type 7  = paste-begin     (browser->agent; stream > 0; starts a chunked paste)
+type 8  = paste-chunk     (browser->agent; stream > 0; one chunk of a paste)
+type 9  = paste-end       (browser->agent; stream > 0; finalize or cancel)
+type 10 = paste-reject    (agent->browser; stream > 0; agent rejected a paste)
+type 11 = download-begin  (agent->browser; stream > 0; starts a chunked download)
+type 12 = download-chunk  (agent->browser; stream > 0; one chunk of a download)
+type 13 = download-end    (agent->browser; stream > 0; finalize or cancel)
 ```
 
 Caps: data ≤ 64 KiB, resize == 4 bytes, open ≤ 64 bytes of
 `[A-Za-z0-9_-]`, hello ≤ 1 KiB, ping/pong ≤ 64 bytes. Unknown types
-rejected. Reserve 7..=15 for the upload/download bolt-on.
+rejected. Reserve 14..=15 for future bolt-ons.
+
+The hub→agent socket writer, the agent→hub socket writer, and the
+agent's per-stream input all use a two-priority channel so interactive
+frames (Data/Resize/Ping/etc.) never sit behind a 1 MiB Paste/Download
+chunk. Outbound writers are byte-bounded (hi=4 MiB, lo=16 MiB);
+per-stream input is item-bounded (hi=8, lo=8).
+
+### Paste (chunked file upload)
+
+Pasting a file (clipboard, right-click, or drag-and-drop) on a tab
+streams the bytes browser → hub → agent over the same mux:
+
+```
+paste-begin: [paste_id:u32 BE][total_size:u64 BE][group_id:u32 BE]
+             [group_size:u32 BE][name_len:u8][name UTF-8]
+paste-chunk: [paste_id:u32 BE][bytes ≤ 1 MiB]   × ceil(total_size / 1 MiB)
+paste-end:   [paste_id:u32 BE][status:u8]       // 0 = ok, 1 = cancel
+paste-reject:[paste_id:u32 BE][reason:u8]       // agent → browser; aborts the paste
+```
+
+PasteReject reasons (`u8`): 0 = registry full, 1 = open failed,
+2 = size mismatch, 3 = write failed, 4 = duplicate paste id,
+5 = group aggregate over 4 GiB.
+
+### Download (agent → browser, via `term-dl`)
+
+Mirror of paste, opposite direction, triggered by the `term-dl <path>`
+helper running inside a shell on the agent host:
+
+```
+term-dl  →  ESC ] 5111 ; dl ; <absolute path> BEL   (on its stdout, into the PTY)
+agent    →  download-begin / download-chunk × N / download-end(0)   (on the same mux stream)
+browser  →  builds a Blob, triggers `<a download>` save
+```
+
+The agent's PTY-output OSC scanner consumes our application-private
+`5111;` OSCs without forwarding them to the browser (so the user
+doesn't see the escape echo); other OSCs (window title, OSC 52
+clipboard, …) pass through unchanged. Caps: 4 GiB per file on the
+wire, but the browser-side Blob buffer is capped at 256 MiB until
+streaming-to-disk is wired up. Per-stream concurrent downloads are
+capped at 16. Bracketed-paste and download tasks are bound to their
+stream's lifetime — closing the browser tab cancels in-flight
+downloads instead of letting them keep streaming bytes into the void.
+
+`paste_id` is browser-allocated and unique among that stream's
+in-flight pastes. `group_id` ties N pastes together as one "paste
+action" (Ctrl-V on a multi-file clipboard, multi-file drag-and-drop);
+`group_size` is N. The agent buffers finished paths per `group_id` and
+injects them all in one bracketed-paste block once all `group_size`
+pastes complete. Cap is 4 GiB per file, 1 MiB per chunk, ≤ 32
+concurrent pastes / 32 concurrent groups per stream. The agent writes
+each file into `$XDG_RUNTIME_DIR/term-agent/paste/` (or
+`/tmp/term-agent-<uid>/paste/`) with mode `0600`, sanitizes the
+browser-supplied filename to `[A-Za-z0-9._-]`, and types the absolute
+path(s) back into the PTY on completion.
 
 Hello payload (JSON):
 
@@ -166,14 +234,7 @@ sudo chown -R term-hub:term-hub /etc/term-hub
 # Generate a PSK per agent on the hub host and copy it to both configs.
 head -c 32 /dev/urandom | base64
 
-# Bundle static assets next to the hub binary (or set TERM_HUB_STATIC_DIR).
-sudo cp -r hub/static /usr/local/share/term-hub-static
-sudo mkdir -p /etc/systemd/system/term-hub.service.d
-sudo tee /etc/systemd/system/term-hub.service.d/static.conf <<EOF >/dev/null
-[Service]
-Environment=TERM_HUB_STATIC_DIR=/usr/local/share/term-hub-static
-EOF
-
+# The SPA is embedded into the term-hub binary; nothing to copy.
 sudo install -m 644 systemd/term-hub.service   /etc/systemd/system/
 sudo install -m 644 systemd/term-agent.service /etc/systemd/system/
 
@@ -222,7 +283,7 @@ pane.
 ├── common/                    wire frame, store types, envelope, flock
 ├── agent/                     term-agent binary
 ├── hub/
-│   ├── src/                   term-hub binary
+│   ├── src/                   term-hub binary (SPA embedded via rust-embed)
 │   └── static/                index.html, app.js, style.css, vendor/xterm/
 ├── hub-admin/                 hub-admin binary
 └── systemd/                   unit files + *.toml.example

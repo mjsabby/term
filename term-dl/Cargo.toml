@@ -1,0 +1,10 @@
+[package]
+name = "term-dl"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "term-dl"
+path = "src/main.rs"

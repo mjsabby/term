@@ -12,6 +12,11 @@ pub enum TlsMode {
     /// Same ACME-managed cert is reused for the agent listener.
     #[default]
     Acme,
+    /// Use cert + key from disk paths. Both browser and agent listeners
+    /// share the loaded cert. Periodically re-read so an external ACME
+    /// bot (lego / certbot / acme.sh) can renew without restarting the
+    /// hub.
+    Files,
     /// Serve plain HTTP (and plain TCP for agents). ONLY for local
     /// development or behind a reverse proxy that terminates TLS.
     Off,
@@ -37,6 +42,18 @@ pub struct HubConfig {
     /// Use Let's Encrypt production directory. Default false (staging).
     #[serde(default)]
     pub acme_production: bool,
+    /// PEM cert chain (leaf first, intermediates after). Required when
+    /// `tls = "files"`.
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    /// PEM private key (PKCS#8, PKCS#1, or SEC1). Required when
+    /// `tls = "files"`.
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    /// Seconds between re-reads of cert_path/key_path. Default 3600
+    /// (1 hour). Match this to your ACME bot's cron cadence.
+    #[serde(default)]
+    pub tls_reload_interval_secs: Option<u64>,
 
     /// Where credentials.json, secret.key, and the ACME cache live.
     #[serde(default = "default_data_dir")]
@@ -49,6 +66,14 @@ pub struct HubConfig {
     #[serde(default = "default_agent_bind")]
     pub agent_bind: String,
 
+    /// Override the public origin used as the WebAuthn origin and for
+    /// browser `Origin:` checks. Default: `https://<domain>`.
+    /// Set this for `tls = "off"` deployments where you're reached at
+    /// a different scheme/port than the default — for local dev,
+    /// typically `"http://localhost:8080"`.
+    #[serde(default)]
+    pub public_origin: Option<String>,
+
     /// Machines the hub knows about. Each entry produces a row in the UI.
     /// Agents identify themselves by `id` + `psk` in the Hello frame.
     #[serde(default)]
@@ -60,12 +85,15 @@ fn default_data_dir() -> PathBuf { PathBuf::from("/var/lib/term-hub") }
 fn default_agent_bind() -> String { "[::]:7700".into() }
 
 impl HubConfig {
-    pub fn origin(&self) -> String { format!("https://{}", self.domain) }
+    pub fn origin(&self) -> String {
+        if let Some(p) = &self.public_origin { return p.clone(); }
+        format!("https://{}", self.domain)
+    }
     pub fn effective_bind(&self) -> String {
         if let Some(b) = &self.bind { return b.clone(); }
         match self.tls {
-            TlsMode::Acme => "[::]:443".into(),
-            TlsMode::Off  => "[::]:8080".into(),
+            TlsMode::Acme | TlsMode::Files => "[::]:443".into(),
+            TlsMode::Off                   => "[::]:8080".into(),
         }
     }
 }

@@ -87,20 +87,64 @@ function assertionToJSON(cred) {
 }
 
 // ----- frame protocol --------------------------------------------------------
+//
+// 9-byte header: [stream_id:u32 BE][type:u8][len:u32 BE][payload:len]
+// Browser always uses stream_id = 0 (the WS itself is the demux); the hub
+// injects the real stream_id when forwarding to the agent, and strips it
+// back to 0 on the way back.
 
-const FRAME_DATA   = 0;
-const FRAME_RESIZE = 1;
-const FRAME_OPEN   = 2;
+const HEADER_LEN   = 9;
+const FRAME_DATA            = 0;
+const FRAME_RESIZE          = 1;
+const FRAME_OPEN            = 2;
+const FRAME_PASTE_BEGIN     = 7;
+const FRAME_PASTE_CHUNK     = 8;
+const FRAME_PASTE_END       = 9;
+const FRAME_PASTE_REJECT    = 10;
+const FRAME_DOWNLOAD_BEGIN  = 11;
+const FRAME_DOWNLOAD_CHUNK  = 12;
+const FRAME_DOWNLOAD_END    = 13;
+
+// Mirror the constants in common/src/frame.rs.
+const MAX_PASTE_TOTAL_BYTES = 4 * 1024 * 1024 * 1024 - 1; // 4 GiB - 1
+const MAX_PASTE_CHUNK_BYTES = 1024 * 1024;                // 1 MiB
+const MAX_PASTE_NAME_LEN    = 255;
+const PASTE_STATUS_OK     = 0;
+const PASTE_STATUS_CANCEL = 1;
+const DOWNLOAD_STATUS_OK     = 0;
+const DOWNLOAD_STATUS_CANCEL = 1;
+// Per-tab cap on concurrent downloads in flight — matches the
+// agent-side MAX_INFLIGHT_DOWNLOADS.
+const MAX_INFLIGHT_DOWNLOADS = 16;
+// Per-download memory cap on the browser side. The wire protocol
+// allows up to 4 GiB per file, but until we wire up streaming-to-disk
+// (File System Access API) the JS heap has to hold the whole Blob,
+// which can OOM the tab. 256 MiB is the practical safe ceiling.
+const MAX_DOWNLOAD_TOTAL_BYTES = 256 * 1024 * 1024;
+
+const PASTE_REJECT_REASONS = [
+  'too many concurrent pastes',
+  'agent could not create temp file',
+  'paste size mismatch',
+  'agent failed to write file',
+  'duplicate paste id',
+  'paste batch exceeds 4 GiB',
+];
+function pasteRejectMessage(reason) {
+  return PASTE_REJECT_REASONS[reason] || `unknown reason ${reason}`;
+}
 
 function encodeFrame(type, payload) {
   const len = payload.length;
-  const buf = new Uint8Array(5 + len);
-  buf[0] = type;
-  buf[1] = (len >>> 24) & 0xff;
-  buf[2] = (len >>> 16) & 0xff;
-  buf[3] = (len >>> 8)  & 0xff;
-  buf[4] =  len         & 0xff;
-  buf.set(payload, 5);
+  const buf = new Uint8Array(HEADER_LEN + len);
+  // stream_id = 0
+  buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 0;
+  buf[4] = type;
+  buf[5] = (len >>> 24) & 0xff;
+  buf[6] = (len >>> 16) & 0xff;
+  buf[7] = (len >>>  8) & 0xff;
+  buf[8] =  len         & 0xff;
+  buf.set(payload, HEADER_LEN);
   return buf;
 }
 function encodeData(bytes) { return encodeFrame(FRAME_DATA, bytes); }
@@ -113,12 +157,57 @@ function encodeResize(rows, cols) {
 function encodeOpen(sessionId) {
   return encodeFrame(FRAME_OPEN, new TextEncoder().encode(sessionId));
 }
+
+function writeU32BE(buf, off, n) {
+  buf[off    ] = (n >>> 24) & 0xff;
+  buf[off + 1] = (n >>> 16) & 0xff;
+  buf[off + 2] = (n >>>  8) & 0xff;
+  buf[off + 3] =  n         & 0xff;
+}
+function writeU64BE(buf, off, n) {
+  // n may exceed 2^32; split via BigInt to stay exact across the full
+  // 4 GiB range.
+  const big = BigInt(n);
+  const hi = Number((big >> 32n) & 0xffffffffn);
+  const lo = Number(big & 0xffffffffn);
+  writeU32BE(buf, off,     hi);
+  writeU32BE(buf, off + 4, lo);
+}
+
+function encodePasteBegin(pasteId, totalSize, groupId, groupSize, name) {
+  // payload: [paste_id:u32][total_size:u64][group_id:u32]
+  //          [group_size:u32][name_len:u8][name utf8]
+  const nameBytes = new TextEncoder().encode(name).slice(0, MAX_PASTE_NAME_LEN);
+  const payload = new Uint8Array(4 + 8 + 4 + 4 + 1 + nameBytes.length);
+  writeU32BE(payload, 0,  pasteId);
+  writeU64BE(payload, 4,  totalSize);
+  writeU32BE(payload, 12, groupId);
+  writeU32BE(payload, 16, groupSize);
+  payload[20] = nameBytes.length;
+  payload.set(nameBytes, 21);
+  return encodeFrame(FRAME_PASTE_BEGIN, payload);
+}
+function encodePasteChunk(pasteId, bytes) {
+  // payload: [paste_id:u32][bytes]
+  const payload = new Uint8Array(4 + bytes.length);
+  writeU32BE(payload, 0, pasteId);
+  payload.set(bytes, 4);
+  return encodeFrame(FRAME_PASTE_CHUNK, payload);
+}
+function encodePasteEnd(pasteId, status) {
+  // payload: [paste_id:u32][status:u8]
+  const payload = new Uint8Array(5);
+  writeU32BE(payload, 0, pasteId);
+  payload[4] = status;
+  return encodeFrame(FRAME_PASTE_END, payload);
+}
 function parseFrame(view) {
-  if (view.byteLength < 5) return null;
-  const type = view[0];
-  const len = (view[1] << 24) | (view[2] << 16) | (view[3] << 8) | view[4];
-  if (view.byteLength !== 5 + len) return null;
-  return { type, payload: view.subarray(5) };
+  if (view.byteLength < HEADER_LEN) return null;
+  // stream_id at [0..4] is always 0 from the hub; ignore.
+  const type = view[4];
+  const len  = ((view[5] << 24) | (view[6] << 16) | (view[7] << 8) | view[8]) >>> 0;
+  if (view.byteLength !== HEADER_LEN + len) return null;
+  return { type, payload: view.subarray(HEADER_LEN) };
 }
 
 // ----- URL fragment <-> tabs -------------------------------------------------
@@ -277,6 +366,7 @@ async function enterApp() {
   }
   if (tabs.length > 0) activateTab(0);
   window.addEventListener('resize', onResize);
+  bindSearchUi();
 }
 
 function bindAppUi() {
@@ -332,24 +422,110 @@ function openTab(machineId, sessionId, activate) {
   }
 
   const term = new Terminal({
-    fontFamily: 'ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace',
+    fontFamily: 'ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace',
     fontSize: 13,
+    lineHeight: 1.0,
+    letterSpacing: 0,
     cursorBlink: true,
+    cursorStyle: 'block',
+    cursorInactiveStyle: 'outline',
     convertEol: false,
+    scrollback: 10000,
+    fastScrollModifier: 'shift',
+    fastScrollSensitivity: 5,
+    scrollSensitivity: 1,
+    minimumContrastRatio: 4.5,
+    drawBoldTextInBrightColors: false,
+    wordSeparator: ' ()[]{}\'",;:`',
+    // xterm 6.0 moved overviewRulerWidth into the overviewRuler object.
+    // Reserve a slim gutter so the search addon's match markers can be
+    // painted on the scrollbar.
+    overviewRuler: { width: 14 },
+    windowOptions: { setWinSizeChars: true },
     theme: {
-      background: '#0b0e14', foreground: '#cdd6f4', cursor: '#cdd6f4',
-      selectionBackground: '#414559',
+      // Catppuccin Mocha.
+      background: '#0b0e14', foreground: '#cdd6f4',
+      cursor: '#f5e0dc', cursorAccent: '#1e1e2e',
+      selectionBackground: '#414559', selectionForeground: undefined,
+      black: '#45475a',  red: '#f38ba8', green: '#a6e3a1',  yellow: '#f9e2af',
+      blue: '#89b4fa',   magenta: '#f5c2e7', cyan: '#94e2d5', white: '#bac2de',
+      brightBlack: '#585b70', brightRed: '#f38ba8', brightGreen: '#a6e3a1',
+      brightYellow: '#f9e2af', brightBlue: '#89b4fa', brightMagenta: '#f5c2e7',
+      brightCyan: '#94e2d5',   brightWhite: '#a6adc8',
     },
     allowProposedApi: true,
   });
+  // Let the browser handle Ctrl/Cmd-V and Ctrl/Cmd-Shift-V so the
+  // native `paste` event fires (capture-phase listener on paneEl then
+  // forwards images as PasteBegin/Chunk/End, or lets xterm.js bubble-
+  // phase handle text paste). Without this xterm.js eats the keystroke
+  // and forwards it to the shell as literal `^V` — meaning Ctrl-V
+  // never reaches our paste handler at all.
+  //
+  // Trade-off: vim users who relied on Ctrl-V for "quoted-insert" must
+  // now use Ctrl-Q. Acceptable for a web terminal where paste is the
+  // dominant use case.
+  term.attachCustomKeyEventHandler((ev) => {
+    if (ev.type === 'keydown'
+        && (ev.ctrlKey || ev.metaKey)
+        && (ev.key === 'v' || ev.key === 'V')) {
+      return false;
+    }
+    return true;
+  });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
+  // Wide-character widths (emoji, CJK). Must activate the version.
+  term.loadAddon(new Unicode11Addon.Unicode11Addon());
+  term.unicode.activeVersion = '11';
+  // Ctrl/Cmd-click URLs.
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  // Ctrl-F search (UI wired below).
+  const search = new SearchAddon.SearchAddon();
+  term.loadAddon(search);
+  // Inline images: sixel + iTerm2 protocol (chafa, kitty +icat, imgcat …).
+  term.loadAddon(new ImageAddon.ImageAddon());
+  // Snapshot the terminal state (incl. scrollback) for sharing / debugging.
+  // Bound to Ctrl-Shift-S below; copies the buffer to the clipboard.
+  const serialize = new SerializeAddon.SerializeAddon();
+  term.loadAddon(serialize);
+  // OSC 52 clipboard: lets `tmux save-buffer -|xclip -i -sel c`-style
+  // tricks and vim's `+y/+p go through the browser's clipboard.
+  term.loadAddon(new ClipboardAddon.ClipboardAddon());
 
   const paneEl = document.createElement('div');
   paneEl.className = 'term-pane';
   paneEl.hidden = true;
   $('#terminal-container').appendChild(paneEl);
   term.open(paneEl);
+
+  // WebGL renderer: 5–10× faster than the DOM renderer. Must be loaded
+  // *after* term.open() so the element exists. Fall back to DOM if the
+  // GPU context is lost or unavailable.
+  try {
+    const webgl = new WebglAddon.WebglAddon();
+    webgl.onContextLoss(() => { try { webgl.dispose(); } catch (_) {} });
+    term.loadAddon(webgl);
+  } catch (e) {
+    console.warn('WebGL renderer unavailable; using DOM renderer', e);
+  }
+
+  // Windows-Terminal / PuTTY clipboard flow:
+  //   - selection auto-copies to the system clipboard (writeText is
+  //     allowed because the surrounding mouseup is a user gesture).
+  //   - right-click pastes from the system clipboard. Falls back
+  //     silently if the user denies clipboard-read.
+  //
+  // Paste + contextmenu handlers that need access to `tab.ws` (for
+  // image paste) are installed in `attachClipboardHandlers(tab)` below,
+  // after the tab object exists.
+  paneEl.addEventListener('mouseup', () => {
+    const sel = term.getSelection();
+    if (!sel) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(sel).catch(() => {});
+    }
+  });
 
   // Tab strip element.
   const tabEl = document.createElement('button');
@@ -369,12 +545,14 @@ function openTab(machineId, sessionId, activate) {
   $('#tab-bar').appendChild(tabEl);
 
   const tab = {
-    machineId, sessionId, term, fit, paneEl, tabEl, statusEl: status,
+    machineId, sessionId, term, fit, search, serialize, paneEl, tabEl, statusEl: status,
     ws: null, dataDisposable: null, resizeDisposable: null,
     closing: false, reconnectAttempt: 0, reconnectTimer: 0,
   };
   tabs.push(tab);
   writeFragment(tabs);
+
+  attachClipboardHandlers(tab);
 
   tabEl.addEventListener('click', (ev) => {
     if (ev.target === close) return;
@@ -388,6 +566,394 @@ function openTab(machineId, sessionId, activate) {
   connectTab(tab);
 
   if (activate) activateTab(tabs.indexOf(tab));
+}
+
+// ----- clipboard / paste / drag-and-drop glue --------------------------------
+//
+// Pasting (Ctrl-V, right-click) or dragging a file onto the terminal pane
+// streams the bytes to the agent as a chunked PasteBegin/Chunk*/End
+// sequence. The agent saves each file under its paste dir, then injects
+// the absolute path(s) into the PTY as a bracketed-paste block. This
+// mirrors iTerm2's "Paste Selection as File" — gives CLI agents running
+// inside the remote shell (Copilot CLI, Claude Code, …) something they
+// can read off disk.
+//
+// Multi-file paste sends N PasteBegins in parallel (different paste_ids);
+// the agent coalesces their finished paths into a single space-separated
+// bracketed-paste block when they land close in time.
+//
+// Text paste continues to flow through xterm.js's normal path.
+
+// Sanitize a browser-supplied filename: take the last path component,
+// restrict to [A-Za-z0-9._-], strip leading dots/dashes, truncate to
+// 200 chars. The agent re-sanitizes; this is just for a sensible hint
+// over the wire and a less-surprising flash() label.
+function sanitizePasteName(name) {
+  if (!name) return '';
+  // Browsers don't expose directory paths on File.name, but be defensive
+  // about backslashes and slashes anyway.
+  let s = name.replace(/^.*[\\/]/, '');
+  s = s.replace(/[^A-Za-z0-9._-]/g, '_');
+  s = s.replace(/^[.\-]+/, '');
+  return s.slice(0, 200);
+}
+
+function defaultNameForBlob(blob) {
+  if (blob && blob.name && blob.name.length) return blob.name;
+  const ext = ({
+    'image/png':  'png',
+    'image/jpeg': 'jpg',
+    'image/gif':  'gif',
+    'image/webp': 'webp',
+    'image/bmp':  'bmp',
+    'application/pdf': 'pdf',
+    'text/plain': 'txt',
+  })[blob && blob.type] || 'bin';
+  return `paste.${ext}`;
+}
+
+// Per-tab paste_id allocator. paste_ids only need to be unique among
+// the tab's in-flight pastes; we just monotonically increment.
+function nextPasteId(tab) {
+  tab._nextPasteId = ((tab._nextPasteId || 0) + 1) >>> 0;
+  if (tab._nextPasteId === 0) tab._nextPasteId = 1; // skip 0 (cosmetic)
+  return tab._nextPasteId;
+}
+
+// Per-tab group_id allocator. Each "paste action" (one Ctrl-V, one
+// right-click, one drag-and-drop) gets a fresh group_id; all N files
+// in that action share it, so the agent injects all N paths in one
+// bracketed-paste block once the last file completes.
+function nextGroupId(tab) {
+  tab._nextGroupId = ((tab._nextGroupId || 0) + 1) >>> 0;
+  if (tab._nextGroupId === 0) tab._nextGroupId = 1;
+  return tab._nextGroupId;
+}
+
+// Block until the WebSocket's send buffer drops below `lowMark`, so a
+// fast file slice doesn't outrun a slow link and blow up RAM.
+async function waitForDrain(ws, lowMark) {
+  while (ws.bufferedAmount > lowMark) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+// Stream a Blob/File as PasteBegin → PasteChunk×N → PasteEnd. Returns
+// true on success (End sent OK), false on any failure (End cancelled).
+async function sendPasteFile(tab, blob, groupId, groupSize) {
+  const size = blob.size;
+  if (size > MAX_PASTE_TOTAL_BYTES) {
+    flash(`file too large (${(size / 1024 / 1024 / 1024).toFixed(2)} GiB > 4 GiB)`);
+    return false;
+  }
+  if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) {
+    flash('terminal disconnected; paste not sent');
+    return false;
+  }
+  // If the group has already been rejected by the agent, bail without
+  // sending any more chunks for it. (sendPasteFiles will skip the rest.)
+  if (tab._abortedGroups && tab._abortedGroups.has(groupId)) {
+    return false;
+  }
+  const name = sanitizePasteName(defaultNameForBlob(blob));
+  const pasteId = nextPasteId(tab);
+  // Track paste_id → group_id so the WS receiver can mark the whole
+  // group aborted when a PasteReject arrives.
+  if (!tab._pasteToGroup) tab._pasteToGroup = new Map();
+  tab._pasteToGroup.set(pasteId, groupId);
+  // High-water mark for browser-side outgoing buffer: 16 chunks.
+  // waitForDrain() yields until we drop below this.
+  const SEND_HIGH_WATER = 16 * MAX_PASTE_CHUNK_BYTES;
+
+  try {
+    tab.ws.send(encodePasteBegin(pasteId, size, groupId, groupSize, name));
+
+    const big = size > MAX_PASTE_CHUNK_BYTES;
+    if (big) flash(`uploading ${name} (${(size / 1024 / 1024).toFixed(1)} MiB)…`);
+
+    // Slice the blob and ship chunk-by-chunk. Blob.slice() doesn't
+    // materialize anything; only the active chunk is read into a JS
+    // ArrayBuffer at any time.
+    let offset = 0;
+    while (offset < size) {
+      if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) {
+        flash('terminal disconnected mid-paste');
+        return false;
+      }
+      // Agent rejected this paste mid-stream — stop wasting bytes.
+      if (tab._abortedPastes && tab._abortedPastes.has(pasteId)) {
+        return false;
+      }
+      // Backpressure: don't read+send the next chunk until the WS has
+      // drained the previous ones. waitForDrain bails out if the socket
+      // closes during the wait.
+      if (tab.ws.bufferedAmount > SEND_HIGH_WATER) {
+        await waitForDrain(tab.ws, SEND_HIGH_WATER / 2);
+        if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) {
+          flash('terminal disconnected mid-paste');
+          return false;
+        }
+      }
+      const end = Math.min(offset + MAX_PASTE_CHUNK_BYTES, size);
+      const slice = blob.slice(offset, end);
+      const buf = new Uint8Array(await slice.arrayBuffer());
+      // Re-check after the await.
+      if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) {
+        flash('terminal disconnected mid-paste');
+        return false;
+      }
+      if (tab._abortedPastes && tab._abortedPastes.has(pasteId)) {
+        return false;
+      }
+      tab.ws.send(encodePasteChunk(pasteId, buf));
+      offset = end;
+    }
+    tab.ws.send(encodePasteEnd(pasteId, PASTE_STATUS_OK));
+    if (big) flash(`uploaded ${name}`);
+    return true;
+  } catch (e) {
+    console.warn('sendPasteFile', e);
+    flash(`paste failed: ${name}`);
+    try {
+      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+        tab.ws.send(encodePasteEnd(pasteId, PASTE_STATUS_CANCEL));
+      }
+    } catch (_) {}
+    return false;
+  } finally {
+    if (tab._pasteToGroup) tab._pasteToGroup.delete(pasteId);
+    if (tab._abortedPastes) tab._abortedPastes.delete(pasteId);
+  }
+}
+
+// Send a list of File objects (any type) in order as one paste group,
+// so the agent injects all the paths in a single bracketed-paste
+// block once the last one finishes uploading.
+async function sendPasteFiles(tab, files) {
+  const fs = (files || []).filter(Boolean);
+  if (fs.length === 0) return;
+  // Enforce the aggregate per-paste-action cap up front. Agent will
+  // reject this anyway via PasteReject if we lie, but it's nicer UX
+  // to fail fast before we start uploading the first file.
+  const totalSize = fs.reduce((a, f) => a + (f.size || 0), 0);
+  if (totalSize > MAX_PASTE_TOTAL_BYTES) {
+    flash(`paste batch too large (${(totalSize / 1024 / 1024 / 1024).toFixed(2)} GiB > 4 GiB)`);
+    return;
+  }
+  const groupId = nextGroupId(tab);
+  for (const f of fs) {
+    // If a previous file in this group hit a PasteReject, stop
+    // dispatching new ones — the agent has already discarded the
+    // already-uploaded siblings.
+    if (tab._abortedGroups && tab._abortedGroups.has(groupId)) break;
+    await sendPasteFile(tab, f, groupId, fs.length);
+  }
+  if (tab._abortedGroups) tab._abortedGroups.delete(groupId);
+}
+
+// ----- downloads (agent → browser, via term-dl) ------------------------------
+//
+// The agent ships a file as DownloadBegin → DownloadChunk × N →
+// DownloadEnd. We buffer chunks per download_id and, on End(ok), trigger
+// a save via a programmatic `<a download>` click. End(cancel) discards
+// the buffer and flashes a message.
+
+function readU32BE(buf, off) {
+  return ((buf[off] << 24) | (buf[off + 1] << 16) |
+          (buf[off + 2] <<  8) |  buf[off + 3]) >>> 0;
+}
+function readU64BENumber(buf, off) {
+  // Accurate across the full 4 GiB range using BigInt; clamp back to a
+  // Number for ergonomic use. Beyond 2^53 we'd lose precision, but
+  // total_size is capped at 4 GiB so we're safe.
+  const hi = BigInt(readU32BE(buf, off));
+  const lo = BigInt(readU32BE(buf, off + 4));
+  return Number((hi << 32n) | lo);
+}
+
+function handleDownloadBegin(tab, payload) {
+  if (payload.length < 13) return;
+  const downloadId = readU32BE(payload, 0);
+  const totalSize  = readU64BENumber(payload, 4);
+  const nameLen    = payload[12];
+  if (payload.length !== 13 + nameLen) return;
+  const name = new TextDecoder('utf-8', { fatal: false })
+    .decode(payload.subarray(13, 13 + nameLen)) || 'download';
+
+  if (totalSize > MAX_DOWNLOAD_TOTAL_BYTES) {
+    flash(`download "${name}" too large (${(totalSize / 1024 / 1024).toFixed(0)} MiB; cap 256 MiB)`);
+    return;
+  }
+
+  if (!tab._downloads) tab._downloads = new Map();
+  if (tab._downloads.size >= MAX_INFLIGHT_DOWNLOADS) {
+    flash(`too many downloads in flight; dropping "${name}"`);
+    return;
+  }
+  if (tab._downloads.has(downloadId)) {
+    // Agent shouldn't reuse a download_id while one is in flight, but
+    // be defensive and reject quietly.
+    return;
+  }
+  tab._downloads.set(downloadId, { name, totalSize, received: 0, chunks: [] });
+  if (totalSize > MAX_PASTE_CHUNK_BYTES) {
+    flash(`downloading ${name} (${(totalSize / 1024 / 1024).toFixed(1)} MiB)…`);
+  }
+}
+
+function handleDownloadChunk(tab, payload) {
+  if (payload.length < 4 || !tab._downloads) return;
+  const downloadId = readU32BE(payload, 0);
+  const dl = tab._downloads.get(downloadId);
+  if (!dl) return;
+  const chunk = payload.subarray(4);
+  if (dl.received + chunk.length > dl.totalSize) {
+    // Agent overran its own declaration. Drop the download to avoid
+    // saving a too-large file (the agent will also have logged this).
+    tab._downloads.delete(downloadId);
+    flash(`download "${dl.name}" overran declared size; discarded`);
+    return;
+  }
+  // Copy out of the WS buffer (which the browser may reuse) into an
+  // owned Uint8Array.
+  dl.chunks.push(new Uint8Array(chunk));
+  dl.received += chunk.length;
+}
+
+function handleDownloadEnd(tab, payload) {
+  if (payload.length !== 5 || !tab._downloads) return;
+  const downloadId = readU32BE(payload, 0);
+  const status     = payload[4];
+  const dl = tab._downloads.get(downloadId);
+  if (!dl) return;
+  tab._downloads.delete(downloadId);
+
+  if (status === DOWNLOAD_STATUS_CANCEL) {
+    flash(`download "${dl.name}" cancelled`);
+    return;
+  }
+  if (dl.received !== dl.totalSize) {
+    flash(`download "${dl.name}" truncated (${dl.received}/${dl.totalSize})`);
+    return;
+  }
+  saveBlob(new Blob(dl.chunks), dl.name);
+  flash(`downloaded ${dl.name}`);
+}
+
+/// Programmatic save via a hidden <a download>. URL.createObjectURL is
+/// per-document so we revoke after the click to avoid leaking the blob.
+function saveBlob(blob, suggestedName) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = suggestedName;
+  a.rel = 'noopener';
+  // Some browsers won't initiate the download for a detached anchor.
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Small timeout so the browser starts the download before we
+  // invalidate the URL.
+  setTimeout(() => URL.revokeObjectURL(url), 5_000);
+}
+
+function attachClipboardHandlers(tab) {
+  const { paneEl, term } = tab;
+
+  // Right-click is reserved for "paste from clipboard". xterm.js, when
+  // an inner app (tmux, vim) enables mouse reporting, encodes button-2
+  // mousedown/up as CSI sequences and writes them to the helper
+  // textarea — which we then forward as Data, which tmux interprets as
+  // "right-click on pane → show menu". Swallowing the raw mouse events
+  // at the capture phase keeps xterm.js from ever seeing them, so the
+  // PTY only ever observes the `contextmenu`-triggered paste below.
+  const swallowRightButton = (ev) => {
+    if (ev.button !== 2) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+  };
+  paneEl.addEventListener('mousedown', swallowRightButton, { capture: true });
+  paneEl.addEventListener('mouseup',   swallowRightButton, { capture: true });
+
+  // Capture-phase paste handler. xterm.js attaches its own paste
+  // handler on the helper textarea in the bubble phase; calling
+  // stopImmediatePropagation() here suppresses that text-paste fallback
+  // when we've already intercepted file items.
+  paneEl.addEventListener('paste', (ev) => {
+    const items = ev.clipboardData && ev.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind !== 'file') continue;
+      const f = it.getAsFile();
+      if (f) files.push(f);
+    }
+    if (files.length === 0) return; // text paste — let xterm.js handle.
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    sendPasteFiles(tab, files);
+  }, { capture: true });
+
+  // Right-click paste. Try clipboard.read() so we can detect files
+  // (images especially); fall back to readText() if the permission is
+  // denied or the API is unavailable (older Safari etc).
+  paneEl.addEventListener('contextmenu', async (ev) => {
+    ev.preventDefault();
+    if (!navigator.clipboard) return;
+    if (navigator.clipboard.read) {
+      try {
+        const items = await navigator.clipboard.read();
+        // Collect any image-like items as Files; ClipboardItem doesn't
+        // expose a filename, so we synthesize one from the MIME type.
+        const blobs = [];
+        for (const item of items) {
+          for (const type of item.types) {
+            if (!type.startsWith('image/') && type !== 'application/pdf') continue;
+            try {
+              const blob = await item.getType(type);
+              // Convert to a File-ish so sendPasteFile can name it.
+              blob.name = defaultNameForBlob({ type, name: '' });
+              blobs.push(blob);
+              break; // one type per ClipboardItem
+            } catch (_) {}
+          }
+        }
+        if (blobs.length > 0) { await sendPasteFiles(tab, blobs); return; }
+        // No files; try text.
+        for (const item of items) {
+          if (item.types.includes('text/plain')) {
+            const blob = await item.getType('text/plain');
+            const text = await blob.text();
+            if (text) term.paste(text);
+            return;
+          }
+        }
+        return;
+      } catch (_) { /* permission denied; fall through to readText */ }
+    }
+    if (navigator.clipboard.readText) {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text) term.paste(text);
+      } catch (_) { /* permission denied or no clipboard */ }
+    }
+  });
+
+  // Drag-and-drop: dropping files onto the terminal pane sends them
+  // through the same path. Browser default is to navigate to the file,
+  // so preventDefault on both dragover (to allow drop) and drop.
+  paneEl.addEventListener('dragover', (ev) => {
+    if (ev.dataTransfer && Array.from(ev.dataTransfer.items || []).some((it) => it.kind === 'file')) {
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'copy';
+    }
+  });
+  paneEl.addEventListener('drop', (ev) => {
+    if (!ev.dataTransfer || !ev.dataTransfer.files || ev.dataTransfer.files.length === 0) return;
+    ev.preventDefault();
+    sendPasteFiles(tab, Array.from(ev.dataTransfer.files));
+  });
 }
 
 function connectTab(tab) {
@@ -429,6 +995,28 @@ function connectTab(tab) {
     if (!f) return;
     if (f.type === FRAME_DATA) {
       tab.term.write(f.payload);
+    } else if (f.type === FRAME_PASTE_REJECT && f.payload.length === 5) {
+      const pasteId = ((f.payload[0] << 24) | (f.payload[1] << 16) |
+                       (f.payload[2] <<  8) |  f.payload[3]) >>> 0;
+      const reason  = f.payload[4];
+      // Mark this paste_id (and its whole group) as aborted so any
+      // in-flight chunk loop bails on its next pre-send check. The
+      // agent has already discarded its tempfile + the group's
+      // already-finished siblings.
+      if (!tab._abortedPastes) tab._abortedPastes = new Set();
+      tab._abortedPastes.add(pasteId);
+      const gid = tab._pasteToGroup && tab._pasteToGroup.get(pasteId);
+      if (gid != null) {
+        if (!tab._abortedGroups) tab._abortedGroups = new Set();
+        tab._abortedGroups.add(gid);
+      }
+      flash(`paste rejected: ${pasteRejectMessage(reason)}`);
+    } else if (f.type === FRAME_DOWNLOAD_BEGIN) {
+      handleDownloadBegin(tab, f.payload);
+    } else if (f.type === FRAME_DOWNLOAD_CHUNK) {
+      handleDownloadChunk(tab, f.payload);
+    } else if (f.type === FRAME_DOWNLOAD_END) {
+      handleDownloadEnd(tab, f.payload);
     }
     // Other frame types coming from hub are not currently used in this
     // direction; ignore.
@@ -508,4 +1096,87 @@ function onResize() {
     resizeRaf = 0;
     if (activeTabIdx >= 0) sendResizeIfReady(tabs[activeTabIdx]);
   });
+}
+
+// ----- search bar (Ctrl-F / Cmd-F) -------------------------------------------
+
+function bindSearchUi() {
+  const bar    = $('#search-bar');
+  const input  = $('#search-input');
+  const count  = $('#search-count');
+  const opts   = { decorations: { matchOverviewRuler: '#f9e2af',
+                                  activeMatchColorOverviewRuler: '#f5e0dc',
+                                  matchBackground: '#414559',
+                                  activeMatchBackground: '#fab387' } };
+
+  function active() { return activeTabIdx >= 0 ? tabs[activeTabIdx] : null; }
+
+  function open() {
+    if (!active()) return;
+    bar.hidden = false;
+    input.focus();
+    input.select();
+  }
+  function close() {
+    bar.hidden = true;
+    const t = active();
+    if (t) { try { t.search.clearDecorations(); } catch (_) {} t.term.focus(); }
+    count.textContent = '';
+  }
+  function find(next) {
+    const t = active();
+    if (!t || !input.value) return;
+    const fn = next ? 'findNext' : 'findPrevious';
+    try { t.search[fn](input.value, opts); } catch (_) {}
+  }
+
+  // Ctrl-F (Cmd-F on Mac). Also intercept Ctrl-Shift-F as "find again".
+  window.addEventListener('keydown', (ev) => {
+    const mod = ev.ctrlKey || ev.metaKey;
+    if (mod && (ev.key === 'f' || ev.key === 'F')) {
+      // Allow the browser's native find inside form inputs; otherwise
+      // hijack for terminal search.
+      if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+      ev.preventDefault();
+      open();
+    } else if (mod && ev.shiftKey && (ev.key === 'S' || ev.key === 's')) {
+      // Ctrl-Shift-S: copy a serialized snapshot of the active tab's
+      // buffer (incl. scrollback + colors as ANSI) to the clipboard.
+      const t = active();
+      if (!t || !t.serialize) return;
+      ev.preventDefault();
+      try {
+        const text = t.serialize.serialize();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            () => flash('snapshot copied'),
+            () => flash('snapshot copy failed'),
+          );
+        }
+      } catch (_) {}
+    } else if (ev.key === 'Escape' && !bar.hidden) {
+      ev.preventDefault();
+      close();
+    }
+  });
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); find(!ev.shiftKey); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+  });
+  input.addEventListener('input', () => find(true));
+}
+
+// ----- transient toast --------------------------------------------------------
+
+function flash(text) {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(flash._t);
+  flash._t = setTimeout(() => el.classList.remove('show'), 1200);
 }
