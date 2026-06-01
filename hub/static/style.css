@@ -287,3 +287,49 @@ main { position: relative; }
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
+
+/* Controller pill in the tab strip. Hidden until the first
+   ControllerChanged frame arrives, then renders one of three states:
+   controlling / viewing / no-controller. The button is the action for
+   the current state (release / take / acquire). */
+.tab .ctrl-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.4;
+  border: 1px solid transparent;
+}
+.tab .ctrl-pill[hidden] { display: none; }
+.tab .ctrl-pill.controlling {
+  background: rgba(166, 227, 161, 0.12);  /* green tint */
+  color: #a6e3a1;
+  border-color: rgba(166, 227, 161, 0.35);
+}
+.tab .ctrl-pill.viewing {
+  background: rgba(137, 180, 250, 0.12);  /* blue tint */
+  color: #89b4fa;
+  border-color: rgba(137, 180, 250, 0.35);
+}
+.tab .ctrl-pill.no-controller {
+  background: rgba(249, 226, 175, 0.10);  /* amber tint */
+  color: #f9e2af;
+  border-color: rgba(249, 226, 175, 0.30);
+}
+.tab .ctrl-pill .ctrl-btn {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0 4px;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  opacity: 0.85;
+}
+.tab .ctrl-pill .ctrl-btn:hover { opacity: 1; }

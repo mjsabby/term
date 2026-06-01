@@ -2,8 +2,10 @@
 
 Web terminal hub: passkey-gated, xterm.js front-end, **agents dial the
 hub** so they work behind NAT, in WSL, in VMs with internal-only IPs,
-or anywhere outbound TCP works. Tabs survive refresh via tmux on the
-agent and a URL fragment in the browser.
+or anywhere outbound TCP works. Tabs survive refresh via an in-agent
+session manager (no tmux required) and a URL fragment in the browser;
+multiple browsers can attach to the same session, with one *controller*
+holding the input/resize lease and the rest as read-only viewers.
 
 ```
 Browser  --HTTPS/WSS-->  Hub  <==TLS+mux+PSK==  Agent  --PTY-->  tmux -- $SHELL
@@ -19,7 +21,7 @@ Browser  --HTTPS/WSS-->  Hub  <==TLS+mux+PSK==  Agent  --PTY-->  tmux -- $SHELL
 | crate      | binary       | role                                            |
 |------------|--------------|-------------------------------------------------|
 | `common`   | —            | wire frame (mux), credential store, envelope    |
-| `agent`    | `term-agent` | dials hub, runs mux, tmux+PTY per stream        |
+| `agent`    | `term-agent` | dials hub, runs mux, in-agent session manager (drops tmux dep) |
 | `hub`      | `term-hub`   | HTTPS+ACME, WebAuthn, agent acceptor, WS proxy, embedded SPA |
 | `hub-admin`| `hub-admin`  | OOB passkey registration CLI on the hub host    |
 | `term-dl`  | `term-dl`    | helper run inside the shell to ship a file from the agent host to the browser as a download |
@@ -43,25 +45,31 @@ with `stream_id` pinned to 0 (the WS itself demultiplexes).
 ```
 [stream_id:u32 BE][type:u8][len:u32 BE][payload:len]    (9-byte header)
 
-type 0  = data            (raw PTY bytes, both directions, stream > 0)
-type 1  = resize          (rows:u16 BE, cols:u16 BE; hub->agent; stream > 0)
-type 2  = open            (utf-8 session_id; hub->agent; FIRST frame of stream)
-type 3  = close           (no payload; either direction; signals stream end)
-type 4  = ping            (<= 64B; either direction; stream = 0)
-type 5  = pong            (echo of ping payload; stream = 0)
-type 6  = hello           (json; agent->hub; FIRST frame; stream = 0)
-type 7  = paste-begin     (browser->agent; stream > 0; starts a chunked paste)
-type 8  = paste-chunk     (browser->agent; stream > 0; one chunk of a paste)
-type 9  = paste-end       (browser->agent; stream > 0; finalize or cancel)
-type 10 = paste-reject    (agent->browser; stream > 0; agent rejected a paste)
-type 11 = download-begin  (agent->browser; stream > 0; starts a chunked download)
-type 12 = download-chunk  (agent->browser; stream > 0; one chunk of a download)
-type 13 = download-end    (agent->browser; stream > 0; finalize or cancel)
+type 0  = data               (raw PTY bytes, both directions, stream > 0)
+type 1  = resize             (rows:u16 BE, cols:u16 BE; hub->agent; stream > 0)
+type 2  = open               (session_id + rows:u16 + cols:u16; hub->agent; FIRST frame of stream)
+type 3  = close              (no payload; either direction; signals stream end)
+type 4  = ping               (<= 64B; either direction; stream = 0)
+type 5  = pong               (echo of ping payload; stream = 0)
+type 6  = hello              (json; agent->hub; FIRST frame; stream = 0)
+type 7  = paste-begin        (browser->agent; stream > 0; starts a chunked paste)
+type 8  = paste-chunk        (browser->agent; stream > 0; one chunk of a paste)
+type 9  = paste-end          (browser->agent; stream > 0; finalize or cancel)
+type 10 = paste-reject       (agent->browser; stream > 0; agent rejected a paste)
+type 11 = download-begin     (agent->browser; stream > 0; starts a chunked download)
+type 12 = download-chunk     (agent->browser; stream > 0; one chunk of a download)
+type 13 = download-end       (agent->browser; stream > 0; finalize or cancel)
+type 14 = acquire-control    (browser->agent; stream > 0; ask to become controller)
+type 15 = release-control    (browser->agent; stream > 0; relinquish control)
+type 16 = take-control       (browser->agent; stream > 0; force preemption)
+type 17 = controller-changed (agent->browser; stream > 0; per-receiver status: 0=none, 1=self, 2=other)
 ```
 
-Caps: data ≤ 64 KiB, resize == 4 bytes, open ≤ 64 bytes of
-`[A-Za-z0-9_-]`, hello ≤ 1 KiB, ping/pong ≤ 64 bytes. Unknown types
-rejected. Reserve 14..=15 for future bolt-ons.
+Caps: data ≤ 64 KiB, resize == 4 bytes, open ≤ 64 + 4 bytes of
+`[A-Za-z0-9_-]` + initial size, hello ≤ 1 KiB, ping/pong ≤ 64 bytes,
+acquire/release/take-control 0 bytes, controller-changed 1 byte.
+Unknown types rejected. Reserve 18..=31 for the session-admin
+(ListSessions/KillSession) bolt-on.
 
 The hub→agent socket writer, the agent→hub socket writer, and the
 agent's per-stream input all use a two-priority channel so interactive
@@ -172,20 +180,50 @@ hub-admin remove <LABEL_OR_CRED_ID>  remove a credential
 hub-admin secret-info                show data_dir + HMAC fingerprint
 ```
 
-## Terminal persistence
+## Terminal persistence + multi-attach
 
-Each tab maps to a tmux session on its agent. The agent runs
-`tmux new-session -A -s <id> -- <shell>`, so reconnecting reattaches
-and tmux replays scrollback. Tab layout lives in the URL fragment:
+Each tab maps to a *session* on its agent. Sessions are owned by an
+in-agent session manager (no tmux required): on the first attach the
+agent spawns `$SHELL` in a fresh PTY; on subsequent attaches with the
+same `session_id` the existing PTY is reused and its scrollback ring
+(default 8 MiB) is replayed to the new client. Multiple browsers can
+attach to the same session at the same time.
+
+Tab layout lives in the URL fragment:
 
 ```
 https://term.xyz.com/#alpha:web-1,alpha:logs,wsl-laptop:root
 ```
 
+### Controller / viewer model
+
+When more than one browser is attached to a session, exactly one is
+the **controller** (input + resize go through) and the rest are
+**viewers** (read-only). Each tab strip shows a pill — `● controlling
+— release`, `👁 viewing — take`, or `— no controller — acquire` —
+that reflects the per-receiver status broadcast by the agent. Wire
+support: types 14–17 (`AcquireControl` / `ReleaseControl` /
+`TakeControl` / `ControllerChanged`).
+
+- First attacher of a fresh session = automatic controller.
+- `Acquire` succeeds only when nobody currently controls.
+- `Take` always succeeds; the prior controller becomes a viewer.
+- `Release` returns control to nobody (next attach or `Acquire`
+  picks it up).
+- When the controller changes, the PTY is resized to the new
+  controller's last-reported geometry; viewers see whatever the
+  controller has (no lowest-common-denominator shrinking).
+
+### Reattach + idle TTL
+
 Refresh = re-auth + reattach. Bookmarks save layouts. If an agent
 disconnects, the browser auto-reconnects with exponential backoff
 (500ms → 30s, with jitter) and the tab status pulses orange until the
 agent reappears.
+
+Sessions survive having no clients attached. After **24 h** with
+zero attached clients (configurable later via `agent.toml`) the
+session is garbage-collected and the shell is killed.
 
 ## Install (one-host quick start)
 

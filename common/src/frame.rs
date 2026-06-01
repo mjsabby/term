@@ -101,6 +101,30 @@ pub const DOWNLOAD_STATUS_OK:     u8 = 0;
 /// DownloadEnd status: cancel — browser discards accumulated chunks.
 pub const DOWNLOAD_STATUS_CANCEL: u8 = 1;
 
+// --- Controller / multi-attach handoff (Phase 4.2) ------------------------
+
+/// `Open` payload may optionally carry an initial terminal size after
+/// the session_id: `[session_id bytes][rows:u16 BE][cols:u16 BE]`.
+/// Bound = MAX_SESSION_ID_LEN + 4 trailing bytes.
+pub const MAX_OPEN_LEN: u32 = MAX_SESSION_ID_LEN + 4;
+/// `ControllerChanged` payload is a single `u8` status. The agent's
+/// per-stream outbound task maps the session's controller into this
+/// status when emitting on each stream:
+///   * `CONTROLLER_STATUS_NONE`  — no controller currently.
+///   * `CONTROLLER_STATUS_SELF`  — *this* browser is controller.
+///   * `CONTROLLER_STATUS_OTHER` — someone else is controller.
+///
+/// This way the browser never has to know its own (hub-allocated)
+/// stream_id.
+pub const CONTROLLER_CHANGED_LEN: u32 = 1;
+pub const CONTROLLER_STATUS_NONE:  u8 = 0;
+pub const CONTROLLER_STATUS_SELF:  u8 = 1;
+pub const CONTROLLER_STATUS_OTHER: u8 = 2;
+/// Legacy alias retained for the agent's internal SessionEvent
+/// (where the per-stream task can use the real stream_id before
+/// mapping). Wire payload uses the status byte above.
+pub const CONTROLLER_NONE_STREAM_ID: u32 = 0;
+
 pub const CONTROL_STREAM: u32 = 0;
 
 #[repr(u8)]
@@ -175,6 +199,30 @@ pub enum FrameType {
     /// `DOWNLOAD_STATUS_OK` (browser triggers save) or
     /// `DOWNLOAD_STATUS_CANCEL` (browser discards buffer).
     DownloadEnd = 13,
+    /// A viewer asks to become the session's controller. Stream-scoped
+    /// (stream_id != 0). Browser → agent only. No payload. Succeeds
+    /// only when the session has no current controller; otherwise
+    /// silently ignored (use `TakeControl` to preempt).
+    AcquireControl = 14,
+    /// The current controller voluntarily relinquishes control. Stream-
+    /// scoped. Browser → agent only. No payload. Honored only when the
+    /// sender is the current controller.
+    ReleaseControl = 15,
+    /// Force-take control of a session, demoting the prior controller
+    /// to viewer. Stream-scoped. Browser → agent only. No payload.
+    /// Always succeeds; the PTY is resized to the new controller's
+    /// last-reported geometry.
+    TakeControl = 16,
+    /// Broadcast to every attached browser whenever a session's
+    /// controller changes. Stream-scoped, agent → browser only.
+    /// Payload: `[status:u8]` — one of `CONTROLLER_STATUS_NONE`,
+    /// `CONTROLLER_STATUS_SELF`, `CONTROLLER_STATUS_OTHER`. The
+    /// agent's per-stream task remaps the session's internal
+    /// controller stream_id into one of these three values before
+    /// emitting, so the browser doesn't need to know its own
+    /// (hub-allocated) sid. Used to render the controlling / viewing
+    /// pill in the tab strip.
+    ControllerChanged = 17,
 }
 
 impl FrameType {
@@ -194,6 +242,10 @@ impl FrameType {
             11 => Some(FrameType::DownloadBegin),
             12 => Some(FrameType::DownloadChunk),
             13 => Some(FrameType::DownloadEnd),
+            14 => Some(FrameType::AcquireControl),
+            15 => Some(FrameType::ReleaseControl),
+            16 => Some(FrameType::TakeControl),
+            17 => Some(FrameType::ControllerChanged),
             _  => None,
         }
     }
@@ -249,13 +301,28 @@ pub enum FrameError {
     DownloadEndLen(u32),
     #[error("download-end status {0} invalid (expected 0 or 1)")]
     DownloadEndStatus(u8),
+    #[error("controller-changed payload must be exactly 1 byte (got {0})")]
+    ControllerChangedLen(u32),
+    #[error("controller-changed status {0} invalid (max {max})", max = CONTROLLER_STATUS_OTHER)]
+    ControllerChangedStatus(u8),
+    #[error("control frame {ty:?} must have empty payload (got {len})")]
+    ControlFrameNonEmpty { ty: FrameType, len: u32 },
 }
 
 #[derive(Debug, Clone)]
 pub enum Body {
     Data(Vec<u8>),
     Resize { rows: u16, cols: u16 },
-    Open(String),
+    /// First frame on a new mux stream. `session_id` matches
+    /// `[A-Za-z0-9_-]{1,64}`. `initial_size` carries the browser's
+    /// terminal geometry at attach time so the agent can spawn a fresh
+    /// session at the right size. Wire layout:
+    /// `[session_id bytes][rows:u16 BE][cols:u16 BE]` — size is
+    /// **mandatory** (the agent has no other way to know the geometry
+    /// before any Resize arrives, and the protocol versions here are
+    /// shipped in lockstep so there is no backward-compat client to
+    /// preserve).
+    Open { session_id: String, initial_size: (u16, u16) },
     Close,
     Ping(Vec<u8>),
     Pong(Vec<u8>),
@@ -293,6 +360,15 @@ pub enum Body {
     /// Finalize a download. `status` is `DOWNLOAD_STATUS_OK` or
     /// `DOWNLOAD_STATUS_CANCEL`.
     DownloadEnd { download_id: u32, status: u8 },
+    /// Viewer asks to become controller.
+    AcquireControl,
+    /// Controller voluntarily relinquishes control.
+    ReleaseControl,
+    /// Force preemption: caller becomes controller.
+    TakeControl,
+    /// Broadcast: per-receiver controller status. Use
+    /// `CONTROLLER_STATUS_*` constants.
+    ControllerChanged { status: u8 },
 }
 
 #[derive(Debug, Clone)]
@@ -308,8 +384,8 @@ impl Frame {
     pub fn resize(stream_id: u32, rows: u16, cols: u16) -> Self {
         Self { stream_id, body: Body::Resize { rows, cols } }
     }
-    pub fn open(stream_id: u32, session_id: String) -> Self {
-        Self { stream_id, body: Body::Open(session_id) }
+    pub fn open(stream_id: u32, session_id: String, initial_size: (u16, u16)) -> Self {
+        Self { stream_id, body: Body::Open { session_id, initial_size } }
     }
     pub fn close(stream_id: u32) -> Self {
         Self { stream_id, body: Body::Close }
@@ -354,30 +430,52 @@ impl Frame {
     pub fn download_end(stream_id: u32, download_id: u32, status: u8) -> Self {
         Self { stream_id, body: Body::DownloadEnd { download_id, status } }
     }
+    pub fn acquire_control(stream_id: u32) -> Self {
+        Self { stream_id, body: Body::AcquireControl }
+    }
+    pub fn release_control(stream_id: u32) -> Self {
+        Self { stream_id, body: Body::ReleaseControl }
+    }
+    pub fn take_control(stream_id: u32) -> Self {
+        Self { stream_id, body: Body::TakeControl }
+    }
+    pub fn controller_changed(stream_id: u32, status: u8) -> Self {
+        Self { stream_id, body: Body::ControllerChanged { status } }
+    }
 
     pub fn ty(&self) -> FrameType {
         match &self.body {
-            Body::Data(_)              => FrameType::Data,
-            Body::Resize { .. }        => FrameType::Resize,
-            Body::Open(_)              => FrameType::Open,
-            Body::Close                => FrameType::Close,
-            Body::Ping(_)              => FrameType::Ping,
-            Body::Pong(_)              => FrameType::Pong,
-            Body::Hello(_)             => FrameType::Hello,
-            Body::PasteBegin { .. }    => FrameType::PasteBegin,
-            Body::PasteChunk { .. }    => FrameType::PasteChunk,
-            Body::PasteEnd { .. }      => FrameType::PasteEnd,
-            Body::PasteReject { .. }   => FrameType::PasteReject,
-            Body::DownloadBegin { .. } => FrameType::DownloadBegin,
-            Body::DownloadChunk { .. } => FrameType::DownloadChunk,
-            Body::DownloadEnd { .. }   => FrameType::DownloadEnd,
+            Body::Data(_)                => FrameType::Data,
+            Body::Resize { .. }          => FrameType::Resize,
+            Body::Open { .. }            => FrameType::Open,
+            Body::Close                  => FrameType::Close,
+            Body::Ping(_)                => FrameType::Ping,
+            Body::Pong(_)                => FrameType::Pong,
+            Body::Hello(_)               => FrameType::Hello,
+            Body::PasteBegin { .. }      => FrameType::PasteBegin,
+            Body::PasteChunk { .. }      => FrameType::PasteChunk,
+            Body::PasteEnd { .. }        => FrameType::PasteEnd,
+            Body::PasteReject { .. }     => FrameType::PasteReject,
+            Body::DownloadBegin { .. }   => FrameType::DownloadBegin,
+            Body::DownloadChunk { .. }   => FrameType::DownloadChunk,
+            Body::DownloadEnd { .. }     => FrameType::DownloadEnd,
+            Body::AcquireControl         => FrameType::AcquireControl,
+            Body::ReleaseControl         => FrameType::ReleaseControl,
+            Body::TakeControl            => FrameType::TakeControl,
+            Body::ControllerChanged { .. } => FrameType::ControllerChanged,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let payload: std::borrow::Cow<'_, [u8]> = match &self.body {
             Body::Data(b)  => std::borrow::Cow::Borrowed(b),
-            Body::Open(s)  => std::borrow::Cow::Borrowed(s.as_bytes()),
+            Body::Open { session_id, initial_size: (rows, cols) } => {
+                let mut p = Vec::with_capacity(session_id.len() + 4);
+                p.extend_from_slice(session_id.as_bytes());
+                p.extend_from_slice(&rows.to_be_bytes());
+                p.extend_from_slice(&cols.to_be_bytes());
+                std::borrow::Cow::Owned(p)
+            }
             Body::Ping(b)  => std::borrow::Cow::Borrowed(b),
             Body::Pong(b)  => std::borrow::Cow::Borrowed(b),
             Body::Hello(b) => std::borrow::Cow::Borrowed(b),
@@ -457,6 +555,12 @@ impl Frame {
                 p.push(*status);
                 std::borrow::Cow::Owned(p)
             }
+            Body::AcquireControl | Body::ReleaseControl | Body::TakeControl => {
+                std::borrow::Cow::Borrowed(&[][..])
+            }
+            Body::ControllerChanged { status } => {
+                std::borrow::Cow::Owned(vec![*status])
+            }
         };
         let len = payload.len() as u32;
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -488,8 +592,10 @@ impl Frame {
             }
             FrameType::Open => {
                 if stream_id == CONTROL_STREAM { return Err(FrameError::DataOnControlStream); }
-                if len == 0 || len > MAX_SESSION_ID_LEN {
-                    return Err(FrameError::PayloadTooLarge { ty, len, max: MAX_SESSION_ID_LEN });
+                // Payload = session_id (1..=64 bytes) + 4 bytes
+                // (rows:u16 BE, cols:u16 BE). Min 5, max 68.
+                if !(5..=MAX_OPEN_LEN).contains(&len) {
+                    return Err(FrameError::PayloadTooLarge { ty, len, max: MAX_OPEN_LEN });
                 }
             }
             FrameType::Close => {
@@ -578,6 +684,18 @@ impl Frame {
                     return Err(FrameError::DownloadEndLen(len));
                 }
             }
+            FrameType::AcquireControl | FrameType::ReleaseControl | FrameType::TakeControl => {
+                if stream_id == CONTROL_STREAM { return Err(FrameError::DataOnControlStream); }
+                if len != 0 {
+                    return Err(FrameError::ControlFrameNonEmpty { ty, len });
+                }
+            }
+            FrameType::ControllerChanged => {
+                if stream_id == CONTROL_STREAM { return Err(FrameError::DataOnControlStream); }
+                if len != CONTROLLER_CHANGED_LEN {
+                    return Err(FrameError::ControllerChangedLen(len));
+                }
+            }
         }
         Ok((ty, len))
     }
@@ -590,9 +708,21 @@ impl Frame {
         let body = match ty {
             FrameType::Data   => Body::Data(payload),
             FrameType::Open   => {
-                let s = String::from_utf8(payload).map_err(|_| FrameError::SessionIdNotUtf8)?;
+                // Layout: [session_id bytes][rows:u16 BE][cols:u16 BE].
+                // header-validated payload.len() in 5..=68; trailing
+                // 4 bytes are the initial size.
+                if payload.len() < 5 {
+                    return Err(FrameError::PayloadTooLarge {
+                        ty, len: payload.len() as u32, max: MAX_OPEN_LEN,
+                    });
+                }
+                let split = payload.len() - 4;
+                let rows = u16::from_be_bytes([payload[split],     payload[split + 1]]);
+                let cols = u16::from_be_bytes([payload[split + 2], payload[split + 3]]);
+                let id_bytes = payload[..split].to_vec();
+                let s = String::from_utf8(id_bytes).map_err(|_| FrameError::SessionIdNotUtf8)?;
                 if !is_valid_session_id(&s) { return Err(FrameError::InvalidSessionId); }
-                Body::Open(s)
+                Body::Open { session_id: s, initial_size: (rows, cols) }
             }
             FrameType::Close  => Body::Close,
             FrameType::Resize => {
@@ -717,6 +847,19 @@ impl Frame {
                     return Err(FrameError::DownloadEndStatus(status));
                 }
                 Body::DownloadEnd { download_id, status }
+            }
+            FrameType::AcquireControl => Body::AcquireControl,
+            FrameType::ReleaseControl => Body::ReleaseControl,
+            FrameType::TakeControl    => Body::TakeControl,
+            FrameType::ControllerChanged => {
+                if payload.len() != CONTROLLER_CHANGED_LEN as usize {
+                    return Err(FrameError::ControllerChangedLen(payload.len() as u32));
+                }
+                let status = payload[0];
+                if status > CONTROLLER_STATUS_OTHER {
+                    return Err(FrameError::ControllerChangedStatus(status));
+                }
+                Body::ControllerChanged { status }
             }
         };
         Ok(Frame { stream_id, body })
@@ -1200,5 +1343,134 @@ mod tests {
             let e = Frame::validate_header(0, ty as u8, len).unwrap_err();
             assert!(matches!(e, FrameError::DataOnControlStream));
         }
+    }
+
+    // ----- controller frames + Open size piggyback -----
+
+    #[test]
+    fn open_with_size_round_trips() {
+        let f = Frame::open(7, "abc-123".into(), (24, 80));
+        let enc = f.encode();
+        let len = u32::from_be_bytes([enc[5], enc[6], enc[7], enc[8]]);
+        assert_eq!(len, 7 + 4);
+        let (ty, _) = Frame::validate_header(7, enc[4], len).unwrap();
+        let back = Frame::from_payload(7, ty, enc[HEADER_LEN..].to_vec()).unwrap();
+        match back.body {
+            Body::Open { session_id, initial_size } => {
+                assert_eq!(session_id, "abc-123");
+                assert_eq!(initial_size, (24, 80));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn open_64byte_id_with_size_works() {
+        // Exactly MAX_SESSION_ID_LEN id + 4 bytes size = 68 = MAX_OPEN_LEN.
+        let id = "a".repeat(MAX_SESSION_ID_LEN as usize);
+        let f = Frame::open(7, id.clone(), (50, 200));
+        let enc = f.encode();
+        let back = Frame::from_payload(7, FrameType::Open, enc[HEADER_LEN..].to_vec()).unwrap();
+        match back.body {
+            Body::Open { session_id, initial_size } => {
+                assert_eq!(session_id, id);
+                assert_eq!(initial_size, (50, 200));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn open_rejects_too_short() {
+        // len 4 = no room for session_id even with size.
+        let e = Frame::validate_header(7, FrameType::Open as u8, 4).unwrap_err();
+        assert!(matches!(e, FrameError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn open_rejects_oversize() {
+        let e = Frame::validate_header(7, FrameType::Open as u8, MAX_OPEN_LEN + 1).unwrap_err();
+        assert!(matches!(e, FrameError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn open_rejects_invalid_session_id() {
+        // "a b" id + (1,2) size — invalid charset; valid length 7.
+        let mut p = b"a b".to_vec();
+        p.extend_from_slice(&1u16.to_be_bytes());
+        p.extend_from_slice(&2u16.to_be_bytes());
+        let e = Frame::from_payload(7, FrameType::Open, p).unwrap_err();
+        assert!(matches!(e, FrameError::InvalidSessionId));
+    }
+
+    #[test]
+    fn control_frames_round_trip() {
+        type Ctor = fn(u32) -> Frame;
+        let cases: &[(Ctor, FrameType)] = &[
+            (Frame::acquire_control, FrameType::AcquireControl),
+            (Frame::release_control, FrameType::ReleaseControl),
+            (Frame::take_control,    FrameType::TakeControl),
+        ];
+        for (ctor, expected_ty) in cases.iter().copied() {
+            let f = ctor(3);
+            let enc = f.encode();
+            let len = u32::from_be_bytes([enc[5], enc[6], enc[7], enc[8]]);
+            assert_eq!(len, 0);
+            let (ty, _) = Frame::validate_header(3, enc[4], len).unwrap();
+            assert_eq!(ty, expected_ty);
+            let back = Frame::from_payload(3, ty, vec![]).unwrap();
+            assert_eq!(back.ty(), expected_ty);
+        }
+    }
+
+    #[test]
+    fn control_frames_reject_nonempty_payload() {
+        let e = Frame::validate_header(3, FrameType::AcquireControl as u8, 1).unwrap_err();
+        assert!(matches!(e, FrameError::ControlFrameNonEmpty { .. }));
+    }
+
+    #[test]
+    fn control_frames_rejected_on_control_stream() {
+        for ty in [
+            FrameType::AcquireControl,
+            FrameType::ReleaseControl,
+            FrameType::TakeControl,
+        ] {
+            let e = Frame::validate_header(0, ty as u8, 0).unwrap_err();
+            assert!(matches!(e, FrameError::DataOnControlStream));
+        }
+    }
+
+    #[test]
+    fn controller_changed_round_trip() {
+        for st in [
+            CONTROLLER_STATUS_NONE,
+            CONTROLLER_STATUS_SELF,
+            CONTROLLER_STATUS_OTHER,
+        ] {
+            let f = Frame::controller_changed(5, st);
+            let enc = f.encode();
+            let len = u32::from_be_bytes([enc[5], enc[6], enc[7], enc[8]]);
+            assert_eq!(len, CONTROLLER_CHANGED_LEN);
+            let (ty, _) = Frame::validate_header(5, enc[4], len).unwrap();
+            assert_eq!(ty, FrameType::ControllerChanged);
+            let back = Frame::from_payload(5, ty, enc[HEADER_LEN..].to_vec()).unwrap();
+            match back.body {
+                Body::ControllerChanged { status } => assert_eq!(status, st),
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn controller_changed_rejects_wrong_len() {
+        let e = Frame::validate_header(5, FrameType::ControllerChanged as u8, 4).unwrap_err();
+        assert!(matches!(e, FrameError::ControllerChangedLen(4)));
+    }
+
+    #[test]
+    fn controller_changed_rejects_bad_status() {
+        let e = Frame::from_payload(5, FrameType::ControllerChanged, vec![7]).unwrap_err();
+        assert!(matches!(e, FrameError::ControllerChangedStatus(7)));
     }
 }

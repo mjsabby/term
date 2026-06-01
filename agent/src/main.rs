@@ -2,9 +2,11 @@
 //!
 //! Dials the hub on `hub` (host:port), authenticates with PSK in a
 //! `Hello` frame, then runs the multiplex demuxer. Each `Open` frame on
-//! a new stream spawns a tmux+PTY task whose stdout flows back as
-//! `Data` frames on the same stream. Reconnects with exponential
-//! backoff on any failure.
+//! a new stream attaches to (or spawns) a [`session::Session`] whose
+//! stdout flows back as `Data` frames on the same stream. Reconnects
+//! with exponential backoff on any failure.
+
+mod session;
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -23,12 +25,11 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 use term_common::frame::{
     Body, Frame, FrameError, FrameType, HelloPayload, HEADER_LEN, HELLO_VERSION,
-    DOWNLOAD_STATUS_OK, MAX_PASTE_CHUNK_BYTES, MAX_PASTE_TOTAL_BYTES,
-    PASTE_REJECT_DUPLICATE_PASTE, PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_OPEN_FAILED,
-    PASTE_REJECT_REGISTRY_FULL, PASTE_REJECT_SIZE_MISMATCH, PASTE_REJECT_WRITE_FAILED,
-    PASTE_STATUS_CANCEL,
+    CONTROLLER_STATUS_NONE, CONTROLLER_STATUS_OTHER, CONTROLLER_STATUS_SELF,
+    MAX_DATA_LEN, MAX_PASTE_TOTAL_BYTES, PASTE_REJECT_DUPLICATE_PASTE,
+    PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_OPEN_FAILED, PASTE_REJECT_REGISTRY_FULL,
+    PASTE_REJECT_SIZE_MISMATCH, PASTE_REJECT_WRITE_FAILED, PASTE_STATUS_CANCEL,
 };
-use term_common::osc::OscScanner;
 use term_common::prio::{item_prio_channel, prio_channel, ItemPrioRx, ItemPrioTx, PrioTx};
 
 #[derive(Debug, Deserialize)]
@@ -46,15 +47,17 @@ struct AgentConfig {
     /// SNI / cert-verification target. Defaults to the host part of `hub`.
     #[serde(default)]
     server_name: Option<String>,
-    /// Shell program inside tmux. Defaults to $SHELL or /bin/sh.
+    /// Shell program spawned in a fresh PTY by the in-agent session
+    /// manager. Defaults to $SHELL or /bin/sh.
     #[serde(default)]
     shell: Option<String>,
-    /// tmux binary path.
-    #[serde(default = "default_tmux")]
-    tmux: String,
+    /// **Deprecated, ignored as of Phase 4.2** — the agent now manages
+    /// sessions in-process and no longer wraps in tmux. Kept here so
+    /// old `agent.toml` files still parse.
+    #[serde(default, rename = "tmux")]
+    _legacy_tmux: Option<String>,
 }
 fn default_tls() -> String { "on".into() }
-fn default_tmux() -> String { "tmux".into() }
 
 const WRITE_HI_BYTES:    usize    = 4 * 1024 * 1024;
 const WRITE_LO_BYTES:    usize    = 16 * 1024 * 1024;
@@ -65,9 +68,6 @@ const STREAM_HI_CAP:     usize    = 8;
 /// holds up to 1 MiB; 8 items ≈ 8 MiB worst case per active paste
 /// stream. Old item-based queue of 64 was 64 MiB worst case.
 const STREAM_LO_CAP:     usize    = 8;
-/// Max concurrent in-flight downloads per mux stream. Each download
-/// task holds an open fd + a 1 MiB read buffer.
-const MAX_INFLIGHT_DOWNLOADS: usize = 16;
 const PING_INTERVAL:     Duration = Duration::from_secs(30);
 const IDLE_DEADLINE:     Duration = Duration::from_secs(90);
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
@@ -126,13 +126,12 @@ async fn main() -> Result<()> {
         tls_on,
         server_name,
         shell,
-        tmux: cfg.tmux,
     });
 
     info!(
-        "term-agent: hub={} machine_id={} tls={} server_name={} tmux={} shell={}",
+        "term-agent: hub={} machine_id={} tls={} server_name={} shell={}",
         resolved.hub, resolved.machine_id, if resolved.tls_on { "on" } else { "off" },
-        resolved.server_name, resolved.tmux, resolved.shell,
+        resolved.server_name, resolved.shell,
     );
 
     let tls_connector = if resolved.tls_on { Some(build_tls_connector()?) } else { None };
@@ -172,7 +171,6 @@ struct ResolvedConfig {
     tls_on: bool,
     server_name: String,
     shell: String,
-    tmux: String,
 }
 
 fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {
@@ -243,6 +241,22 @@ where
         .await
         .map_err(|_| anyhow!("writer closed before hello"))?;
 
+    // In-agent session manager: drops tmux, owns PTYs + scrollback +
+    // controller state across browser tab lifecycle.
+    let sessions = session::SessionManager::new(cfg.shell.clone());
+
+    // Idle/exit sweeper: periodically drops sessions whose shells have
+    // exited OR which have been detached longer than IDLE_TTL.
+    let gc_sessions = sessions.clone();
+    let gc_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            gc_sessions.gc_pass().await;
+        }
+    });
+
     // Per-stream registry. Each stream gets a priority channel so
     // interactive Data/Resize never sit behind 1 MiB PasteChunks.
     let streams: Arc<Mutex<HashMap<u32, ItemPrioTx<Body>>>> =
@@ -273,15 +287,18 @@ where
                 (0, Body::Pong(_))  => {}
                 (0, Body::Hello(_)) => bail!("hub sent hello (protocol error)"),
                 (0, _)              => bail!("unexpected control-stream frame"),
-                (sid, Body::Open(session_id)) => {
-                    // Spawn a per-session task.
+                (sid, Body::Open { session_id, initial_size }) => {
+                    // Spawn a per-stream task that attaches to (or
+                    // spawns) the session and pumps frames.
                     let (s_tx, s_rx) = item_prio_channel::<Body>(STREAM_HI_CAP, STREAM_LO_CAP);
                     streams.lock().await.insert(sid, s_tx);
-                    let cfg = cfg.clone();
+                    let sessions = sessions.clone();
                     let writer = write_tx.clone();
                     let streams = streams.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = run_session_stream(cfg, sid, session_id.clone(), s_rx, writer.clone()).await {
+                        if let Err(e) = run_session_stream(
+                            sessions, sid, session_id.clone(), initial_size, s_rx, writer.clone()
+                        ).await {
                             warn!(stream_id = sid, session = %session_id, error = %e, "session ended with error");
                         }
                         // Best-effort: tell hub the stream is done and
@@ -315,6 +332,7 @@ where
     // Tear down everything for this connection.
     streams.lock().await.clear(); // drops all per-stream txes -> sessions terminate
     pinger.abort();
+    gc_task.abort();
     drop(write_tx);
     let _ = writer_task.await;
 
@@ -368,107 +386,121 @@ struct PendingGroup {
     total_declared: u64,
 }
 
-/// Spawn tmux+PTY and pump data both ways for one stream.
+/// Per-stream task: attach to the session, replay scrollback, pump
+/// frames in both directions. The PTY, OSC scanner, scrollback, and
+/// download stream all live inside the shared [`session::Session`] —
+/// this function only handles wire-side concerns (paste uploads,
+/// controller frames, broadcast → writer fan-out for THIS stream's
+/// sid).
 async fn run_session_stream(
-    cfg: Arc<ResolvedConfig>,
+    sessions: Arc<session::SessionManager>,
     sid: u32,
     session_id: String,
+    initial_size: (u16, u16),
     mut rx: ItemPrioRx<Body>,
     writer: PrioTx,
 ) -> Result<()> {
-    let (pty, pts) = pty_process::open().context("pty_process::open")?;
-    pty.resize(pty_process::Size::new(24, 80)).context("initial resize")?;
-    // systemd service units inherit no TERM and no locale. Set a
-    // terminfo-capable TERM so tmux starts, advertise truecolor so
-    // modern TUIs (nvim, bat, eza, …) light up, and pick a UTF-8 locale
-    // so glibc-based programs render non-ASCII correctly. xterm.js is
-    // xterm-compatible and supports 24-bit color via COLORTERM=truecolor.
-    let mut child = pty_process::Command::new(&cfg.tmux)
-        .env("TERM",      "xterm-256color")
-        .env("COLORTERM", "truecolor")
-        .env("LANG",      "C.UTF-8")
-        .env("LC_ALL",    "C.UTF-8")
-        .args(["new-session", "-A", "-s", &session_id, "--", &cfg.shell])
-        .spawn(pts)
-        .context("spawn tmux")?;
+    // Look up or spawn the underlying session.
+    let session = sessions.lookup_or_spawn(&session_id, initial_size).await?;
+    let attach = session.attach(sid, initial_size).await;
+    info!(stream_id = sid, session = %session_id,
+          became_controller = attach.became_controller,
+          "attached to session");
 
-    let (mut pty_r, pty_w) = pty.into_split();
-    info!(stream_id = sid, session = %session_id, "tmux session started");
+    // Replay scrollback as Data frames before live output resumes. Cap
+    // each frame at MAX_DATA_LEN so the wire is well-formed.
+    for chunk in attach.scrollback.chunks(MAX_DATA_LEN as usize) {
+        send_frame_to_hub(&writer, Frame::data(sid, chunk.to_vec()))
+            .await
+            .map_err(|_| anyhow!("writer closed during scrollback replay"))?;
+    }
+    // Tell this browser who the current controller is, in *its own*
+    // reference frame (it doesn't know its hub-allocated sid).
+    let initial_status = match attach.current_controller {
+        None      => CONTROLLER_STATUS_NONE,
+        Some(c) if c == sid => CONTROLLER_STATUS_SELF,
+        _         => CONTROLLER_STATUS_OTHER,
+    };
+    let _ = send_frame_to_hub(&writer, Frame::controller_changed(sid, initial_status)).await;
 
-    // pty_w is shared between the rx-driven control loop and the
-    // group-flush path; tokio::sync::Mutex is held across .await on
-    // writes, so std::sync::Mutex won't do.
-    let pty_w = Arc::new(tokio::sync::Mutex::new(pty_w));
-
-    // Paste registries live in Arcs so that, no matter which arm of the
-    // tokio::select! finishes first, the post-select cleanup runs over
-    // the same maps and can unlink any tempfiles for in-flight pastes.
+    // Per-stream paste state (PasteBegin/Chunk/End handlers buffer
+    // chunks here; on PasteEnd the path is typed into the shared PTY
+    // via session.write_internal()).
     let pending_pastes: Arc<tokio::sync::Mutex<HashMap<u32, PendingPaste>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_groups: Arc<tokio::sync::Mutex<HashMap<u32, PendingGroup>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    // Per-stream download bookkeeping. Bounds concurrent downloads so a
-    // shell script that spams `term-dl` against many files can't open
-    // unbounded fds. `next_download_id` only needs uniqueness among
-    // *this stream's* in-flight downloads. The JoinSet + Notify pair
-    // give us cancellation so we can stop in-flight downloads as soon
-    // as the stream goes away (browser close, agent shutdown).
-    let download_sem = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_DOWNLOADS));
-    let next_download_id = Arc::new(std::sync::atomic::AtomicU32::new(1));
-    let download_cancel: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-    let download_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>> =
-        Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
-
-    let pty_to_writer = {
+    // Outbound: forward broadcast events from the session to our writer.
+    let outbound = {
         let writer = writer.clone();
-        let pty_w = pty_w.clone();
-        let download_sem = download_sem.clone();
-        let next_download_id = next_download_id.clone();
-        let download_cancel = download_cancel.clone();
-        let download_tasks = download_tasks.clone();
+        let mut event_rx = attach.event_rx;
         async move {
-            let mut buf = vec![0u8; 16 * 1024];
-            let mut osc = OscScanner::new();
             loop {
-                let n = pty_r.read(&mut buf).await?;
-                if n == 0 { return Ok::<(), anyhow::Error>(()); }
-                let (fwd, captured) = osc.feed(&buf[..n]);
-                if !fwd.is_empty()
-                    && send_frame_to_hub(&writer, Frame::data(sid, fwd)).await.is_err()
-                {
-                    return Err(anyhow!("writer closed"));
-                }
-                for payload in captured {
-                    dispatch_app_osc(
-                        sid, payload,
-                        &writer, &pty_w,
-                        &download_sem, &next_download_id,
-                        &download_cancel, &download_tasks,
-                    ).await;
+                use session::SessionEvent::*;
+                match event_rx.recv().await {
+                    Ok(Data(bytes)) => {
+                        for chunk in bytes.chunks(MAX_DATA_LEN as usize) {
+                            if send_frame_to_hub(&writer, Frame::data(sid, chunk.to_vec()))
+                                .await.is_err()
+                            { return; }
+                        }
+                    }
+                    Ok(ControllerChanged { controller }) => {
+                        let status = if controller == term_common::frame::CONTROLLER_NONE_STREAM_ID {
+                            CONTROLLER_STATUS_NONE
+                        } else if controller == sid {
+                            CONTROLLER_STATUS_SELF
+                        } else {
+                            CONTROLLER_STATUS_OTHER
+                        };
+                        if send_frame_to_hub(&writer,
+                            Frame::controller_changed(sid, status)).await.is_err()
+                        { return; }
+                    }
+                    Ok(DownloadBegin { id, total_size, name }) => {
+                        if send_frame_to_hub(&writer,
+                            Frame::download_begin(sid, id, total_size, name)).await.is_err()
+                        { return; }
+                    }
+                    Ok(DownloadChunk { id, bytes }) => {
+                        if send_frame_to_hub(&writer,
+                            Frame::download_chunk(sid, id, bytes.as_ref().clone()))
+                            .await.is_err()
+                        { return; }
+                    }
+                    Ok(DownloadEnd { id, status }) => {
+                        if send_frame_to_hub(&writer,
+                            Frame::download_end(sid, id, status)).await.is_err()
+                        { return; }
+                    }
+                    Ok(Closed) => {
+                        let _ = send_frame_to_hub(&writer, Frame::close(sid)).await;
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(stream_id = sid, lagged = n, "broadcast lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         }
     };
 
-    let rx_to_pty = {
-        let pty_w = pty_w.clone();
+    // Inbound: forward rx frames to the session.
+    let inbound = {
+        let session = session.clone();
         let pending_pastes = pending_pastes.clone();
         let pending_groups = pending_groups.clone();
         let writer = writer.clone();
         async move {
             while let Some(body) = rx.recv().await {
                 match body {
-                    Body::Data(b) => {
-                        pty_w.lock().await.write_all(&b).await?;
-                    }
-                    Body::Resize { rows, cols } => {
-                        if let Err(e) = pty_w.lock().await
-                            .resize(pty_process::Size::new(rows, cols))
-                        {
-                            warn!(error = %e, "pty resize failed");
-                        }
-                    }
+                    Body::Data(b) => session.write_input_from(sid, &b).await,
+                    Body::Resize { rows, cols } => session.resize_for(sid, rows, cols).await,
+                    Body::AcquireControl => { session.acquire_control(sid).await; }
+                    Body::ReleaseControl => { session.release_control(sid).await; }
+                    Body::TakeControl    => { session.take_control(sid).await; }
                     Body::PasteBegin { paste_id, total_size, group_id, group_size, name } => {
                         handle_paste_begin(
                             sid, paste_id, total_size, group_id, group_size, name,
@@ -481,39 +513,26 @@ async fn run_session_stream(
                     Body::PasteEnd { paste_id, status } => {
                         handle_paste_end(
                             sid, paste_id, status,
-                            &pending_pastes, &pending_groups, &pty_w, &writer,
+                            &pending_pastes, &pending_groups, &session, &writer,
                         ).await;
                     }
                     Body::Close => break,
                     _ => debug!("ignored body on session stream"),
                 }
             }
-            Ok::<(), anyhow::Error>(())
         }
     };
 
     tokio::select! {
-        _ = pty_to_writer => {}
-        _ = rx_to_pty     => {}
-    };
-
-    // Tear down any in-flight downloads BEFORE running cleanup so they
-    // stop pumping bytes into a dying stream. `notify_waiters` wakes
-    // every in-flight `run_download` cancellation-aware select; aborting
-    // the JoinSet for good measure handles tasks that haven't reached
-    // their await point yet.
-    download_cancel.notify_waiters();
-    {
-        let mut tasks = download_tasks.lock().await;
-        tasks.abort_all();
-        // Drain so we don't leak JoinHandles; ignore individual errors.
-        while tasks.join_next().await.is_some() {}
+        _ = outbound => {}
+        _ = inbound  => {}
     }
 
-    // Cancellation-safe cleanup: works whether rx_to_pty completed
-    // normally OR was cancelled because pty_to_writer finished first.
-    // Both branches drop the local future tree, but `pending_pastes`/
-    // `pending_groups` are Arcs and survive.
+    // Detach (releases controller slot if we held it; broadcasts
+    // ControllerChanged(none) to the remaining viewers).
+    session.detach(sid).await;
+
+    // Clean up any in-flight pastes for this stream.
     {
         let mut pp = pending_pastes.lock().await;
         for (_, p) in pp.drain() {
@@ -529,8 +548,6 @@ async fn run_session_stream(
         }
     }
 
-    let _ = child.start_kill();
-    let _ = child.wait().await;
     Ok(())
 }
 
@@ -695,7 +712,7 @@ async fn handle_paste_end(
     status: u8,
     pending_pastes: &tokio::sync::Mutex<HashMap<u32, PendingPaste>>,
     pending_groups: &tokio::sync::Mutex<HashMap<u32, PendingGroup>>,
-    pty_w: &tokio::sync::Mutex<pty_process::OwnedWritePty>,
+    session: &Arc<session::Session>,
     writer: &PrioTx,
 ) {
     let mut pp = pending_pastes.lock().await;
@@ -766,18 +783,19 @@ async fn handle_paste_end(
     };
 
     if let Some(paths) = to_inject {
-        inject_paste_paths(sid, paths, pty_w).await;
+        inject_paste_paths(sid, paths, session).await;
     }
 }
 
 /// Build a single bracketed-paste sequence
-/// `ESC[200~ p1 p2 ... pn ESC[201~` and write it to the PTY, so shells
-/// / readline / vim treat the lot as literal text and do not execute
-/// it. Trailing space lets the user keep typing without a gap.
+/// `ESC[200~ p1 p2 ... pn ESC[201~` and write it to the shared PTY via
+/// the Session, so all attached viewers see the typed paths. Shells /
+/// readline / vim treat the lot as literal text and do not execute it.
+/// Trailing space lets the user keep typing without a gap.
 async fn inject_paste_paths(
     sid: u32,
     paths: Vec<PathBuf>,
-    pty_w: &tokio::sync::Mutex<pty_process::OwnedWritePty>,
+    session: &Arc<session::Session>,
 ) {
     let cap: usize = paths.iter().map(|p| p.as_os_str().len() + 1).sum::<usize>() + 16;
     let mut seq = Vec::with_capacity(cap);
@@ -787,170 +805,11 @@ async fn inject_paste_paths(
         seq.extend_from_slice(p.as_os_str().as_encoded_bytes());
     }
     seq.extend_from_slice(b" \x1b[201~");
-    let mut w = pty_w.lock().await;
-    if let Err(e) = w.write_all(&seq).await {
+    if let Err(e) = session.write_internal(&seq).await {
         warn!(stream_id = sid, error = %e, "pty write of pasted paths failed");
     }
 }
 
-// ----- application OSC dispatch (term-dl) -----------------------------------
-
-/// Dispatch one application OSC payload captured from the PTY output.
-/// The OSC `\x1b]5111;dl;<path>\x07` triggers a download of `<path>`
-/// from the agent to the browser on the same mux stream.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_app_osc(
-    sid: u32,
-    payload: Vec<u8>,
-    writer: &PrioTx,
-    pty_w: &Arc<tokio::sync::Mutex<pty_process::OwnedWritePty>>,
-    sem: &Arc<tokio::sync::Semaphore>,
-    next_id: &Arc<std::sync::atomic::AtomicU32>,
-    cancel: &Arc<tokio::sync::Notify>,
-    tasks: &Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
-) {
-    // payload looks like `dl;/absolute/path/to/file`.
-    let Some(semi) = payload.iter().position(|&b| b == b';') else {
-        warn!(stream_id = sid, "app OSC missing subcommand separator");
-        return;
-    };
-    let cmd = &payload[..semi];
-    let arg = &payload[semi + 1..];
-    if cmd != b"dl" {
-        warn!(stream_id = sid, cmd = ?String::from_utf8_lossy(cmd),
-              "unknown app OSC subcommand; ignoring");
-        return;
-    }
-    let path = match std::str::from_utf8(arg) {
-        Ok(s) => PathBuf::from(s),
-        Err(_) => {
-            warn!(stream_id = sid, "app OSC path not utf-8");
-            return;
-        }
-    };
-
-    let permit = match sem.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            // Too many concurrent downloads — bail loudly into the PTY
-            // so the user knows.
-            term_dl_error(pty_w, "too many concurrent downloads").await;
-            return;
-        }
-    };
-    let download_id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let writer = writer.clone();
-    let pty_w = pty_w.clone();
-    let cancel = cancel.clone();
-    tasks.lock().await.spawn(async move {
-        // run_download bails fast if `cancel` fires, so a browser
-        // disconnect doesn't keep streaming GiBs into a dead stream.
-        let result = tokio::select! {
-            biased;
-            _ = cancel.notified() => Err(anyhow!("stream cancelled")),
-            r = run_download(sid, download_id, &path, &writer) => r,
-        };
-        if let Err(e) = result {
-            warn!(stream_id = sid, download_id, path = %path.display(),
-                  error = %e, "download failed");
-            // Best-effort cancel for whatever the browser may have seen.
-            let _ = send_frame_to_hub(
-                &writer,
-                Frame::download_end(sid, download_id,
-                    term_common::frame::DOWNLOAD_STATUS_CANCEL),
-            ).await;
-            term_dl_error(&pty_w, &format!("{}: {e}", path.display())).await;
-        }
-        drop(permit);
-    });
-}
-
-/// Stream `path` to the browser on `sid` as a chunked download.
-/// Returns Err on any I/O or send failure so the caller can emit a
-/// `DownloadEnd(cancel)` and a PTY error line.
-async fn run_download(
-    sid: u32,
-    download_id: u32,
-    path: &Path,
-    writer: &PrioTx,
-) -> Result<()> {
-    let mut file = fs::File::open(path).await
-        .with_context(|| format!("opening {}", path.display()))?;
-    let meta = file.metadata().await
-        .with_context(|| format!("stat {}", path.display()))?;
-    if !meta.is_file() {
-        bail!("{} is not a regular file", path.display());
-    }
-    let total_size = meta.len();
-    if total_size > MAX_PASTE_TOTAL_BYTES {
-        bail!(
-            "{} is {} bytes; over 4 GiB cap",
-            path.display(), total_size
-        );
-    }
-    let name = path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("download")
-        .to_owned();
-
-    info!(stream_id = sid, download_id, name = %name, total_size, "download begin");
-
-    send_frame_to_hub(
-        writer,
-        Frame::download_begin(sid, download_id, total_size, name.clone()),
-    ).await.map_err(|_| anyhow!("writer closed before download begin"))?;
-
-    let mut buf = vec![0u8; MAX_PASTE_CHUNK_BYTES as usize];
-    let mut sent: u64 = 0;
-    loop {
-        let n = file.read(&mut buf).await
-            .with_context(|| format!("reading {}", path.display()))?;
-        if n == 0 { break; }
-        // Refuse to overshoot the size declared in Begin. Bail rather
-        // than truncate so the browser discards instead of saving a
-        // file that lies about its own length. (Happens if the file
-        // grew under us between stat and read.)
-        if sent.saturating_add(n as u64) > total_size {
-            bail!(
-                "{} grew during read: declared {total_size}, would send {}",
-                path.display(),
-                sent + n as u64,
-            );
-        }
-        let chunk = buf[..n].to_vec();
-        sent = sent.saturating_add(n as u64);
-        send_frame_to_hub(writer, Frame::download_chunk(sid, download_id, chunk))
-            .await
-            .map_err(|_| anyhow!("writer closed mid-download"))?;
-    }
-
-    if sent != total_size {
-        // File shrank under us (race). Treat as failure so the browser
-        // discards instead of saving a truncated file.
-        bail!(
-            "{} shrank during read: declared {total_size}, sent {sent}",
-            path.display()
-        );
-    }
-
-    send_frame_to_hub(writer, Frame::download_end(sid, download_id, DOWNLOAD_STATUS_OK))
-        .await
-        .map_err(|_| anyhow!("writer closed before download end"))?;
-
-    info!(stream_id = sid, download_id, "download committed");
-    Ok(())
-}
-
-/// Write a `\rterm-dl: <msg>\r\n` line into the PTY so the user sees a
-/// visible error after running `term-dl`.
-async fn term_dl_error(
-    pty_w: &tokio::sync::Mutex<pty_process::OwnedWritePty>,
-    msg: &str,
-) {
-    let line = format!("\rterm-dl: {msg}\r\n");
-    let mut w = pty_w.lock().await;
-    let _ = w.write_all(line.as_bytes()).await;
-}
 
 /// Returns the path used for pasted screenshots (does NOT create it; use
 /// [`ensure_paste_dir`]).

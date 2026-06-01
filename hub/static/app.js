@@ -94,16 +94,20 @@ function assertionToJSON(cred) {
 // back to 0 on the way back.
 
 const HEADER_LEN   = 9;
-const FRAME_DATA            = 0;
-const FRAME_RESIZE          = 1;
-const FRAME_OPEN            = 2;
-const FRAME_PASTE_BEGIN     = 7;
-const FRAME_PASTE_CHUNK     = 8;
-const FRAME_PASTE_END       = 9;
-const FRAME_PASTE_REJECT    = 10;
-const FRAME_DOWNLOAD_BEGIN  = 11;
-const FRAME_DOWNLOAD_CHUNK  = 12;
-const FRAME_DOWNLOAD_END    = 13;
+const FRAME_DATA               = 0;
+const FRAME_RESIZE             = 1;
+const FRAME_OPEN               = 2;
+const FRAME_PASTE_BEGIN        = 7;
+const FRAME_PASTE_CHUNK        = 8;
+const FRAME_PASTE_END          = 9;
+const FRAME_PASTE_REJECT       = 10;
+const FRAME_DOWNLOAD_BEGIN     = 11;
+const FRAME_DOWNLOAD_CHUNK     = 12;
+const FRAME_DOWNLOAD_END       = 13;
+const FRAME_ACQUIRE_CONTROL    = 14;
+const FRAME_RELEASE_CONTROL    = 15;
+const FRAME_TAKE_CONTROL       = 16;
+const FRAME_CONTROLLER_CHANGED = 17;
 
 // Mirror the constants in common/src/frame.rs.
 const MAX_PASTE_TOTAL_BYTES = 4 * 1024 * 1024 * 1024 - 1; // 4 GiB - 1
@@ -154,8 +158,20 @@ function encodeResize(rows, cols) {
   p[2] = (cols >>> 8) & 0xff; p[3] = cols & 0xff;
   return encodeFrame(FRAME_RESIZE, p);
 }
-function encodeOpen(sessionId) {
-  return encodeFrame(FRAME_OPEN, new TextEncoder().encode(sessionId));
+function encodeOpen(sessionId, rows, cols) {
+  // Wire: [session_id UTF-8][rows:u16 BE][cols:u16 BE]
+  const idBytes = new TextEncoder().encode(sessionId);
+  const payload = new Uint8Array(idBytes.length + 4);
+  payload.set(idBytes, 0);
+  payload[idBytes.length    ] = (rows >>> 8) & 0xff;
+  payload[idBytes.length + 1] =  rows        & 0xff;
+  payload[idBytes.length + 2] = (cols >>> 8) & 0xff;
+  payload[idBytes.length + 3] =  cols        & 0xff;
+  return encodeFrame(FRAME_OPEN, payload);
+}
+function encodeControlOnly(type) {
+  // AcquireControl / ReleaseControl / TakeControl — zero-payload.
+  return encodeFrame(type, new Uint8Array(0));
 }
 
 function writeU32BE(buf, off, n) {
@@ -536,16 +552,33 @@ function openTab(machineId, sessionId, activate) {
   const name = document.createElement('span');
   name.className = 'name';
   name.textContent = `${machine.label} · ${sessionId}`;
+  // Controller pill: shows "● controlling — Release" when this tab is
+  // controller, "👁 viewing — Take control" when not, and "no
+  // controller — Acquire" when nobody controls. Wired by
+  // handleControllerChanged below.
+  const ctrlPill = document.createElement('span');
+  ctrlPill.className = 'ctrl-pill';
+  ctrlPill.hidden = true;
+  const ctrlLabel = document.createElement('span');
+  ctrlLabel.className = 'ctrl-label';
+  const ctrlBtn = document.createElement('button');
+  ctrlBtn.type = 'button';
+  ctrlBtn.className = 'ctrl-btn';
+  ctrlPill.appendChild(ctrlLabel);
+  ctrlPill.appendChild(ctrlBtn);
   const close = document.createElement('button');
   close.type = 'button';
   close.className = 'close'; close.textContent = '×'; close.title = 'close';
   tabEl.appendChild(status);
   tabEl.appendChild(name);
+  tabEl.appendChild(ctrlPill);
   tabEl.appendChild(close);
   $('#tab-bar').appendChild(tabEl);
 
   const tab = {
     machineId, sessionId, term, fit, search, serialize, paneEl, tabEl, statusEl: status,
+    ctrlPill, ctrlLabel, ctrlBtn,
+    controllerStatus: 0, // CONTROLLER_STATUS_NONE
     ws: null, dataDisposable: null, resizeDisposable: null,
     closing: false, reconnectAttempt: 0, reconnectTimer: 0,
   };
@@ -553,6 +586,18 @@ function openTab(machineId, sessionId, activate) {
   writeFragment(tabs);
 
   attachClipboardHandlers(tab);
+
+  // Wire the controller-pill button: behavior depends on current
+  // status. Stops propagation so it doesn't also activate the tab.
+  ctrlBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+    switch (tab.controllerStatus) {
+      case 0: tab.ws.send(encodeControlOnly(FRAME_ACQUIRE_CONTROL)); break;
+      case 1: tab.ws.send(encodeControlOnly(FRAME_RELEASE_CONTROL)); break;
+      case 2: tab.ws.send(encodeControlOnly(FRAME_TAKE_CONTROL));    break;
+    }
+  });
 
   tabEl.addEventListener('click', (ev) => {
     if (ev.target === close) return;
@@ -841,6 +886,36 @@ function handleDownloadEnd(tab, payload) {
   flash(`downloaded ${dl.name}`);
 }
 
+/// Update the controller pill in the tab strip based on the
+/// per-receiver status byte the agent sent us.
+/// status = 0 (NONE) | 1 (SELF) | 2 (OTHER).
+function handleControllerChanged(tab, status) {
+  tab.controllerStatus = status;
+  if (!tab.ctrlPill) return;
+  tab.ctrlPill.hidden = false;
+  tab.ctrlPill.classList.remove('controlling', 'viewing', 'no-controller');
+  switch (status) {
+    case 1: // SELF
+      tab.ctrlPill.classList.add('controlling');
+      tab.ctrlLabel.textContent = '● controlling';
+      tab.ctrlBtn.textContent = 'release';
+      tab.ctrlBtn.title = 'release control of this session';
+      break;
+    case 2: // OTHER
+      tab.ctrlPill.classList.add('viewing');
+      tab.ctrlLabel.textContent = '👁 viewing';
+      tab.ctrlBtn.textContent = 'take';
+      tab.ctrlBtn.title = 'take control (the current controller becomes a viewer)';
+      break;
+    default: // NONE
+      tab.ctrlPill.classList.add('no-controller');
+      tab.ctrlLabel.textContent = '— no controller';
+      tab.ctrlBtn.textContent = 'acquire';
+      tab.ctrlBtn.title = 'become the controller for this session';
+      break;
+  }
+}
+
 /// Programmatic save via a hidden <a download>. URL.createObjectURL is
 /// per-document so we revoke after the click to avoid leaking the blob.
 function saveBlob(blob, suggestedName) {
@@ -976,9 +1051,17 @@ function connectTab(tab) {
   ws.addEventListener('open', () => {
     tab.reconnectAttempt = 0;
     setStatus(tab, 'ok');
-    // First frame: Open(session_id) — tmux on the agent reattaches the
-    // session by this id so scrollback is preserved across reconnects.
-    ws.send(encodeOpen(tab.sessionId));
+    // First frame: Open(session_id, initial_size) — agent attaches to
+    // (or spawns) the session with this geometry, so a fresh PTY comes
+    // up at the right size instead of the 24×80 placeholder.
+    let { fit } = tab;
+    // The fit addon needs the pane visible to compute size; if this
+    // tab isn't the active one yet, fit may report nothing. Fall back
+    // to (24, 80) — Resize will fix it as soon as the tab is shown.
+    try { fit.fit(); } catch (_) {}
+    const rows = (tab.term && tab.term.rows) ? tab.term.rows : 24;
+    const cols = (tab.term && tab.term.cols) ? tab.term.cols : 80;
+    ws.send(encodeOpen(tab.sessionId, rows, cols));
     sendResizeIfReady(tab);
     tab.dataDisposable = tab.term.onData((str) => {
       if (ws.readyState !== WebSocket.OPEN) return;
@@ -1017,6 +1100,11 @@ function connectTab(tab) {
       handleDownloadChunk(tab, f.payload);
     } else if (f.type === FRAME_DOWNLOAD_END) {
       handleDownloadEnd(tab, f.payload);
+    } else if (f.type === FRAME_CONTROLLER_CHANGED && f.payload.length === 1) {
+      // status: 0 = no controller, 1 = SELF, 2 = OTHER. Agent does
+      // the mapping per-stream so the browser doesn't have to know its
+      // own (hub-allocated) sid.
+      handleControllerChanged(tab, f.payload[0]);
     }
     // Other frame types coming from hub are not currently used in this
     // direction; ignore.

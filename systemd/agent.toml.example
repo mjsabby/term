@@ -23,10 +23,13 @@ tls         = "on"
 ## DNS-named cert.
 # server_name = "term.xyz.com"
 
-## Shell run inside tmux. Defaults to $SHELL of the unit user, else /bin/sh.
-## For a login shell, set in ~/.tmux.conf instead:
-##     set -g default-command "/bin/bash -l"
+## Shell spawned in a fresh PTY by the in-agent session manager.
+## Defaults to $SHELL of the unit user, else /bin/sh. Use an absolute
+## path. For a login shell, point at a wrapper script that exec's your
+## shell with -l, e.g.:
+##   #!/bin/sh
+##   exec /bin/bash -l "$@"
 shell       = "/bin/bash"
 
-## tmux binary. Defaults to "tmux" looked up in $PATH.
-tmux        = "/usr/bin/tmux"
+## (Legacy, ignored as of Phase 4.2: the agent no longer wraps in tmux.)
+# tmux        = "/usr/bin/tmux"
