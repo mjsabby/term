@@ -69,6 +69,10 @@ async fn main() -> Result<()> {
         .route("/webauthn/login/start",    post(webauthn_routes::login_start))
         .route("/webauthn/login/finish",   post(webauthn_routes::login_finish))
         .route("/api/machines",            get(api_routes::machines))
+        .route("/api/machines/{machine_id}/sessions",
+                                           get(api_routes::list_sessions))
+        .route("/api/machines/{machine_id}/sessions/{session_id}",
+                                           axum::routing::delete(api_routes::kill_session))
         .route("/api/me",                  get(api_routes::me))
         .route("/api/logout",              post(api_routes::logout))
         .route("/ws/term/{machine_id}",    get(proxy::term_ws))

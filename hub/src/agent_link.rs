@@ -28,14 +28,16 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use term_common::frame::{
     Body, Frame, FrameError, FrameType, HelloPayload, HEADER_LEN, HELLO_VERSION,
+    KILL_STATUS_OK,
 };
 use term_common::prio::{prio_channel, PrioTx};
 
@@ -56,6 +58,28 @@ const HUB_WRITER_LO_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_CHAN_CAP:   usize    = 64;
 const HELLO_DEADLINE:    Duration = Duration::from_secs(10);
 const IDLE_DEADLINE:     Duration = Duration::from_secs(90);
+/// Wait this long for a session-admin RPC response from the agent
+/// before failing the HTTP call back to the browser.
+const RPC_DEADLINE:      Duration = Duration::from_secs(5);
+
+/// JSON shape the agent sends in a `SessionList` response and the hub
+/// re-serialises for the browser admin panel.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionInfo {
+    pub id:             String,
+    /// Seconds since this session was last attached or detached.
+    pub idle_secs:      u64,
+    /// Number of browser tabs currently attached.
+    pub attached:       usize,
+    /// Whether there is a current controller (any one of the attached
+    /// streams).
+    pub has_controller: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionInfoEnvelope {
+    pub sessions: Vec<SessionInfo>,
+}
 
 /// Handle the hub keeps for one connected agent.
 pub struct AgentLink {
@@ -66,6 +90,12 @@ pub struct AgentLink {
     /// fresh connection from the same machine_id). The connection's
     /// reader loop selects on this notification and exits.
     notify_close:   tokio::sync::Notify,
+    /// Per-link RPC plumbing: each ListSessions / KillSession call
+    /// allocates a fresh `request_id`, parks an oneshot here, and
+    /// awaits. The reader loop fires the oneshot when the matching
+    /// SessionList / KillSessionAck comes back.
+    next_request_id: AtomicU32,
+    pending_rpcs:    Mutex<HashMap<u32, oneshot::Sender<Body>>>,
 }
 
 /// Send half of a mux stream, held by the browser→agent task.
@@ -114,6 +144,97 @@ impl AgentLink {
             _ => &self.writer.hi,
         };
         half.send(f.encode()).await.map_err(|_| ())
+    }
+
+    /// Ask the agent for the current session list. Times out after
+    /// `RPC_DEADLINE`; returns an `Err` if the agent doesn't respond
+    /// or has gone away.
+    pub async fn list_sessions(self: &Arc<Self>) -> anyhow::Result<Vec<SessionInfo>> {
+        let body = self.rpc(Frame::list_sessions).await?;
+        match body {
+            Body::SessionList { json, .. } => {
+                let env: SessionInfoEnvelope = serde_json::from_slice(&json)
+                    .context("decode SessionList JSON")?;
+                Ok(env.sessions)
+            }
+            other => bail!("unexpected RPC response: {:?}", other.kind()),
+        }
+    }
+
+    /// Ask the agent to kill `session_id`. Returns `Ok(true)` if the
+    /// session was found and killed, `Ok(false)` if not found.
+    pub async fn kill_session(self: &Arc<Self>, session_id: &str) -> anyhow::Result<bool> {
+        let body = self
+            .rpc(|rid| Frame::kill_session(rid, session_id.to_owned()))
+            .await?;
+        match body {
+            Body::KillSessionAck { status, .. } => Ok(status == KILL_STATUS_OK),
+            other => bail!("unexpected RPC response: {:?}", other.kind()),
+        }
+    }
+
+    /// Generic request/response over stream 0. `build` constructs the
+    /// request frame from the allocated `request_id`. Used by
+    /// `list_sessions` and `kill_session`.
+    async fn rpc<F>(self: &Arc<Self>, build: F) -> anyhow::Result<Body>
+    where
+        F: FnOnce(u32) -> Frame,
+    {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending_rpcs.lock().await.insert(request_id, tx);
+        let send_result = self.send_frame(build(request_id)).await;
+        if send_result.is_err() {
+            // Clean up the entry we just inserted; nobody will fire it.
+            self.pending_rpcs.lock().await.remove(&request_id);
+            bail!("agent link writer closed");
+        }
+        let body = match timeout(RPC_DEADLINE, rx).await {
+            Ok(Ok(b))  => b,
+            Ok(Err(_)) => {
+                self.pending_rpcs.lock().await.remove(&request_id);
+                bail!("agent dropped before responding");
+            }
+            Err(_) => {
+                self.pending_rpcs.lock().await.remove(&request_id);
+                bail!("agent did not respond within {RPC_DEADLINE:?}");
+            }
+        };
+        Ok(body)
+    }
+}
+
+/// Helper for the `unexpected RPC response` log line: stringifies the
+/// body variant name without dumping payload bytes.
+trait BodyKind {
+    fn kind(&self) -> &'static str;
+}
+impl BodyKind for Body {
+    fn kind(&self) -> &'static str {
+        match self {
+            Body::Data(_)              => "Data",
+            Body::Resize { .. }        => "Resize",
+            Body::Open { .. }          => "Open",
+            Body::Close                => "Close",
+            Body::Ping(_)              => "Ping",
+            Body::Pong(_)              => "Pong",
+            Body::Hello(_)             => "Hello",
+            Body::PasteBegin { .. }    => "PasteBegin",
+            Body::PasteChunk { .. }    => "PasteChunk",
+            Body::PasteEnd { .. }      => "PasteEnd",
+            Body::PasteReject { .. }   => "PasteReject",
+            Body::DownloadBegin { .. } => "DownloadBegin",
+            Body::DownloadChunk { .. } => "DownloadChunk",
+            Body::DownloadEnd { .. }   => "DownloadEnd",
+            Body::AcquireControl       => "AcquireControl",
+            Body::ReleaseControl       => "ReleaseControl",
+            Body::TakeControl          => "TakeControl",
+            Body::ControllerChanged { .. } => "ControllerChanged",
+            Body::ListSessions { .. }  => "ListSessions",
+            Body::SessionList { .. }   => "SessionList",
+            Body::KillSession { .. }   => "KillSession",
+            Body::KillSessionAck { .. } => "KillSessionAck",
+        }
     }
 }
 
@@ -206,10 +327,12 @@ where
     // ---- link + writer ----------------------------------------------------
     let (write_tx, mut write_rx) = prio_channel(HUB_WRITER_HI_BYTES, HUB_WRITER_LO_BYTES);
     let link = Arc::new(AgentLink {
-        writer:         write_tx.clone(),
-        next_stream_id: AtomicU32::new(1),
-        streams:        Mutex::new(HashMap::new()),
-        notify_close:   tokio::sync::Notify::new(),
+        writer:          write_tx.clone(),
+        next_stream_id:  AtomicU32::new(1),
+        streams:         Mutex::new(HashMap::new()),
+        notify_close:    tokio::sync::Notify::new(),
+        next_request_id: AtomicU32::new(1),
+        pending_rpcs:    Mutex::new(HashMap::new()),
     });
 
     // Atomically replace any prior link for this machine. If we evict an
@@ -278,6 +401,20 @@ where
                 (0, Body::Ping(p))  => { let _ = link_for_read.send_frame(Frame::pong(p)).await; }
                 (0, Body::Pong(_))  => { /* track RTT later */ }
                 (0, Body::Hello(_)) => bail!("hello after registration"),
+                // Admin RPC responses: route back to the parked oneshot.
+                (0, body @ (Body::SessionList { .. } | Body::KillSessionAck { .. })) => {
+                    let request_id = match &body {
+                        Body::SessionList    { request_id, .. } => *request_id,
+                        Body::KillSessionAck { request_id, .. } => *request_id,
+                        _ => unreachable!(),
+                    };
+                    let tx = link_for_read.pending_rpcs.lock().await.remove(&request_id);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(body);
+                    } else {
+                        debug!(request_id, "RPC response with no waiter; dropping");
+                    }
+                }
                 (0, _)              => bail!("unexpected control frame"),
                 (sid, body)         => {
                     let tx = {

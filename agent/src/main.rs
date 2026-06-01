@@ -286,6 +286,35 @@ where
                 (0, Body::Ping(p))  => { let _ = send_frame_to_hub(&write_tx, Frame::pong(p)).await; }
                 (0, Body::Pong(_))  => {}
                 (0, Body::Hello(_)) => bail!("hub sent hello (protocol error)"),
+                (0, Body::ListSessions { request_id }) => {
+                    let sessions = sessions.clone();
+                    let writer = write_tx.clone();
+                    tokio::spawn(async move {
+                        let json = build_session_list_json(&sessions).await;
+                        let _ = send_frame_to_hub(
+                            &writer, Frame::session_list(request_id, json),
+                        ).await;
+                    });
+                }
+                (0, Body::KillSession { request_id, session_id }) => {
+                    let sessions = sessions.clone();
+                    let writer = write_tx.clone();
+                    tokio::spawn(async move {
+                        let killed = match sessions.remove(&session_id).await {
+                            Some(s) => { s.kill().await; true }
+                            None    => false,
+                        };
+                        let status = if killed {
+                            term_common::frame::KILL_STATUS_OK
+                        } else {
+                            term_common::frame::KILL_STATUS_NOT_FOUND
+                        };
+                        info!(session = %session_id, killed, "kill_session ack");
+                        let _ = send_frame_to_hub(
+                            &writer, Frame::kill_session_ack(request_id, status),
+                        ).await;
+                    });
+                }
                 (0, _)              => bail!("unexpected control-stream frame"),
                 (sid, Body::Open { session_id, initial_size }) => {
                     // Spawn a per-stream task that attaches to (or
@@ -563,6 +592,38 @@ async fn send_frame_to_hub(w: &PrioTx, f: Frame) -> Result<(), Vec<u8>> {
         _                        => &w.hi,
     };
     half.send(f.encode()).await
+}
+
+/// Build the JSON payload the agent sends in a `SessionList` response.
+/// Walks every live session, snapshots its current attached count +
+/// idle time + controller presence, returns the same JSON shape the
+/// hub forwards to the browser.
+async fn build_session_list_json(sessions: &Arc<session::SessionManager>) -> Vec<u8> {
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Info {
+        id:             String,
+        idle_secs:      u64,
+        attached:       usize,
+        has_controller: bool,
+    }
+    #[derive(Serialize)]
+    struct Envelope { sessions: Vec<Info> }
+
+    let now = std::time::Instant::now();
+    let live = sessions.list().await;
+    let mut out = Vec::with_capacity(live.len());
+    for s in live {
+        out.push(Info {
+            id:             s.id.clone(),
+            idle_secs:      now.saturating_duration_since(s.last_attached_at().await).as_secs(),
+            attached:       s.attached_count().await,
+            has_controller: s.controller().await.is_some(),
+        });
+    }
+    serde_json::to_vec(&Envelope { sessions: out })
+        .unwrap_or_else(|_| br#"{"sessions":[]}"#.to_vec())
 }
 
 /// Send a PasteReject(paste_id, reason) frame back to the hub on this

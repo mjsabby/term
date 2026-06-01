@@ -63,13 +63,18 @@ type 14 = acquire-control    (browser->agent; stream > 0; ask to become controll
 type 15 = release-control    (browser->agent; stream > 0; relinquish control)
 type 16 = take-control       (browser->agent; stream > 0; force preemption)
 type 17 = controller-changed (agent->browser; stream > 0; per-receiver status: 0=none, 1=self, 2=other)
+type 18 = list-sessions      (hub->agent; stream = 0; admin RPC request)
+type 19 = session-list       (agent->hub; stream = 0; admin RPC response)
+type 20 = kill-session       (hub->agent; stream = 0; admin RPC request)
+type 21 = kill-session-ack   (agent->hub; stream = 0; admin RPC response)
 ```
 
 Caps: data ≤ 64 KiB, resize == 4 bytes, open ≤ 64 + 4 bytes of
 `[A-Za-z0-9_-]` + initial size, hello ≤ 1 KiB, ping/pong ≤ 64 bytes,
-acquire/release/take-control 0 bytes, controller-changed 1 byte.
-Unknown types rejected. Reserve 18..=31 for the session-admin
-(ListSessions/KillSession) bolt-on.
+acquire/release/take-control 0 bytes, controller-changed 1 byte,
+list-sessions 4 bytes, session-list ≤ 256 KiB JSON, kill-session ≤
+4 + 1 + 64 bytes, kill-session-ack 5 bytes. Unknown types rejected.
+Reserve 22..=31 for future admin extensions.
 
 The hub→agent socket writer, the agent→hub socket writer, and the
 agent's per-stream input all use a two-priority channel so interactive
@@ -224,6 +229,22 @@ agent reappears.
 Sessions survive having no clients attached. After **24 h** with
 zero attached clients (configurable later via `agent.toml`) the
 session is garbage-collected and the shell is killed.
+
+### Listing / killing sessions
+
+Each machine row in the sidebar has a `sessions ▾` toggle that opens
+a panel showing the agent's live sessions with attached counts, idle
+time, and a `× kill` button. Backed by HTTP:
+
+```
+GET    /api/machines/{id}/sessions               // returns {"sessions":[…]}
+DELETE /api/machines/{id}/sessions/{session_id}  // returns {"killed":true|false}
+```
+
+Both require the bearer token from login. Under the hood the hub runs
+a stream-0 RPC to the agent (request_id + oneshot wait, 5s timeout)
+to ask for the live state — the hub doesn't cache, so what you see
+is what the agent has *right now*.
 
 ## Install (one-host quick start)
 

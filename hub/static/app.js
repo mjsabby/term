@@ -405,26 +405,119 @@ function renderMachines() {
   ul.innerHTML = '';
   for (const m of machines) {
     const li = document.createElement('li');
+    const row = document.createElement('div');
+    row.className = 'machine-row';
     const label = document.createElement('span');
     label.className = 'label'; label.textContent = m.label;
     const id = document.createElement('span');
     id.className = 'id'; id.textContent = m.id;
+    const sessionsBtn = document.createElement('button');
+    sessionsBtn.className = 'sessions-toggle';
+    sessionsBtn.type = 'button';
+    sessionsBtn.title = 'list / kill running sessions on this agent';
+    sessionsBtn.textContent = 'sessions ▾';
     const add = document.createElement('button');
     add.className = 'new'; add.type = 'button'; add.title = 'new tab';
     add.textContent = '+';
-    li.appendChild(label);
-    li.appendChild(id);
-    li.appendChild(add);
-    li.addEventListener('click', (ev) => {
-      if (ev.target === add) return;
+    row.appendChild(label);
+    row.appendChild(id);
+    row.appendChild(sessionsBtn);
+    row.appendChild(add);
+    const panel = document.createElement('div');
+    panel.className = 'sessions-panel';
+    panel.hidden = true;
+    li.appendChild(row);
+    li.appendChild(panel);
+    row.addEventListener('click', (ev) => {
+      if (ev.target === add || ev.target === sessionsBtn) return;
       openTab(m.id, newSessionId(), /*activate*/ true);
     });
     add.addEventListener('click', (ev) => {
       ev.stopPropagation();
       openTab(m.id, newSessionId(), /*activate*/ true);
     });
+    sessionsBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      panel.hidden = !panel.hidden;
+      sessionsBtn.textContent = panel.hidden ? 'sessions ▾' : 'sessions ▴';
+      if (!panel.hidden) await refreshSessionsPanel(m.id, panel);
+    });
     ul.appendChild(li);
   }
+}
+
+/// Fetch the agent's session list via the new admin API and render it
+/// in `panel`. Each entry shows id + attached count + idle time + a
+/// kill button. Refreshes on its own after a kill so the user sees
+/// the entry disappear.
+async function refreshSessionsPanel(machineId, panel) {
+  panel.innerHTML = '<div class="sessions-status">loading…</div>';
+  let data;
+  try {
+    const res = await fetch(`/api/machines/${encodeURIComponent(machineId)}/sessions`, {
+      headers: { 'authorization': 'Bearer ' + token },
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      panel.innerHTML = `<div class="sessions-status err">error ${res.status}: ${text}</div>`;
+      return;
+    }
+    data = await res.json();
+  } catch (e) {
+    panel.innerHTML = `<div class="sessions-status err">fetch failed: ${e}</div>`;
+    return;
+  }
+  if (!data.sessions || data.sessions.length === 0) {
+    panel.innerHTML = '<div class="sessions-status">no live sessions</div>';
+    return;
+  }
+  panel.innerHTML = '';
+  const list = document.createElement('ul');
+  list.className = 'sessions-list';
+  for (const s of data.sessions) {
+    const row = document.createElement('li');
+    const idSpan = document.createElement('span');
+    idSpan.className = 'sid'; idSpan.textContent = s.id;
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    const ctrl = s.has_controller ? '●' : '○';
+    const idle = formatIdle(s.idle_secs);
+    meta.textContent = `${ctrl} ${s.attached} attached · idle ${idle}`;
+    const kill = document.createElement('button');
+    kill.className = 'sess-kill';
+    kill.type = 'button';
+    kill.textContent = '× kill';
+    kill.title = `kill session ${s.id}`;
+    kill.addEventListener('click', async () => {
+      if (!confirm(`Kill session "${s.id}" on ${machineId}? Any attached tabs will see the shell exit.`)) return;
+      kill.disabled = true;
+      try {
+        const res = await fetch(
+          `/api/machines/${encodeURIComponent(machineId)}/sessions/${encodeURIComponent(s.id)}`,
+          { method: 'DELETE', headers: { 'authorization': 'Bearer ' + token } },
+        );
+        if (!res.ok) {
+          flash(`kill failed: ${res.status}`);
+        }
+      } catch (e) {
+        flash(`kill error: ${e}`);
+      } finally {
+        await refreshSessionsPanel(machineId, panel);
+      }
+    });
+    row.appendChild(idSpan);
+    row.appendChild(meta);
+    row.appendChild(kill);
+    list.appendChild(row);
+  }
+  panel.appendChild(list);
+}
+
+function formatIdle(secs) {
+  if (secs < 60)     return `${secs}s`;
+  if (secs < 3600)   return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400)  return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86400)}d`;
 }
 
 function openTab(machineId, sessionId, activate) {

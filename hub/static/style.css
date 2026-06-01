@@ -333,3 +333,69 @@ main { position: relative; }
   opacity: 0.85;
 }
 .tab .ctrl-pill .ctrl-btn:hover { opacity: 1; }
+
+/* Sessions admin panel (per-machine sidebar). Toggled by the
+   "sessions ▾" button next to each machine row. */
+.machines li .machine-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.machines li .sessions-toggle {
+  appearance: none;
+  background: transparent;
+  border: 1px solid #313244;
+  color: #cdd6f4;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.machines li .sessions-toggle:hover { background: #1e1e2e; }
+.machines li .sessions-panel {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: #11141c;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.machines li .sessions-panel[hidden] { display: none; }
+.machines li .sessions-status { color: #6c7086; }
+.machines li .sessions-status.err { color: #f38ba8; }
+.machines li ul.sessions-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.machines li ul.sessions-list > li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  border-top: 1px solid #1e1e2e;
+}
+.machines li ul.sessions-list > li:first-child { border-top: 0; }
+.machines li .sid {
+  font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  color: #cdd6f4;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.machines li .meta { color: #6c7086; white-space: nowrap; }
+.machines li .sess-kill {
+  appearance: none;
+  background: transparent;
+  border: 1px solid #45475a;
+  color: #f38ba8;
+  border-radius: 4px;
+  padding: 0 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.machines li .sess-kill:hover { background: rgba(243, 139, 168, 0.10); }
+.machines li .sess-kill:disabled { opacity: 0.5; cursor: default; }

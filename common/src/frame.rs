@@ -125,6 +125,35 @@ pub const CONTROLLER_STATUS_OTHER: u8 = 2;
 /// mapping). Wire payload uses the status byte above.
 pub const CONTROLLER_NONE_STREAM_ID: u32 = 0;
 
+// --- Session admin RPC (Phase 4.2.1) --------------------------------------
+//
+// Browser → hub HTTP → agent over stream 0 with a request/response
+// pattern. Each request carries an opaque request_id (hub-allocated);
+// the response echoes the same id so the hub can route to the right
+// waiting oneshot.
+//
+// Stream 0 is normally reserved for connection control (Hello / Ping /
+// Pong). These admin frames live there because they're agent-wide
+// concerns (list/kill *any* session) and don't belong to any one mux
+// stream.
+
+/// `ListSessions` payload: `[request_id:u32 BE]`.
+pub const LIST_SESSIONS_LEN: u32 = 4;
+/// `SessionList` payload: `[request_id:u32 BE][json_len:u32 BE][json
+/// bytes]`. Cap on json bytes — sessions can be many; 256 KiB is
+/// plenty (each entry is ~100 bytes JSON, so room for ~2500 sessions).
+pub const MAX_SESSION_LIST_JSON_LEN: u32 = 256 * 1024;
+pub const MAX_SESSION_LIST_LEN: u32 = 4 + 4 + MAX_SESSION_LIST_JSON_LEN;
+/// `KillSession` payload: `[request_id:u32 BE][session_id_len:u8]
+/// [session_id UTF-8]`.
+pub const MAX_KILL_SESSION_LEN: u32 = 4 + 1 + MAX_SESSION_ID_LEN;
+/// `KillSessionAck` payload: `[request_id:u32 BE][status:u8]`.
+pub const KILL_SESSION_ACK_LEN: u32 = 4 + 1;
+/// `KillSessionAck` status codes.
+pub const KILL_STATUS_OK:        u8 = 0;
+pub const KILL_STATUS_NOT_FOUND: u8 = 1;
+pub const KILL_STATUS_MAX:       u8 = KILL_STATUS_NOT_FOUND;
+
 pub const CONTROL_STREAM: u32 = 0;
 
 #[repr(u8)]
@@ -223,6 +252,18 @@ pub enum FrameType {
     /// (hub-allocated) sid. Used to render the controlling / viewing
     /// pill in the tab strip.
     ControllerChanged = 17,
+    /// Admin request: list all sessions on this agent. Stream 0.
+    /// Browser → hub → agent. Payload: `[request_id:u32 BE]`.
+    ListSessions = 18,
+    /// Admin response to `ListSessions`. Stream 0. Agent → hub →
+    /// browser. Payload: `[request_id:u32 BE][json_len:u32 BE][json]`.
+    SessionList = 19,
+    /// Admin request: kill a specific session. Stream 0.
+    /// Payload: `[request_id:u32 BE][session_id_len:u8][session_id]`.
+    KillSession = 20,
+    /// Admin response to `KillSession`. Stream 0.
+    /// Payload: `[request_id:u32 BE][status:u8]`.
+    KillSessionAck = 21,
 }
 
 impl FrameType {
@@ -246,6 +287,10 @@ impl FrameType {
             15 => Some(FrameType::ReleaseControl),
             16 => Some(FrameType::TakeControl),
             17 => Some(FrameType::ControllerChanged),
+            18 => Some(FrameType::ListSessions),
+            19 => Some(FrameType::SessionList),
+            20 => Some(FrameType::KillSession),
+            21 => Some(FrameType::KillSessionAck),
             _  => None,
         }
     }
@@ -305,6 +350,22 @@ pub enum FrameError {
     ControllerChangedLen(u32),
     #[error("controller-changed status {0} invalid (max {max})", max = CONTROLLER_STATUS_OTHER)]
     ControllerChangedStatus(u8),
+    #[error("list-sessions payload must be exactly 4 bytes (got {0})")]
+    ListSessionsLen(u32),
+    #[error("session-list payload too short ({0} bytes; need request_id + json_len)")]
+    SessionListTruncated(u32),
+    #[error("session-list json_len {len} mismatches payload (payload {payload}, expected {expected})")]
+    SessionListJsonLen { len: u32, payload: u32, expected: u32 },
+    #[error("session-list payload too large ({0} bytes; cap {max})", max = MAX_SESSION_LIST_LEN)]
+    SessionListOverflow(u32),
+    #[error("kill-session payload too short ({0} bytes; need request_id + name_len)")]
+    KillSessionTruncated(u32),
+    #[error("kill-session session_id length mismatch (header says {0}, payload {1})")]
+    KillSessionIdLen(u8, u32),
+    #[error("kill-session-ack payload must be exactly 5 bytes (got {0})")]
+    KillSessionAckLen(u32),
+    #[error("kill-session-ack status {0} invalid (max {max})", max = KILL_STATUS_MAX)]
+    KillSessionAckStatus(u8),
     #[error("control frame {ty:?} must have empty payload (got {len})")]
     ControlFrameNonEmpty { ty: FrameType, len: u32 },
 }
@@ -369,6 +430,15 @@ pub enum Body {
     /// Broadcast: per-receiver controller status. Use
     /// `CONTROLLER_STATUS_*` constants.
     ControllerChanged { status: u8 },
+    /// Admin: browser asks agent for all session metadata.
+    ListSessions { request_id: u32 },
+    /// Admin: agent's response. `json` decodes to
+    /// `{"sessions":[{ id, idle_secs, attached, has_controller }]}`.
+    SessionList { request_id: u32, json: Vec<u8> },
+    /// Admin: browser asks agent to kill `session_id`.
+    KillSession { request_id: u32, session_id: String },
+    /// Admin: agent ack. Use `KILL_STATUS_*` constants.
+    KillSessionAck { request_id: u32, status: u8 },
 }
 
 #[derive(Debug, Clone)]
@@ -442,6 +512,18 @@ impl Frame {
     pub fn controller_changed(stream_id: u32, status: u8) -> Self {
         Self { stream_id, body: Body::ControllerChanged { status } }
     }
+    pub fn list_sessions(request_id: u32) -> Self {
+        Self { stream_id: CONTROL_STREAM, body: Body::ListSessions { request_id } }
+    }
+    pub fn session_list(request_id: u32, json: Vec<u8>) -> Self {
+        Self { stream_id: CONTROL_STREAM, body: Body::SessionList { request_id, json } }
+    }
+    pub fn kill_session(request_id: u32, session_id: String) -> Self {
+        Self { stream_id: CONTROL_STREAM, body: Body::KillSession { request_id, session_id } }
+    }
+    pub fn kill_session_ack(request_id: u32, status: u8) -> Self {
+        Self { stream_id: CONTROL_STREAM, body: Body::KillSessionAck { request_id, status } }
+    }
 
     pub fn ty(&self) -> FrameType {
         match &self.body {
@@ -463,6 +545,10 @@ impl Frame {
             Body::ReleaseControl         => FrameType::ReleaseControl,
             Body::TakeControl            => FrameType::TakeControl,
             Body::ControllerChanged { .. } => FrameType::ControllerChanged,
+            Body::ListSessions { .. }    => FrameType::ListSessions,
+            Body::SessionList { .. }     => FrameType::SessionList,
+            Body::KillSession { .. }     => FrameType::KillSession,
+            Body::KillSessionAck { .. }  => FrameType::KillSessionAck,
         }
     }
 
@@ -560,6 +646,30 @@ impl Frame {
             }
             Body::ControllerChanged { status } => {
                 std::borrow::Cow::Owned(vec![*status])
+            }
+            Body::ListSessions { request_id } => {
+                std::borrow::Cow::Owned(request_id.to_be_bytes().to_vec())
+            }
+            Body::SessionList { request_id, json } => {
+                let mut p = Vec::with_capacity(4 + 4 + json.len());
+                p.extend_from_slice(&request_id.to_be_bytes());
+                p.extend_from_slice(&(json.len() as u32).to_be_bytes());
+                p.extend_from_slice(json);
+                std::borrow::Cow::Owned(p)
+            }
+            Body::KillSession { request_id, session_id } => {
+                let n = session_id.len().min(MAX_SESSION_ID_LEN as usize);
+                let mut p = Vec::with_capacity(4 + 1 + n);
+                p.extend_from_slice(&request_id.to_be_bytes());
+                p.push(n as u8);
+                p.extend_from_slice(&session_id.as_bytes()[..n]);
+                std::borrow::Cow::Owned(p)
+            }
+            Body::KillSessionAck { request_id, status } => {
+                let mut p = Vec::with_capacity(5);
+                p.extend_from_slice(&request_id.to_be_bytes());
+                p.push(*status);
+                std::borrow::Cow::Owned(p)
             }
         };
         let len = payload.len() as u32;
@@ -694,6 +804,46 @@ impl Frame {
                 if stream_id == CONTROL_STREAM { return Err(FrameError::DataOnControlStream); }
                 if len != CONTROLLER_CHANGED_LEN {
                     return Err(FrameError::ControllerChangedLen(len));
+                }
+            }
+            FrameType::ListSessions => {
+                if stream_id != CONTROL_STREAM {
+                    return Err(FrameError::ControlOnDataStream(stream_id));
+                }
+                if len != LIST_SESSIONS_LEN {
+                    return Err(FrameError::ListSessionsLen(len));
+                }
+            }
+            FrameType::SessionList => {
+                if stream_id != CONTROL_STREAM {
+                    return Err(FrameError::ControlOnDataStream(stream_id));
+                }
+                if len < 8 {
+                    return Err(FrameError::SessionListTruncated(len));
+                }
+                if len > MAX_SESSION_LIST_LEN {
+                    return Err(FrameError::SessionListOverflow(len));
+                }
+            }
+            FrameType::KillSession => {
+                if stream_id != CONTROL_STREAM {
+                    return Err(FrameError::ControlOnDataStream(stream_id));
+                }
+                if len < 5 {
+                    return Err(FrameError::KillSessionTruncated(len));
+                }
+                if len > MAX_KILL_SESSION_LEN {
+                    return Err(FrameError::PayloadTooLarge {
+                        ty, len, max: MAX_KILL_SESSION_LEN,
+                    });
+                }
+            }
+            FrameType::KillSessionAck => {
+                if stream_id != CONTROL_STREAM {
+                    return Err(FrameError::ControlOnDataStream(stream_id));
+                }
+                if len != KILL_SESSION_ACK_LEN {
+                    return Err(FrameError::KillSessionAckLen(len));
                 }
             }
         }
@@ -860,6 +1010,63 @@ impl Frame {
                     return Err(FrameError::ControllerChangedStatus(status));
                 }
                 Body::ControllerChanged { status }
+            }
+            FrameType::ListSessions => {
+                if payload.len() != LIST_SESSIONS_LEN as usize {
+                    return Err(FrameError::ListSessionsLen(payload.len() as u32));
+                }
+                let request_id = u32::from_be_bytes(
+                    [payload[0], payload[1], payload[2], payload[3]]);
+                Body::ListSessions { request_id }
+            }
+            FrameType::SessionList => {
+                if payload.len() < 8 {
+                    return Err(FrameError::SessionListTruncated(payload.len() as u32));
+                }
+                let request_id = u32::from_be_bytes(
+                    [payload[0], payload[1], payload[2], payload[3]]);
+                let json_len = u32::from_be_bytes(
+                    [payload[4], payload[5], payload[6], payload[7]]);
+                let expected = 8 + json_len;
+                if (payload.len() as u32) != expected {
+                    return Err(FrameError::SessionListJsonLen {
+                        len: json_len,
+                        payload: payload.len() as u32,
+                        expected,
+                    });
+                }
+                let json = payload[8..].to_vec();
+                Body::SessionList { request_id, json }
+            }
+            FrameType::KillSession => {
+                if payload.len() < 5 {
+                    return Err(FrameError::KillSessionTruncated(payload.len() as u32));
+                }
+                let request_id = u32::from_be_bytes(
+                    [payload[0], payload[1], payload[2], payload[3]]);
+                let id_len = payload[4];
+                let id_end = 5 + id_len as usize;
+                if payload.len() != id_end {
+                    return Err(FrameError::KillSessionIdLen(id_len, payload.len() as u32));
+                }
+                let session_id = String::from_utf8(payload[5..id_end].to_vec())
+                    .map_err(|_| FrameError::SessionIdNotUtf8)?;
+                if !is_valid_session_id(&session_id) {
+                    return Err(FrameError::InvalidSessionId);
+                }
+                Body::KillSession { request_id, session_id }
+            }
+            FrameType::KillSessionAck => {
+                if payload.len() != KILL_SESSION_ACK_LEN as usize {
+                    return Err(FrameError::KillSessionAckLen(payload.len() as u32));
+                }
+                let request_id = u32::from_be_bytes(
+                    [payload[0], payload[1], payload[2], payload[3]]);
+                let status = payload[4];
+                if status > KILL_STATUS_MAX {
+                    return Err(FrameError::KillSessionAckStatus(status));
+                }
+                Body::KillSessionAck { request_id, status }
             }
         };
         Ok(Frame { stream_id, body })
@@ -1472,5 +1679,119 @@ mod tests {
     fn controller_changed_rejects_bad_status() {
         let e = Frame::from_payload(5, FrameType::ControllerChanged, vec![7]).unwrap_err();
         assert!(matches!(e, FrameError::ControllerChangedStatus(7)));
+    }
+
+    // ----- session-admin RPC -----
+
+    #[test]
+    fn list_sessions_round_trip() {
+        let f = Frame::list_sessions(0xdeadbeef);
+        let enc = f.encode();
+        assert_eq!(u32::from_be_bytes([enc[0], enc[1], enc[2], enc[3]]), 0); // stream 0
+        let len = u32::from_be_bytes([enc[5], enc[6], enc[7], enc[8]]);
+        assert_eq!(len, LIST_SESSIONS_LEN);
+        let (ty, _) = Frame::validate_header(0, enc[4], len).unwrap();
+        assert_eq!(ty, FrameType::ListSessions);
+        let back = Frame::from_payload(0, ty, enc[HEADER_LEN..].to_vec()).unwrap();
+        match back.body {
+            Body::ListSessions { request_id } => assert_eq!(request_id, 0xdeadbeef),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn list_sessions_rejected_on_data_stream() {
+        let e = Frame::validate_header(7, FrameType::ListSessions as u8, 4).unwrap_err();
+        assert!(matches!(e, FrameError::ControlOnDataStream(7)));
+    }
+
+    #[test]
+    fn list_sessions_rejects_wrong_len() {
+        let e = Frame::validate_header(0, FrameType::ListSessions as u8, 3).unwrap_err();
+        assert!(matches!(e, FrameError::ListSessionsLen(3)));
+    }
+
+    #[test]
+    fn session_list_round_trip() {
+        let json = br#"{"sessions":[{"id":"abc","idle_secs":12,"attached":2,"has_controller":true}]}"#;
+        let f = Frame::session_list(42, json.to_vec());
+        let enc = f.encode();
+        let (ty, _) = Frame::validate_header(
+            0, enc[4],
+            u32::from_be_bytes([enc[5], enc[6], enc[7], enc[8]])).unwrap();
+        let back = Frame::from_payload(0, ty, enc[HEADER_LEN..].to_vec()).unwrap();
+        match back.body {
+            Body::SessionList { request_id, json: j } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(j, json);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn session_list_rejects_mismatched_json_len() {
+        // payload says json_len=100 but only 4 bytes of json follow.
+        let mut p = Vec::with_capacity(12);
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.extend_from_slice(&100u32.to_be_bytes());
+        p.extend_from_slice(b"abcd");
+        let e = Frame::from_payload(0, FrameType::SessionList, p).unwrap_err();
+        assert!(matches!(e, FrameError::SessionListJsonLen { .. }));
+    }
+
+    #[test]
+    fn kill_session_round_trip() {
+        let f = Frame::kill_session(7, "alpha-1".into());
+        let enc = f.encode();
+        let (ty, _) = Frame::validate_header(
+            0, enc[4],
+            u32::from_be_bytes([enc[5], enc[6], enc[7], enc[8]])).unwrap();
+        assert_eq!(ty, FrameType::KillSession);
+        let back = Frame::from_payload(0, ty, enc[HEADER_LEN..].to_vec()).unwrap();
+        match back.body {
+            Body::KillSession { request_id, session_id } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(session_id, "alpha-1");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn kill_session_rejects_invalid_session_id() {
+        // payload: req_id=1, len=3, "a b" (space invalid).
+        let mut p = Vec::with_capacity(8);
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.push(3);
+        p.extend_from_slice(b"a b");
+        let e = Frame::from_payload(0, FrameType::KillSession, p).unwrap_err();
+        assert!(matches!(e, FrameError::InvalidSessionId));
+    }
+
+    #[test]
+    fn kill_session_ack_round_trip() {
+        for st in [KILL_STATUS_OK, KILL_STATUS_NOT_FOUND] {
+            let f = Frame::kill_session_ack(11, st);
+            let enc = f.encode();
+            let back = Frame::from_payload(
+                0, FrameType::KillSessionAck, enc[HEADER_LEN..].to_vec()).unwrap();
+            match back.body {
+                Body::KillSessionAck { request_id, status } => {
+                    assert_eq!(request_id, 11);
+                    assert_eq!(status, st);
+                }
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn kill_session_ack_rejects_bad_status() {
+        let mut p = Vec::with_capacity(5);
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.push(99);
+        let e = Frame::from_payload(0, FrameType::KillSessionAck, p).unwrap_err();
+        assert!(matches!(e, FrameError::KillSessionAckStatus(99)));
     }
 }
