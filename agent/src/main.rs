@@ -29,8 +29,9 @@ use term_common::frame::{
     Body, Frame, FrameError, FrameType, HelloPayload, HEADER_LEN, HELLO_VERSION,
     CONTROLLER_STATUS_NONE, CONTROLLER_STATUS_OTHER, CONTROLLER_STATUS_SELF,
     MAX_DATA_LEN, MAX_PASTE_TOTAL_BYTES, PASTE_REJECT_DUPLICATE_PASTE,
-    PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_OPEN_FAILED, PASTE_REJECT_REGISTRY_FULL,
-    PASTE_REJECT_SIZE_MISMATCH, PASTE_REJECT_WRITE_FAILED, PASTE_STATUS_CANCEL,
+    PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_NOT_CONTROLLER, PASTE_REJECT_OPEN_FAILED,
+    PASTE_REJECT_REGISTRY_FULL, PASTE_REJECT_SIZE_MISMATCH, PASTE_REJECT_WRITE_FAILED,
+    PASTE_STATUS_CANCEL,
 };
 use term_common::prio::{item_prio_channel, prio_channel, ItemPrioRx, ItemPrioTx, PrioTx};
 
@@ -89,6 +90,11 @@ struct ConfigLimits {
     /// Default 32.
     #[serde(default)]
     max_pending_groups_per_stream: Option<usize>,
+    /// Cap on the number of live sessions (shells) this agent will
+    /// spawn at once. Attaching to an already-running session is always
+    /// allowed; only brand-new sessions count against this. Default 64.
+    #[serde(default)]
+    max_sessions: Option<usize>,
 }
 
 /// Resolved limits — same fields as [`ConfigLimits`] but with defaults
@@ -99,6 +105,7 @@ pub struct Limits {
     pub idle_ttl:                      Duration,
     pub max_pending_pastes_per_stream: usize,
     pub max_pending_groups_per_stream: usize,
+    pub max_sessions:                  usize,
 }
 
 impl Default for Limits {
@@ -108,6 +115,7 @@ impl Default for Limits {
             idle_ttl:                      session::DEFAULT_IDLE_TTL,
             max_pending_pastes_per_stream: DEFAULT_MAX_PENDING_PASTES,
             max_pending_groups_per_stream: DEFAULT_MAX_PENDING_GROUPS,
+            max_sessions:                  DEFAULT_MAX_SESSIONS,
         }
     }
 }
@@ -122,6 +130,7 @@ impl ConfigLimits {
                 .unwrap_or(d.max_pending_pastes_per_stream),
             max_pending_groups_per_stream: self.max_pending_groups_per_stream
                 .unwrap_or(d.max_pending_groups_per_stream),
+            max_sessions: self.max_sessions.unwrap_or(d.max_sessions),
         }
     }
 }
@@ -153,6 +162,8 @@ const HEALTHY_SESSION:   Duration = Duration::from_secs(30);
 const DEFAULT_MAX_PENDING_PASTES: usize = 32;
 /// Default for `limits.max_pending_groups_per_stream`.
 const DEFAULT_MAX_PENDING_GROUPS: usize = 32;
+/// Default for `limits.max_sessions` — the per-agent live-shell cap.
+const DEFAULT_MAX_SESSIONS: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -203,13 +214,14 @@ async fn main() -> Result<()> {
 
     info!(
         "term-agent: hub={} machine_id={} tls={} server_name={} shell={} \
-         scrollback_cap={} idle_ttl={:?} max_pastes={} max_groups={}",
+         scrollback_cap={} idle_ttl={:?} max_pastes={} max_groups={} max_sessions={}",
         resolved.hub, resolved.machine_id, if resolved.tls_on { "on" } else { "off" },
         resolved.server_name, resolved.shell,
         resolved.limits.scrollback_cap_bytes,
         resolved.limits.idle_ttl,
         resolved.limits.max_pending_pastes_per_stream,
         resolved.limits.max_pending_groups_per_stream,
+        resolved.limits.max_sessions,
     );
 
     let tls_connector = if resolved.tls_on { Some(build_tls_connector()?) } else { None };
@@ -536,8 +548,22 @@ async fn run_session_stream(
     mut rx: ItemPrioRx<Body>,
     writer: PrioTx,
 ) -> Result<()> {
-    // Look up or spawn the underlying session.
-    let session = sessions.lookup_or_spawn(&session_id, initial_size).await?;
+    // Look up or spawn the underlying session. A failure here is almost
+    // always the per-agent session cap; surface it to the browser as a
+    // one-line message on the stream, then close cleanly rather than
+    // logging it as an unexpected error and reconnect-looping silently.
+    let session = match sessions.lookup_or_spawn(&session_id, initial_size).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(stream_id = sid, session = %session_id, error = %e,
+                  "refusing to open session");
+            let _ = send_frame_to_hub(
+                &writer,
+                Frame::data(sid, format!("\r\nterm-agent: {e}\r\n").into_bytes()),
+            ).await;
+            return Ok(());
+        }
+    };
     let attach = session.attach(sid, initial_size).await;
     info!(stream_id = sid, session = %session_id,
           became_controller = attach.became_controller,
@@ -639,10 +665,21 @@ async fn run_session_stream(
                     Body::ReleaseControl => { session.release_control(sid).await; }
                     Body::TakeControl    => { session.take_control(sid).await; }
                     Body::PasteBegin { paste_id, total_size, group_id, group_size, name } => {
-                        handle_paste_begin(
-                            sid, paste_id, total_size, group_id, group_size, name,
-                            &pending_pastes, &pending_groups, &writer, limits,
-                        ).await;
+                        // Pasting saves a file and types its path into
+                        // the shared PTY — an input action. Gate it on
+                        // the control lease like keystrokes/resize;
+                        // viewers get a PasteReject instead of silently
+                        // injecting into the controller's shell.
+                        if session.is_controller(sid).await {
+                            handle_paste_begin(
+                                sid, paste_id, total_size, group_id, group_size, name,
+                                &pending_pastes, &pending_groups, &writer, limits,
+                            ).await;
+                        } else {
+                            send_paste_reject(
+                                &writer, sid, paste_id, PASTE_REJECT_NOT_CONTROLLER,
+                            ).await;
+                        }
                     }
                     Body::PasteChunk { paste_id, bytes } => {
                         handle_paste_chunk(sid, paste_id, &bytes, &pending_pastes, &writer).await;
@@ -974,6 +1011,20 @@ async fn inject_paste_paths(
     paths: Vec<PathBuf>,
     session: &Arc<session::Session>,
 ) {
+    // Belt to the PasteBegin suspenders: if control moved to a different
+    // stream while this paste was uploading, don't type the paths into
+    // someone else's PTY. Drop the now-orphaned tempfiles.
+    if !session.is_controller(sid).await {
+        warn!(
+            stream_id = sid,
+            "no longer controller at paste injection; dropping {} path(s)",
+            paths.len(),
+        );
+        for p in &paths {
+            let _ = fs::remove_file(p).await;
+        }
+        return;
+    }
     let cap: usize = paths.iter().map(|p| p.as_os_str().len() + 3).sum::<usize>() + 16;
     let mut seq = Vec::with_capacity(cap);
 

@@ -18,6 +18,7 @@ mod agent_link;
 mod api_routes;
 mod auth;
 mod config;
+mod edge;
 mod listener_mode;
 mod metrics;
 mod proxy;
@@ -118,6 +119,7 @@ async fn main() -> Result<()> {
 /// Routes exposed on the authenticated listener. Same set as before
 /// the dual-listener split, plus the public `/api/mode` probe.
 fn build_authed_router(state: AppState, mode: ListenerMode) -> Router {
+    let origin = mode.origin.clone();
     Router::new()
         .route("/webauthn/register/start", post(webauthn_routes::register_start))
         .route("/webauthn/login/start",    post(webauthn_routes::login_start))
@@ -135,6 +137,10 @@ fn build_authed_router(state: AppState, mode: ListenerMode) -> Router {
         .fallback(static_assets::handler)
         .layer(TraceLayer::new_for_http())
         .layer(Extension(mode))
+        .layer(axum::middleware::from_fn_with_state(
+            edge::EdgeConfig { origin },
+            edge::middleware,
+        ))
         .with_state(state)
 }
 
@@ -144,6 +150,7 @@ fn build_authed_router(state: AppState, mode: ListenerMode) -> Router {
 /// `/api/logout` (there's no bearer to drop), and `/metrics` (we don't
 /// want machine ids and connection counts leaving via the tunnel).
 fn build_no_auth_router(state: AppState, mode: ListenerMode) -> Router {
+    let origin = mode.origin.clone();
     Router::new()
         .route("/api/machines",            get(api_routes::machines))
         .route("/api/machines/{machine_id}/sessions",
@@ -156,6 +163,10 @@ fn build_no_auth_router(state: AppState, mode: ListenerMode) -> Router {
         .fallback(static_assets::handler)
         .layer(TraceLayer::new_for_http())
         .layer(Extension(mode))
+        .layer(axum::middleware::from_fn_with_state(
+            edge::EdgeConfig { origin },
+            edge::middleware,
+        ))
         .with_state(state)
 }
 

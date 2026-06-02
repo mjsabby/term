@@ -137,6 +137,7 @@ const PASTE_REJECT_REASONS = [
   'agent failed to write file',
   'duplicate paste id',
   'paste batch exceeds 4 GiB',
+  'this tab is a viewer — take control to paste',
 ];
 function pasteRejectMessage(reason) {
   return PASTE_REJECT_REASONS[reason] || `unknown reason ${reason}`;
@@ -348,11 +349,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       await enterApp();
     } catch (e) {
       console.error(e);
-      // Surface a basic error rather than spinning on "loading…".
-      document.body.innerHTML =
-        '<pre style="padding:1rem;font:14px/1.4 monospace">' +
-        'failed to enter app: ' + (e && e.message ? e.message : String(e)) +
-        '</pre>';
+      // Surface a basic error rather than spinning on "loading…". Build
+      // the node + textContent instead of innerHTML so the message can't
+      // inject markup.
+      const pre = document.createElement('pre');
+      pre.style.cssText = 'padding:1rem;font:14px/1.4 monospace';
+      pre.textContent = 'failed to enter app: ' + (e && e.message ? e.message : String(e));
+      document.body.textContent = '';
+      document.body.appendChild(pre);
     }
     return;
   }
@@ -490,12 +494,23 @@ function renderMachines() {
   }
 }
 
+// Replace a panel's contents with a single status line. Builds nodes +
+// textContent rather than innerHTML so server/exception strings can
+// never inject markup.
+function setPanelStatus(panel, text, isErr) {
+  panel.textContent = '';
+  const div = document.createElement('div');
+  div.className = isErr ? 'sessions-status err' : 'sessions-status';
+  div.textContent = text;
+  panel.appendChild(div);
+}
+
 /// Fetch the agent's session list via the new admin API and render it
 /// in `panel`. Each entry shows id + attached count + idle time + a
 /// kill button. Refreshes on its own after a kill so the user sees
 /// the entry disappear.
 async function refreshSessionsPanel(machineId, panel) {
-  panel.innerHTML = '<div class="sessions-status">loading…</div>';
+  setPanelStatus(panel, 'loading…');
   let data;
   try {
     const res = await fetch(`/api/machines/${encodeURIComponent(machineId)}/sessions`, {
@@ -503,19 +518,19 @@ async function refreshSessionsPanel(machineId, panel) {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      panel.innerHTML = `<div class="sessions-status err">error ${res.status}: ${text}</div>`;
+      setPanelStatus(panel, `error ${res.status}: ${text}`, true);
       return;
     }
     data = await res.json();
   } catch (e) {
-    panel.innerHTML = `<div class="sessions-status err">fetch failed: ${e}</div>`;
+    setPanelStatus(panel, `fetch failed: ${e}`, true);
     return;
   }
   if (!data.sessions || data.sessions.length === 0) {
-    panel.innerHTML = '<div class="sessions-status">no live sessions</div>';
+    setPanelStatus(panel, 'no live sessions');
     return;
   }
-  panel.innerHTML = '';
+  panel.textContent = '';
   const list = document.createElement('ul');
   list.className = 'sessions-list';
   for (const s of data.sessions) {
@@ -1025,6 +1040,15 @@ async function sendPasteFile(tab, blob, groupId, groupSize) {
 async function sendPasteFiles(tab, files) {
   const fs = (files || []).filter(Boolean);
   if (fs.length === 0) return;
+  // Pasting/dropping files makes the agent save them and type their
+  // paths into the shared PTY — an input action. Only the controller
+  // may do it (the agent enforces this too and will PasteReject
+  // otherwise); short-circuit here so a viewer doesn't waste bandwidth
+  // uploading bytes that will be refused.
+  if (tab.controllerStatus !== 1) {
+    flash('take control of this session to paste or drop files');
+    return;
+  }
   // Enforce the aggregate per-paste-action cap up front. Agent will
   // reject this anyway via PasteReject if we lie, but it's nicer UX
   // to fail fast before we start uploading the first file.

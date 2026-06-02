@@ -97,7 +97,8 @@ paste-reject:[paste_id:u32 BE][reason:u8]       // agent → browser; aborts the
 
 PasteReject reasons (`u8`): 0 = registry full, 1 = open failed,
 2 = size mismatch, 3 = write failed, 4 = duplicate paste id,
-5 = group aggregate over 4 GiB.
+5 = group aggregate over 4 GiB, 6 = stream is a viewer, not the
+session's controller (paste is an input action — see below).
 
 ### Download (agent → browser, via `term-dl`)
 
@@ -212,8 +213,9 @@ https://term.xyz.com/#alpha:web-1,alpha:logs,wsl-laptop:root
 ### Controller / viewer model
 
 When more than one browser is attached to a session, exactly one is
-the **controller** (input + resize go through) and the rest are
-**viewers** (read-only). Each tab strip shows a pill — `● controlling
+the **controller** (input, resize, and file paste/drop go through) and
+the rest are **viewers** (read-only — keystrokes, resize, and paste are
+all dropped/rejected by the agent for non-controllers). Each tab strip shows a pill — `● controlling
 — release`, `👁 viewing — take`, or `— no controller — acquire` —
 that reflects the per-receiver status broadcast by the agent. Wire
 support: types 14–17 (`AcquireControl` / `ReleaseControl` /
