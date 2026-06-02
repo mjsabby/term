@@ -5,11 +5,20 @@
 //! via Let's Encrypt (TLS-ALPN-01) using rustls-acme; the same cert
 //! resolver is shared with the agent listener so renewals propagate
 //! to both endpoints.
+//!
+//! Optionally serves a SECOND browser-facing listener (`[no_auth]` in
+//! `hub.toml`) that runs without WebAuthn — intended to live behind an
+//! external perimeter such as Microsoft Dev Tunnel or a corporate SSO
+//! reverse proxy. When configured, the two listeners share the same
+//! `AppState` (so machine list, agent connections, etc. are unified)
+//! but route requests through different `Router`s carrying different
+//! `ListenerMode` extensions.
 
 mod agent_link;
 mod api_routes;
 mod auth;
 mod config;
+mod listener_mode;
 mod metrics;
 mod proxy;
 mod state;
@@ -22,13 +31,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Extension, Router};
 use rustls_acme::{caches::DirCache, AcmeConfig};
 use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-use config::{HubConfig, TlsMode};
+use config::{HubConfig, NoAuthConfig, TlsMode};
+use listener_mode::ListenerMode;
 use state::AppState;
 use term_common::creds;
 
@@ -61,10 +71,54 @@ async fn main() -> Result<()> {
             .with_context(|| format!("origin {origin:?} is not a valid URL"))?;
     }
 
+    // Resolve env-var overrides + validate the optional no-auth listener.
+    let no_auth_cfg: Option<NoAuthConfig> = cfg.effective_no_auth()?.cloned();
+    if let Some(na) = &no_auth_cfg {
+        url::Url::parse(&na.public_origin)
+            .with_context(|| format!("no_auth.public_origin {:?} is not a valid URL", na.public_origin))?;
+        let browser_bind = cfg.effective_bind();
+        if equal_socket_addr(&browser_bind, &na.bind) {
+            anyhow::bail!(
+                "no_auth.bind {:?} collides with the authed browser bind {:?}",
+                na.bind, browser_bind,
+            );
+        }
+    }
+
     let cfg = Arc::new(cfg);
     let app_state = AppState::new(cfg.clone(), secret);
 
-    let app = Router::new()
+    let authed_mode = ListenerMode { no_auth: false, origin: cfg.origin() };
+    let authed_app = build_authed_router(app_state.clone(), authed_mode);
+
+    let browser_bind: SocketAddr = cfg
+        .effective_bind()
+        .parse()
+        .with_context(|| format!("parse bind {}", cfg.effective_bind()))?;
+
+    let authed_fut = async {
+        match cfg.tls {
+            TlsMode::Acme  => serve_acme(app_state.clone(), cfg.clone(), browser_bind, authed_app).await,
+            TlsMode::Files => serve_files(app_state.clone(), cfg.clone(), browser_bind, authed_app).await,
+            TlsMode::Off   => serve_plain(app_state.clone(), cfg.clone(), browser_bind, authed_app).await,
+        }
+    };
+
+    // Optional no-auth listener. We bind even when `no_auth_cfg` is
+    // None — using a never-ready future — so the select! arms have a
+    // uniform type.
+    let no_auth_fut = serve_optional_no_auth(app_state.clone(), no_auth_cfg);
+
+    tokio::select! {
+        res = authed_fut  => res,
+        res = no_auth_fut => res,
+    }
+}
+
+/// Routes exposed on the authenticated listener. Same set as before
+/// the dual-listener split, plus the public `/api/mode` probe.
+fn build_authed_router(state: AppState, mode: ListenerMode) -> Router {
+    Router::new()
         .route("/webauthn/register/start", post(webauthn_routes::register_start))
         .route("/webauthn/login/start",    post(webauthn_routes::login_start))
         .route("/webauthn/login/finish",   post(webauthn_routes::login_finish))
@@ -74,22 +128,69 @@ async fn main() -> Result<()> {
         .route("/api/machines/{machine_id}/sessions/{session_id}",
                                            axum::routing::delete(api_routes::kill_session))
         .route("/api/me",                  get(api_routes::me))
+        .route("/api/mode",                get(api_routes::mode))
         .route("/api/logout",              post(api_routes::logout))
         .route("/metrics",                 get(metrics::handler))
         .route("/ws/term/{machine_id}",    get(proxy::term_ws))
         .fallback(static_assets::handler)
         .layer(TraceLayer::new_for_http())
-        .with_state(app_state.clone());
+        .layer(Extension(mode))
+        .with_state(state)
+}
 
-    let browser_bind: SocketAddr = cfg
-        .effective_bind()
-        .parse()
-        .with_context(|| format!("parse bind {}", cfg.effective_bind()))?;
+/// Routes exposed on the **no-auth** listener — a strict subset of the
+/// authed surface. Notably absent: `/webauthn/*` (passkey registration
+/// is meaningless behind a tunnel that handles identity itself),
+/// `/api/logout` (there's no bearer to drop), and `/metrics` (we don't
+/// want machine ids and connection counts leaving via the tunnel).
+fn build_no_auth_router(state: AppState, mode: ListenerMode) -> Router {
+    Router::new()
+        .route("/api/machines",            get(api_routes::machines))
+        .route("/api/machines/{machine_id}/sessions",
+                                           get(api_routes::list_sessions))
+        .route("/api/machines/{machine_id}/sessions/{session_id}",
+                                           axum::routing::delete(api_routes::kill_session))
+        .route("/api/me",                  get(api_routes::me))
+        .route("/api/mode",                get(api_routes::mode))
+        .route("/ws/term/{machine_id}",    get(proxy::term_ws))
+        .fallback(static_assets::handler)
+        .layer(TraceLayer::new_for_http())
+        .layer(Extension(mode))
+        .with_state(state)
+}
 
-    match cfg.tls {
-        TlsMode::Acme  => serve_acme(app_state, cfg, browser_bind, app).await,
-        TlsMode::Files => serve_files(app_state, cfg, browser_bind, app).await,
-        TlsMode::Off   => serve_plain(app_state, cfg, browser_bind, app).await,
+async fn serve_optional_no_auth(state: AppState, cfg: Option<NoAuthConfig>) -> Result<()> {
+    let cfg = match cfg {
+        Some(c) => c,
+        None    => return std::future::pending().await,
+    };
+    let bind: SocketAddr = cfg.bind.parse()
+        .with_context(|| format!("parse no_auth.bind {}", cfg.bind))?;
+    let mode = ListenerMode { no_auth: true, origin: cfg.public_origin.clone() };
+    let app = build_no_auth_router(state, mode);
+    info!(
+        "term-hub no-auth listener on http://{} (perimeter origin {}); \
+         WebAuthn + bearer DISABLED on this socket",
+        bind, cfg.public_origin,
+    );
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind no_auth {}", bind))?;
+    axum::serve(listener, app.into_make_service())
+        .await
+        .context("axum::serve (no-auth)")
+}
+
+/// Compare two bind strings by parsing them as `SocketAddr` so
+/// `[::]:8080` and `[::1]:8080` aren't mistakenly considered identical
+/// while `[::]:8080` and `[::]:8080` (different whitespace) are.
+fn equal_socket_addr(a: &str, b: &str) -> bool {
+    match (a.parse::<SocketAddr>(), b.parse::<SocketAddr>()) {
+        (Ok(x), Ok(y)) => x == y,
+        // If either side fails to parse we leave the collision check
+        // to the downstream parse error — but we don't want a typo to
+        // silently bypass the check, so fall back to string equality.
+        _              => a.trim() == b.trim(),
     }
 }
 
@@ -248,4 +349,169 @@ async fn serve_files(
         .serve(app.into_make_service())
         .await
         .context("axum_server::bind_rustls")
+}
+
+#[cfg(test)]
+mod tests {
+    //! Router-level tests for the dual-listener split. We never bind a
+    //! socket — `tower::ServiceExt::oneshot` drives the `Router` as a
+    //! plain `Service` so the tests run in milliseconds and don't
+    //! touch the network.
+
+    use std::path::PathBuf;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    use crate::config::{HubConfig, NoAuthConfig, TlsMode};
+    use crate::listener_mode::ListenerMode;
+    use crate::state::AppState;
+
+    fn test_cfg() -> HubConfig {
+        HubConfig {
+            domain: "term.example.com".into(),
+            rp_id: "example.com".into(),
+            rp_name: "term".into(),
+            tls: TlsMode::Off,
+            acme_email: None,
+            acme_production: false,
+            cert_path: None,
+            key_path: None,
+            tls_reload_interval_secs: None,
+            data_dir: PathBuf::from("/tmp"),
+            bind: None,
+            agent_bind: "[::]:7700".into(),
+            public_origin: None,
+            no_auth: Some(NoAuthConfig {
+                bind: "[::]:18080".into(),
+                public_origin: "https://tunnel.example.com".into(),
+            }),
+            machines: vec![],
+        }
+    }
+
+    fn state() -> AppState {
+        AppState::new(std::sync::Arc::new(test_cfg()), [0u8; 32])
+    }
+
+    fn authed_router() -> axum::Router {
+        let s = state();
+        let mode = ListenerMode { no_auth: false, origin: s.cfg.origin() };
+        super::build_authed_router(s, mode)
+    }
+
+    fn no_auth_router() -> axum::Router {
+        let s = state();
+        let na = s.cfg.no_auth.clone().unwrap();
+        let mode = ListenerMode { no_auth: true, origin: na.public_origin };
+        super::build_no_auth_router(s, mode)
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn authed_machines_without_bearer_is_401() {
+        let resp = authed_router()
+            .oneshot(Request::builder().uri("/api/machines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn no_auth_machines_without_bearer_is_200() {
+        let resp = no_auth_router()
+            .oneshot(Request::builder().uri("/api/machines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v.get("machines").is_some(), "got {v:?}");
+    }
+
+    #[tokio::test]
+    async fn no_auth_logout_is_absent() {
+        let resp = no_auth_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 404 (no matching route) — not 401 or 200.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_auth_webauthn_is_absent() {
+        let resp = no_auth_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/webauthn/login/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_auth_metrics_is_absent() {
+        // /metrics on the no-auth port would leak machine ids /
+        // connection counts to anyone past the perimeter. The route
+        // must not be exposed there.
+        let resp = no_auth_router()
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        // Static-asset fallback may serve a 404 with HTML; either way
+        // the route shouldn't return Prometheus text.
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mode_endpoint_reports_authed_listener() {
+        let resp = authed_router()
+            .oneshot(Request::builder().uri("/api/mode").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["no_auth"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn mode_endpoint_reports_no_auth_listener() {
+        let resp = no_auth_router()
+            .oneshot(Request::builder().uri("/api/mode").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["no_auth"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn equal_socket_addr_matches_canonical_forms() {
+        // Same canonical address even if written differently — both
+        // sides parse identically.
+        assert!(super::equal_socket_addr("[::]:8080", "[::]:8080"));
+        // Different ports.
+        assert!(!super::equal_socket_addr("[::]:8080", "[::]:18080"));
+        // Different addresses.
+        assert!(!super::equal_socket_addr("[::]:8080", "[::1]:8080"));
+        // Unparseable inputs fall back to string equality.
+        assert!(super::equal_socket_addr("bogus", "bogus"));
+        assert!(!super::equal_socket_addr("bogus", "different-bogus"));
+    }
 }

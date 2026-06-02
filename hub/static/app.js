@@ -5,7 +5,11 @@
 // where `m` is a machine id and `sid` is a tmux session id.
 //
 // Auth state (bearer token) lives only in the `token` module-level
-// variable; a refresh forces re-auth via passkey.
+// variable; a refresh forces re-auth via passkey. When the hub
+// reports `no_auth: true` via /api/mode (i.e. the SPA is being served
+// by the dual-listener no-auth port, fronted by an external
+// perimeter), we skip the auth screen entirely and `token` stays
+// null. Helper `authHeaders()` then returns an empty object.
 
 'use strict';
 
@@ -260,11 +264,20 @@ function newSessionId() {
 
 // ----- application state -----------------------------------------------------
 
-let token = null;        // bearer token (in-memory only)
+let token = null;        // bearer token (in-memory only; null in no-auth mode)
+let noAuthMode = false;  // set from /api/mode at bootstrap
 let machines = [];       // [{id, label, address}]
 const machinesById = new Map();
 let tabs = [];           // [{ machineId, sessionId, term, fit, ws, paneEl, tabEl, statusEl }]
 let activeTabIdx = -1;
+
+// Build the auth headers object for fetch(). Empty in no-auth mode so
+// we don't send a meaningless `Authorization: Bearer null` header.
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (token) h['authorization'] = 'Bearer ' + token;
+  return h;
+}
 
 // ----- auth flow -------------------------------------------------------------
 
@@ -313,6 +326,37 @@ async function doRegister(label) {
 // ----- bootstrap -------------------------------------------------------------
 
 document.addEventListener('DOMContentLoaded', async () => {
+  // Probe the listener mode before deciding which screen to show. On
+  // the no-auth listener (typically behind a Dev Tunnel) we skip the
+  // passkey screen and jump straight into the app.
+  try {
+    const res = await fetch('/api/mode');
+    if (res.ok) {
+      const m = await res.json();
+      noAuthMode = !!m.no_auth;
+    }
+  } catch (_) { /* fall through to authed bootstrap */ }
+
+  if (noAuthMode) {
+    // Hide auth-only UI (logout doesn't apply when the perimeter
+    // owns identity). The button stays in the DOM but is hidden;
+    // `enterApp()` will still call `bindAppUi()` once to wire it,
+    // which is harmless because nobody can click a hidden button.
+    const logoutBtn = $('#logout-btn');
+    if (logoutBtn) logoutBtn.hidden = true;
+    try {
+      await enterApp();
+    } catch (e) {
+      console.error(e);
+      // Surface a basic error rather than spinning on "loading…".
+      document.body.innerHTML =
+        '<pre style="padding:1rem;font:14px/1.4 monospace">' +
+        'failed to enter app: ' + (e && e.message ? e.message : String(e)) +
+        '</pre>';
+    }
+    return;
+  }
+
   bindAuthUi();
   // Page always starts on the auth screen — no auth state survives refresh.
   showScreen('auth');
@@ -361,7 +405,7 @@ function bindAuthUi() {
 
 async function enterApp() {
   const res = await fetch('/api/machines', {
-    headers: { 'authorization': 'Bearer ' + token }
+    headers: authHeaders()
   });
   if (!res.ok) throw new Error(`/api/machines ${res.status}`);
   const data = await res.json();
@@ -389,7 +433,7 @@ function bindAppUi() {
   $('#logout-btn').addEventListener('click', async () => {
     try {
       await fetch('/api/logout', {
-        method: 'POST', headers: { 'authorization': 'Bearer ' + token }
+        method: 'POST', headers: authHeaders()
       });
     } catch (_) { /* ignore */ }
     // Close everything and reload to auth screen.
@@ -455,7 +499,7 @@ async function refreshSessionsPanel(machineId, panel) {
   let data;
   try {
     const res = await fetch(`/api/machines/${encodeURIComponent(machineId)}/sessions`, {
-      headers: { 'authorization': 'Bearer ' + token },
+      headers: authHeaders(),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -494,7 +538,7 @@ async function refreshSessionsPanel(machineId, panel) {
       try {
         const res = await fetch(
           `/api/machines/${encodeURIComponent(machineId)}/sessions/${encodeURIComponent(s.id)}`,
-          { method: 'DELETE', headers: { 'authorization': 'Bearer ' + token } },
+          { method: 'DELETE', headers: authHeaders() },
         );
         if (!res.ok) {
           flash(`kill failed: ${res.status}`);
@@ -1247,7 +1291,12 @@ function connectTab(tab) {
   const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term/${encodeURIComponent(tab.machineId)}`;
   let ws;
   try {
-    ws = new WebSocket(wsUrl, ['bearer.' + token]);
+    // In no-auth mode (token === null) the bearer subprotocol is
+    // skipped. The hub's WS handler only echoes a Sec-WebSocket-
+    // Protocol back when the browser sends one, so this matches up.
+    ws = token
+      ? new WebSocket(wsUrl, ['bearer.' + token])
+      : new WebSocket(wsUrl);
   } catch (e) {
     setStatus(tab, 'error');
     scheduleReconnect(tab);

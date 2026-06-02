@@ -42,6 +42,17 @@ param(
   ## Agent bind. Default :7700.
   [string] $AgentBind = "[::]:7700",
 
+  ## Optional second browser-facing listener WITHOUT browser-side auth.
+  ## Intended for deployments fronted by a perimeter that handles
+  ## identity (Microsoft Dev Tunnel, SSO reverse proxy, ...). Always
+  ## plain HTTP — the perimeter terminates TLS.
+  ##   -NoAuthBind   "[::]:8080"
+  ##   -NoAuthOrigin "https://abc-8080.usw2.devtunnels.ms"
+  ## Both must be passed together. Force-disable at runtime by setting
+  ## the TERM_HUB_NO_AUTH=off env var on the scheduled task.
+  [string] $NoAuthBind   = "",
+  [string] $NoAuthOrigin = "",
+
   ## Comma-separated list of "id:label" pairs to seed [[machines]].
   ## PSKs are auto-generated (32 random bytes, base64) and printed at
   ## the end so you can paste them into install-agent on each agent.
@@ -156,6 +167,16 @@ if ((Test-Path $ConfigPath) -and -not $Force) {
   }
   $bindLine = ""
   if ($Bind) { $bindLine = "bind = `"$Bind`"`r`n" }
+  if ($NoAuthBind -and -not $NoAuthOrigin) {
+    Die "-NoAuthBind requires -NoAuthOrigin (the perimeter URL for WS Origin: check)"
+  }
+  if ($NoAuthOrigin -and -not $NoAuthBind) {
+    Die "-NoAuthOrigin requires -NoAuthBind"
+  }
+  $noAuthBlock = ""
+  if ($NoAuthBind) {
+    $noAuthBlock = "`r`n[no_auth]`r`nbind          = `"$NoAuthBind`"`r`npublic_origin = `"$NoAuthOrigin`"`r`n"
+  }
   $now = (Get-Date).ToString("o")
   $dataDirEsc = ($DataDir -replace '\\', '\\')
   $contents = @"
@@ -167,6 +188,7 @@ $acmeLines
 data_dir   = "$dataDirEsc"
 $bindLine
 agent_bind = "$AgentBind"
+$noAuthBlock
 $machineToml
 "@
   [System.IO.File]::WriteAllText($ConfigPath, $contents, [System.Text.Encoding]::UTF8)

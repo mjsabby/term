@@ -14,6 +14,7 @@ use axum::http::{request::Parts, HeaderMap, StatusCode};
 use base64::Engine;
 use rand::RngCore;
 
+use crate::listener_mode::ListenerMode;
 use crate::state::{gc, AppState, Session, SESSION_TTL};
 
 /// 32 random bytes encoded as URL-safe base64 (no padding) = 43 chars.
@@ -46,6 +47,14 @@ pub async fn drop_token(state: &AppState, token: &str) {
 }
 
 /// Authorization: Bearer extractor. Returns 401 when missing/invalid.
+///
+/// When the request carries a `ListenerMode { no_auth: true, … }`
+/// extension (i.e. served by the no-auth listener), the extractor
+/// short-circuits and returns `Bearer(String::new())` as an anonymous
+/// sentinel. Handlers that actually inspect the token (currently only
+/// `logout`) are NOT exposed on the no-auth router, so the sentinel
+/// can't leak through. Missing extension is treated as "authed
+/// listener" (fail closed) — both routers always insert the extension.
 pub struct Bearer(pub String);
 
 impl FromRequestParts<AppState> for Bearer {
@@ -55,6 +64,12 @@ impl FromRequestParts<AppState> for Bearer {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        if let Some(mode) = parts.extensions.get::<ListenerMode>() {
+            if mode.no_auth {
+                return Ok(Bearer(String::new()));
+            }
+        }
+
         let token = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)

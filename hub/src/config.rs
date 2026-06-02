@@ -74,6 +74,21 @@ pub struct HubConfig {
     #[serde(default)]
     pub public_origin: Option<String>,
 
+    /// Optional second browser-facing listener that runs **without any
+    /// browser-side authentication**. Intended for deployments fronted
+    /// by an external perimeter (Microsoft Dev Tunnel, a corporate SSO
+    /// reverse proxy, a private network …) that handles identity for
+    /// us. The hub trusts every request it sees on this socket.
+    ///
+    /// Always plain HTTP — the perimeter terminates TLS. The agent
+    /// listener and `/webauthn/*` routes are NOT exposed here.
+    ///
+    /// Can be force-disabled at runtime with the env var
+    /// `TERM_HUB_NO_AUTH=off`, or force-enabled (provided the block is
+    /// present) with `TERM_HUB_NO_AUTH=on`.
+    #[serde(default)]
+    pub no_auth: Option<NoAuthConfig>,
+
     /// Machines the hub knows about. Each entry produces a row in the UI.
     /// Agents identify themselves by `id` + `psk` in the Hello frame.
     #[serde(default)]
@@ -83,6 +98,21 @@ pub struct HubConfig {
 fn default_rp_name() -> String { "term".into() }
 fn default_data_dir() -> PathBuf { PathBuf::from("/var/lib/term-hub") }
 fn default_agent_bind() -> String { "[::]:7700".into() }
+
+/// `[no_auth]` block: a second browser-facing listener with no auth.
+/// Intended to sit behind an external perimeter (Dev Tunnel, SSO
+/// reverse proxy, …) that handles identity.
+#[derive(Debug, Deserialize, Clone)]
+pub struct NoAuthConfig {
+    /// Socket address to bind. Plain HTTP only.
+    pub bind: String,
+    /// Required. The browser-facing URL the perimeter exposes —
+    /// compared verbatim against the `Origin:` header on WebSocket
+    /// upgrades. Skipping this would let any web origin that can reach
+    /// the listener open a terminal WS (WebSockets are not protected
+    /// by CORS the way fetch responses are), so we require it.
+    pub public_origin: String,
+}
 
 impl HubConfig {
     pub fn origin(&self) -> String {
@@ -94,6 +124,33 @@ impl HubConfig {
         match self.tls {
             TlsMode::Acme | TlsMode::Files => "[::]:443".into(),
             TlsMode::Off                   => "[::]:8080".into(),
+        }
+    }
+
+    /// Decide whether the no-auth listener should actually run, given
+    /// the config block and the `TERM_HUB_NO_AUTH` env-var override:
+    ///   unset       — listener runs iff `[no_auth]` is present
+    ///   "on"/"1"    — listener runs (config block REQUIRED; error otherwise)
+    ///   "off"/"0"   — listener does NOT run, even if `[no_auth]` is present
+    pub fn effective_no_auth(&self) -> anyhow::Result<Option<&NoAuthConfig>> {
+        let env = std::env::var("TERM_HUB_NO_AUTH").ok();
+        let want = match env.as_deref().map(str::trim) {
+            Some("on")  | Some("1") | Some("true")  | Some("yes") => Some(true),
+            Some("off") | Some("0") | Some("false") | Some("no")  => Some(false),
+            Some("")    | None                                    => None,
+            Some(other) => {
+                anyhow::bail!(
+                    "TERM_HUB_NO_AUTH={other:?} not recognised (expected on/off/1/0)"
+                );
+            }
+        };
+        match (want, self.no_auth.as_ref()) {
+            (Some(false), _)       => Ok(None),
+            (Some(true), Some(c))  => Ok(Some(c)),
+            (Some(true), None)     => anyhow::bail!(
+                "TERM_HUB_NO_AUTH=on but no [no_auth] section in hub.toml"
+            ),
+            (None, opt)            => Ok(opt),
         }
     }
 }
@@ -120,4 +177,102 @@ pub fn is_valid_machine_id(s: &str) -> bool {
     let n = s.len();
     if n == 0 || n > 32 { return false; }
     s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(no_auth: Option<NoAuthConfig>) -> HubConfig {
+        HubConfig {
+            domain: "term.example.com".into(),
+            rp_id: "example.com".into(),
+            rp_name: "term".into(),
+            tls: TlsMode::Off,
+            acme_email: None,
+            acme_production: false,
+            cert_path: None,
+            key_path: None,
+            tls_reload_interval_secs: None,
+            data_dir: PathBuf::from("/tmp"),
+            bind: None,
+            agent_bind: default_agent_bind(),
+            public_origin: None,
+            no_auth,
+            machines: vec![],
+        }
+    }
+
+    fn na() -> NoAuthConfig {
+        NoAuthConfig {
+            bind: "[::]:18080".into(),
+            public_origin: "https://example.devtunnels.ms".into(),
+        }
+    }
+
+    /// Serialize tests that mutate the env var — Rust runs tests in
+    /// parallel by default, and `std::env::set_var` is process-wide.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn no_auth_present_unset_env_returns_some() {
+        let _g = env_lock();
+        std::env::remove_var("TERM_HUB_NO_AUTH");
+        let c = cfg_with(Some(na()));
+        assert!(c.effective_no_auth().unwrap().is_some());
+    }
+
+    #[test]
+    fn no_auth_absent_unset_env_returns_none() {
+        let _g = env_lock();
+        std::env::remove_var("TERM_HUB_NO_AUTH");
+        let c = cfg_with(None);
+        assert!(c.effective_no_auth().unwrap().is_none());
+    }
+
+    #[test]
+    fn no_auth_env_off_disables_even_when_configured() {
+        let _g = env_lock();
+        for v in ["off", "0", "false", "no"] {
+            std::env::set_var("TERM_HUB_NO_AUTH", v);
+            let c = cfg_with(Some(na()));
+            assert!(c.effective_no_auth().unwrap().is_none(), "v={v}");
+        }
+        std::env::remove_var("TERM_HUB_NO_AUTH");
+    }
+
+    #[test]
+    fn no_auth_env_on_requires_config_block() {
+        let _g = env_lock();
+        std::env::set_var("TERM_HUB_NO_AUTH", "on");
+        let c = cfg_with(None);
+        assert!(c.effective_no_auth().is_err());
+        std::env::remove_var("TERM_HUB_NO_AUTH");
+    }
+
+    #[test]
+    fn no_auth_env_on_passes_through_when_configured() {
+        let _g = env_lock();
+        for v in ["on", "1", "true", "yes"] {
+            std::env::set_var("TERM_HUB_NO_AUTH", v);
+            let c = cfg_with(Some(na()));
+            assert!(c.effective_no_auth().unwrap().is_some(), "v={v}");
+        }
+        std::env::remove_var("TERM_HUB_NO_AUTH");
+    }
+
+    #[test]
+    fn no_auth_env_garbage_is_rejected() {
+        let _g = env_lock();
+        std::env::set_var("TERM_HUB_NO_AUTH", "maybe");
+        let c = cfg_with(Some(na()));
+        assert!(c.effective_no_auth().is_err());
+        std::env::remove_var("TERM_HUB_NO_AUTH");
+    }
 }

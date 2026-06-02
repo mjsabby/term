@@ -44,6 +44,32 @@ data_dir       = "/var/lib/term-hub"
 ## tls = "acme", plain TCP when tls = "off". Default "[::]:7700".
 agent_bind     = "[::]:7700"
 
+## ---------------------------------------------------------------------
+## Optional second browser-facing listener with NO authentication.
+##
+## Intended for deployments fronted by an external perimeter that
+## handles identity for you: Microsoft Dev Tunnel, a corporate SSO
+## reverse proxy, a Tailscale / WireGuard private network, etc. The
+## hub trusts every request it sees on this socket — anything that
+## reaches it can attach to any configured machine.
+##
+## Always plain HTTP — the perimeter terminates TLS. WebAuthn endpoints
+## and /metrics are NOT exposed here.
+##
+## Can be force-disabled at runtime with the env var
+## `TERM_HUB_NO_AUTH=off`, or force-enabled (config block REQUIRED)
+## with `TERM_HUB_NO_AUTH=on`. Useful in systemd / sc.exe to flip the
+## mode without editing the file.
+##
+## [no_auth]
+## bind          = "[::]:8080"
+## # The browser-facing URL of the perimeter. Compared verbatim against
+## # the WebSocket `Origin:` header — must match exactly (scheme,
+## # host, optional port). Required: WebSockets are not protected by
+## # CORS, so a missing Origin check would let any web origin that can
+## # reach the perimeter open a terminal.
+## public_origin = "https://abc-8080.usw2.devtunnels.ms"
+
 ## One block per machine. The hub *waits* for an agent presenting this
 ## machine id + matching PSK to connect; until then the machine's tabs
 ## get a "service unavailable" response.

@@ -357,6 +357,90 @@ installer once per user with `-TaskName` overridden.
 To uninstall: `Unregister-ScheduledTask -TaskName term-agent
 -Confirm:$false` and remove the install dirs.
 
+### Windows hub
+
+The hub can be installed the same way on Windows when you'd rather
+run it as a Scheduled Task than under systemd. `term-hub.exe` is
+fully self-contained — the SPA is embedded.
+
+```powershell
+# Elevated PowerShell on the hub host.
+.\scripts\install-hub.ps1 `
+    -Domain    term.xyz.com `
+    -AcmeEmail ops@xyz.com `
+    -TlsMode   acme
+```
+
+To run the hub on a corporate network behind Microsoft Dev Tunnel —
+the second listener mode described below — pass `-NoAuthBind` +
+`-NoAuthOrigin`:
+
+```powershell
+.\scripts\install-hub.ps1 `
+    -Domain        term.xyz.com `
+    -TlsMode       off `
+    -NoAuthBind    "[::]:8080" `
+    -NoAuthOrigin  "https://abc-8080.usw2.devtunnels.ms"
+```
+
+The hub binds 8080 in plain HTTP; Dev Tunnel terminates TLS upstream
+and you reach it at the `-NoAuthOrigin` URL. Open the Windows Firewall
+port if loopback isn't enough:
+
+```powershell
+New-NetFirewallRule -DisplayName 'term-hub no-auth' `
+    -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8080
+```
+
+### Dev Tunnel deployment (corporate networks)
+
+For machines that live in a corporate network where the public hub
+can't reach them, run the hub locally and front it with a
+[Microsoft Dev Tunnel](https://learn.microsoft.com/azure/developer/dev-tunnels/).
+The `[no_auth]` listener section in `hub.toml` enables a second port
+that skips WebAuthn — Dev Tunnel's own AAD-backed access policy is
+the perimeter.
+
+```toml
+## hub.toml
+domain          = "irrelevant.example.com"   # still required, but unused
+rp_id           = "irrelevant.example.com"
+tls             = "off"
+data_dir        = "/var/lib/term-hub"
+
+[no_auth]
+bind          = "[::]:8080"
+public_origin = "https://abc-8080.usw2.devtunnels.ms"   # your tunnel URL
+
+[[machines]]
+id    = "alpha"
+label = "alpha.lan"
+psk   = "<base64 psk>"
+```
+
+Then create the tunnel and forward port 8080:
+
+```sh
+devtunnel host -p 8080 --allow-anonymous false
+```
+
+(or run with `--allow-anonymous true` if your tenant policy allows
+it and you accept that the perimeter is open). The hub trusts every
+request it sees on the no-auth port, so anyone who passes the
+tunnel's access check sees every configured machine.
+
+Runtime overrides:
+
+- `TERM_HUB_NO_AUTH=off` — force the no-auth listener off even if
+  `[no_auth]` is present (useful on systemd / `sc.exe` without
+  editing the config file).
+- `TERM_HUB_NO_AUTH=on` — require the `[no_auth]` block; fail to
+  start if it's missing.
+
+The authed listener (443 or whatever `bind` is) and the no-auth
+listener can run side-by-side on the same hub process — you don't
+have to choose.
+
 ## Security notes
 
 - **Trust model.** The hub trusts whoever presents the right PSK. The
@@ -364,6 +448,11 @@ To uninstall: `Unregister-ScheduledTask -TaskName term-agent
   WebAuthn flow protects the browser ↔ hub side. Anyone with a PSK
   *and* TCP reachability to the hub's `agent_bind` can register as
   that machine and serve any tab the operator opens for it.
+- **No-auth listener.** When `[no_auth]` is configured, anyone who
+  reaches the listener has full hub access. *Always* front it with a
+  perimeter (Dev Tunnel access policy, SSO reverse proxy, private
+  network). The hub itself does not authenticate callers on this
+  socket. The `Origin:` check is still enforced.
 - **rp_id scope.** `rp_id = xyz.com` shares credentials across sibling
   subdomains. Set `rp_id = term.xyz.com` for stricter scoping.
 - **SecurityKey vs Passkey.** We use `SecurityKey` so login is touch
@@ -374,14 +463,6 @@ To uninstall: `Unregister-ScheduledTask -TaskName term-agent
   registration envelopes).
 - **PSK strength.** 32 random bytes from `/dev/urandom`. The hub warns
   if a configured PSK decodes to fewer than 16 bytes.
-
-## What's not built yet
-
-File upload / download. Frame types 7..=15 are reserved so the
-existing multiplexed connection can carry transfers later without a
-protocol change. The next iteration will likely add `upload-meta`/
-`upload-chunk` and `download-req`/`download-chunk` plus a small SPA
-pane.
 
 ## Layout
 

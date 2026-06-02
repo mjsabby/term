@@ -35,3 +35,6 @@ sha2               = { workspace = true }
 futures-util       = { version = "0.3", default-features = false }
 http               = "1"
 term-common        = { path = "../common" }
+
+[dev-dependencies]
+tower              = { version = "0.5", features = ["util"] }

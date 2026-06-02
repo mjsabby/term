@@ -1,6 +1,6 @@
 //! Authenticated JSON API routes.
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::agent_link::SessionInfoEnvelope;
 use crate::auth::Bearer;
 use crate::config::MachineConfig;
+use crate::listener_mode::ListenerMode;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -34,6 +35,21 @@ pub async fn me(_auth: Bearer) -> Json<MeResp> {
 pub async fn logout(Bearer(tok): Bearer, State(state): State<AppState>) -> Json<MeResp> {
     crate::auth::drop_token(&state, &tok).await;
     Json(MeResp { ok: true })
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModeResp {
+    /// True iff this listener does not require WebAuthn / bearer auth.
+    /// The SPA uses this on bootstrap to decide whether to show the
+    /// login screen.
+    pub no_auth: bool,
+}
+
+/// `GET /api/mode` — public probe (no auth even on the authed
+/// listener). The SPA hits this once on load to learn whether it
+/// should display the login screen or jump straight to the app.
+pub async fn mode(Extension(mode): Extension<ListenerMode>) -> Json<ModeResp> {
+    Json(ModeResp { no_auth: mode.no_auth })
 }
 
 /// `GET /api/machines/:id/sessions` — ask `<id>`'s agent for its live
