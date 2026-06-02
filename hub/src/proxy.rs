@@ -68,6 +68,13 @@ pub async fn term_ws(
         }
     };
 
+    // Bound concurrent streams per agent so a client can't exhaust
+    // hub/agent memory by opening an unbounded number of tabs.
+    if link.stream_count().await >= crate::agent_link::MAX_STREAMS_PER_AGENT {
+        warn!(machine = %machine_id, "ws upgrade rejected: per-agent stream cap reached");
+        return (StatusCode::SERVICE_UNAVAILABLE, "agent stream limit reached").into_response();
+    }
+
     let machine_id = machine_id.clone();
     info!(machine = %machine_id, no_auth = mode.no_auth, "ws upgrade -> agent link");
 

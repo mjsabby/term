@@ -66,3 +66,9 @@ shell       = "/bin/bash"
 # ## one "paste action" (e.g. Ctrl-V on a multi-file clipboard, or a
 # ## multi-file drag-and-drop).
 # max_pending_groups_per_stream = 32
+#
+# ## Cap on the number of live sessions (shells) this agent will spawn
+# ## at once. Attaching to an already-running session is always allowed;
+# ## only brand-new session ids count against this. Bounds the blast
+# ## radius of a client that opens unbounded tabs.
+# max_sessions = 64

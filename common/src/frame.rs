@@ -72,8 +72,12 @@ pub const PASTE_REJECT_SIZE_MISMATCH:     u8 = 2;
 pub const PASTE_REJECT_WRITE_FAILED:      u8 = 3;
 pub const PASTE_REJECT_DUPLICATE_PASTE:   u8 = 4;
 pub const PASTE_REJECT_GROUP_OVERSIZE:    u8 = 5;
+/// Agent → browser: the sending stream is a viewer, not the session's
+/// controller. Pasting injects text into the shared PTY, so only the
+/// controller may do it (mirrors the keystroke / resize controller gate).
+pub const PASTE_REJECT_NOT_CONTROLLER:    u8 = 6;
 /// Maximum legal `PasteReject` reason value (inclusive).
-pub const PASTE_REJECT_MAX_REASON:        u8 = PASTE_REJECT_GROUP_OVERSIZE;
+pub const PASTE_REJECT_MAX_REASON:        u8 = PASTE_REJECT_NOT_CONTROLLER;
 
 // --- Chunked file download (agent -> browser) -----------------------------
 //
@@ -876,6 +880,12 @@ impl Frame {
             }
             FrameType::Close  => Body::Close,
             FrameType::Resize => {
+                // `validate_header` already enforces len == 4, but
+                // `from_payload` is `pub`; re-check so a direct caller
+                // can't trigger an out-of-bounds index panic.
+                if payload.len() != 4 {
+                    return Err(FrameError::InvalidResizeLen(payload.len() as u32));
+                }
                 let rows = u16::from_be_bytes([payload[0], payload[1]]);
                 let cols = u16::from_be_bytes([payload[2], payload[3]]);
                 Body::Resize { rows, cols }
@@ -1027,12 +1037,17 @@ impl Frame {
                     [payload[0], payload[1], payload[2], payload[3]]);
                 let json_len = u32::from_be_bytes(
                     [payload[4], payload[5], payload[6], payload[7]]);
-                let expected = 8 + json_len;
-                if (payload.len() as u32) != expected {
+                // Compare against the actual trailing-byte count instead
+                // of computing `8 + json_len` (which overflows u32 for a
+                // hostile json_len near u32::MAX — a debug-build panic /
+                // release wraparound). `payload.len()` is already bounded
+                // by `validate_header`.
+                let json_actual = (payload.len() - 8) as u32;
+                if json_len != json_actual {
                     return Err(FrameError::SessionListJsonLen {
                         len: json_len,
                         payload: payload.len() as u32,
-                        expected,
+                        expected: json_len.saturating_add(8),
                     });
                 }
                 let json = payload[8..].to_vec();
@@ -1738,6 +1753,27 @@ mod tests {
         p.extend_from_slice(b"abcd");
         let e = Frame::from_payload(0, FrameType::SessionList, p).unwrap_err();
         assert!(matches!(e, FrameError::SessionListJsonLen { .. }));
+    }
+
+    #[test]
+    fn session_list_huge_json_len_does_not_panic() {
+        // A hostile json_len near u32::MAX must not overflow `8 +
+        // json_len` (which would panic in debug builds). It should fall
+        // out as a clean length-mismatch error.
+        let mut p = Vec::with_capacity(12);
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.extend_from_slice(&u32::MAX.to_be_bytes());
+        p.extend_from_slice(b"abcd");
+        let e = Frame::from_payload(0, FrameType::SessionList, p).unwrap_err();
+        assert!(matches!(e, FrameError::SessionListJsonLen { .. }));
+    }
+
+    #[test]
+    fn resize_from_payload_rejects_short_payload() {
+        // `from_payload` is public; a short Resize payload must error
+        // rather than panic on an out-of-bounds index.
+        let e = Frame::from_payload(3, FrameType::Resize, vec![0, 0, 0]).unwrap_err();
+        assert!(matches!(e, FrameError::InvalidResizeLen(3)));
     }
 
     #[test]

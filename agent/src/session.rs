@@ -282,7 +282,7 @@ impl Session {
                             // "hostile printf in PTY output" attack;
                             // only term-dl invocations from inside the
                             // attached shell get TERM_DL_TOKEN.
-                            if token != session_for_reader.dl_token {
+                            if !ct_eq_str(&token, &session_for_reader.dl_token) {
                                 warn!(
                                     session = %session_id_for_log,
                                     "rejecting dl OSC: token mismatch (hostile PTY output?)",
@@ -459,6 +459,13 @@ impl Session {
         self.inner.lock().await.controller
     }
 
+    /// True iff `sid` currently holds the control lease. Used to gate
+    /// input-injecting actions (keystrokes, resize, paste) to the one
+    /// stream allowed to drive the shared PTY.
+    pub async fn is_controller(&self, sid: StreamId) -> bool {
+        self.inner.lock().await.controller == Some(sid)
+    }
+
     #[allow(dead_code)]
     pub async fn last_attached_at(&self) -> Instant {
         self.inner.lock().await.last_attached_at
@@ -477,6 +484,22 @@ impl Session {
     pub async fn kill(&self) {
         self.pty.kill().await;
     }
+}
+
+/// Constant-time compare for the per-session download token. Both
+/// operands are fixed-length base64url tokens, so the early length
+/// check leaks nothing useful; the byte loop avoids a short-circuit
+/// timing signal on the secret.
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Parse a `5111;` OSC payload. We recognise:
@@ -535,6 +558,18 @@ impl SessionManager {
             }
             // Stale (shell exited but not yet GC'd) — replace.
             map.remove(id);
+        }
+        // Cap the number of live shells one agent will spawn. Attaching
+        // to an *existing* session is always allowed (handled above, so
+        // reconnects keep working at the cap); only brand-new sessions
+        // are gated. Without this, a client could open unbounded tabs
+        // with fresh session ids and fork-bomb the host.
+        if map.len() >= self.limits.max_sessions {
+            bail!(
+                "session limit reached ({} live sessions on this host); \
+                 close an existing tab first",
+                self.limits.max_sessions,
+            );
         }
         let s = Session::spawn(
             id.clone(), &self.shell, initial_size, self.limits.scrollback_cap_bytes,
@@ -893,11 +928,47 @@ mod tests {
             idle_ttl: Duration::from_millis(50),
             max_pending_pastes_per_stream: 4,
             max_pending_groups_per_stream: 4,
+            max_sessions: 8,
         };
         let mgr = SessionManager::new("/bin/sh".into(), limits);
         assert_eq!(mgr.limits.idle_ttl, Duration::from_millis(50));
         assert_eq!(mgr.limits.scrollback_cap_bytes, 64 * 1024);
         assert_eq!(mgr.limits.max_pending_pastes_per_stream, 4);
         assert_eq!(mgr.limits.max_pending_groups_per_stream, 4);
+        assert_eq!(mgr.limits.max_sessions, 8);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_manager_enforces_max_sessions() {
+        if !std::path::Path::new("/bin/sh").exists() { return; }
+        let limits = crate::Limits {
+            scrollback_cap_bytes: 64 * 1024,
+            idle_ttl: Duration::from_secs(3600),
+            max_pending_pastes_per_stream: 4,
+            max_pending_groups_per_stream: 4,
+            max_sessions: 2,
+        };
+        let mgr = SessionManager::new("/bin/sh".into(), limits);
+
+        // Two distinct sessions spawn fine.
+        let s1 = mgr.lookup_or_spawn(&"cap-a".into(), (24, 80)).await.expect("first spawn");
+        let _s2 = mgr.lookup_or_spawn(&"cap-b".into(), (24, 80)).await.expect("second spawn");
+
+        // A third *new* session id is refused at the cap.
+        assert!(
+            mgr.lookup_or_spawn(&"cap-c".into(), (24, 80)).await.is_err(),
+            "third distinct session must be rejected at the cap",
+        );
+
+        // Re-attaching to an existing session is still allowed at the cap.
+        let s1_again = mgr.lookup_or_spawn(&"cap-a".into(), (24, 80)).await
+            .expect("reattach to existing session must succeed at the cap");
+        assert!(Arc::ptr_eq(&s1, &s1_again));
+
+        // Cleanup.
+        for id in ["cap-a", "cap-b"] {
+            if let Some(s) = mgr.remove(&id.into()).await { s.kill().await; }
+        }
     }
 }

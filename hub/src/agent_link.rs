@@ -56,6 +56,12 @@ use crate::state::AppState;
 const HUB_WRITER_HI_BYTES: usize =  4 * 1024 * 1024;
 const HUB_WRITER_LO_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_CHAN_CAP:   usize    = 64;
+/// Hard cap on concurrent mux streams the hub will open against a single
+/// agent. Bounds per-agent task / memory growth from a client that opens
+/// an unbounded number of tabs or WebSockets. Generous enough for normal
+/// multi-tab use; the agent's own `limits.max_sessions` caps the costlier
+/// shell-spawn side.
+pub const MAX_STREAMS_PER_AGENT: usize = 256;
 const HELLO_DEADLINE:    Duration = Duration::from_secs(10);
 const IDLE_DEADLINE:     Duration = Duration::from_secs(90);
 /// Wait this long for a session-admin RPC response from the agent
