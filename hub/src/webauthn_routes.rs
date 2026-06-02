@@ -16,7 +16,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -65,7 +65,7 @@ pub async fn register_start(
     // 16 random bytes for the per-registration user handle — WebAuthn
     // requires one; we never use it again.
     let mut user_id = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut user_id);
+    rand::rng().fill_bytes(&mut user_id);
     let user_name = format!(
         "term-admin-{}",
         &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(user_id)[..8],
