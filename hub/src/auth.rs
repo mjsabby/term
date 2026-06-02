@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use axum::extract::FromRequestParts;
 use axum::http::{request::Parts, HeaderMap, StatusCode};
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 
 use crate::listener_mode::ListenerMode;
 use crate::state::{gc, AppState, Session, SESSION_TTL};
@@ -20,7 +20,7 @@ use crate::state::{gc, AppState, Session, SESSION_TTL};
 /// 32 random bytes encoded as URL-safe base64 (no padding) = 43 chars.
 pub fn mint_token() -> String {
     let mut buf = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
