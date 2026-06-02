@@ -10,6 +10,7 @@ mod pty;
 mod session;
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -52,6 +53,12 @@ struct AgentConfig {
     /// manager. Defaults to $SHELL or /bin/sh.
     #[serde(default)]
     shell: Option<String>,
+
+    /// Resource limits. All fields optional; defaults below match the
+    /// values that were hardcoded before this knob existed.
+    #[serde(default)]
+    limits: ConfigLimits,
+
     /// **Deprecated, ignored as of Phase 4.2** — the agent now manages
     /// sessions in-process and no longer wraps in tmux. Kept here so
     /// old `agent.toml` files still parse.
@@ -59,6 +66,65 @@ struct AgentConfig {
     _legacy_tmux: Option<String>,
 }
 fn default_tls() -> String { "on".into() }
+
+/// Per-agent resource limits, all optional in `agent.toml`. Resolved
+/// into a `Limits` struct at startup with the defaults below.
+#[derive(Debug, Default, Deserialize)]
+struct ConfigLimits {
+    /// Per-session scrollback ring size, in bytes. Bigger = more
+    /// replay history at the cost of RAM. Default 8 MiB.
+    #[serde(default)]
+    scrollback_cap_bytes: Option<usize>,
+    /// How long a session with zero attached clients survives before
+    /// the GC sweeper kills the shell. In seconds. Default 86400 (24 h).
+    #[serde(default)]
+    idle_ttl_secs: Option<u64>,
+    /// Cap on in-flight chunked-paste uploads per stream. Each holds
+    /// an open tempfile FD plus a buffer; this caps malicious-browser
+    /// FD usage. Default 32.
+    #[serde(default)]
+    max_pending_pastes_per_stream: Option<usize>,
+    /// Cap on distinct in-flight paste groups per stream. A group =
+    /// one "paste action" (e.g. Ctrl-V on a multi-file clipboard).
+    /// Default 32.
+    #[serde(default)]
+    max_pending_groups_per_stream: Option<usize>,
+}
+
+/// Resolved limits — same fields as [`ConfigLimits`] but with defaults
+/// applied so the rest of the agent sees a single concrete value.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub scrollback_cap_bytes:          usize,
+    pub idle_ttl:                      Duration,
+    pub max_pending_pastes_per_stream: usize,
+    pub max_pending_groups_per_stream: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            scrollback_cap_bytes:          session::DEFAULT_SCROLLBACK_CAP_BYTES,
+            idle_ttl:                      session::DEFAULT_IDLE_TTL,
+            max_pending_pastes_per_stream: DEFAULT_MAX_PENDING_PASTES,
+            max_pending_groups_per_stream: DEFAULT_MAX_PENDING_GROUPS,
+        }
+    }
+}
+
+impl ConfigLimits {
+    fn resolve(self) -> Limits {
+        let d = Limits::default();
+        Limits {
+            scrollback_cap_bytes: self.scrollback_cap_bytes.unwrap_or(d.scrollback_cap_bytes),
+            idle_ttl: self.idle_ttl_secs.map(Duration::from_secs).unwrap_or(d.idle_ttl),
+            max_pending_pastes_per_stream: self.max_pending_pastes_per_stream
+                .unwrap_or(d.max_pending_pastes_per_stream),
+            max_pending_groups_per_stream: self.max_pending_groups_per_stream
+                .unwrap_or(d.max_pending_groups_per_stream),
+        }
+    }
+}
 
 const WRITE_HI_BYTES:    usize    = 4 * 1024 * 1024;
 const WRITE_LO_BYTES:    usize    = 16 * 1024 * 1024;
@@ -83,6 +149,11 @@ const RECONNECT_MAX:     Duration = Duration::from_secs(60);
 /// reconnects ~4x/second forever and spams both logs.
 const HEALTHY_SESSION:   Duration = Duration::from_secs(30);
 
+/// Default for `limits.max_pending_pastes_per_stream`.
+const DEFAULT_MAX_PENDING_PASTES: usize = 32;
+/// Default for `limits.max_pending_groups_per_stream`.
+const DEFAULT_MAX_PENDING_GROUPS: usize = 32;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -99,7 +170,7 @@ async fn main() -> Result<()> {
 
     let cfg_path = std::env::var("TERM_AGENT_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/etc/term-agent/agent.toml"));
+        .unwrap_or_else(|_| default_config_path());
     let cfg: AgentConfig = {
         let s = std::fs::read_to_string(&cfg_path)
             .with_context(|| format!("reading {}", cfg_path.display()))?;
@@ -108,7 +179,7 @@ async fn main() -> Result<()> {
 
     let shell = cfg.shell.clone()
         .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/sh".into());
+        .unwrap_or_else(default_shell);
 
     let server_name = cfg.server_name.clone().unwrap_or_else(|| {
         cfg.hub.split(':').next().unwrap_or("").to_string()
@@ -127,12 +198,18 @@ async fn main() -> Result<()> {
         tls_on,
         server_name,
         shell,
+        limits: cfg.limits.resolve(),
     });
 
     info!(
-        "term-agent: hub={} machine_id={} tls={} server_name={} shell={}",
+        "term-agent: hub={} machine_id={} tls={} server_name={} shell={} \
+         scrollback_cap={} idle_ttl={:?} max_pastes={} max_groups={}",
         resolved.hub, resolved.machine_id, if resolved.tls_on { "on" } else { "off" },
         resolved.server_name, resolved.shell,
+        resolved.limits.scrollback_cap_bytes,
+        resolved.limits.idle_ttl,
+        resolved.limits.max_pending_pastes_per_stream,
+        resolved.limits.max_pending_groups_per_stream,
     );
 
     let tls_connector = if resolved.tls_on { Some(build_tls_connector()?) } else { None };
@@ -172,6 +249,7 @@ struct ResolvedConfig {
     tls_on: bool,
     server_name: String,
     shell: String,
+    limits: Limits,
 }
 
 fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {
@@ -181,6 +259,42 @@ fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
+}
+
+/// Default path for `agent.toml` when `TERM_AGENT_CONFIG` isn't set.
+/// Linux:   `/etc/term-agent/agent.toml`
+/// Windows: `%PROGRAMDATA%\term-agent\agent.toml`
+///          (falls back to `C:\ProgramData\term-agent\agent.toml`)
+fn default_config_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(p) = std::env::var_os("PROGRAMDATA") {
+            return PathBuf::from(p).join("term-agent").join("agent.toml");
+        }
+        PathBuf::from(r"C:\ProgramData\term-agent\agent.toml")
+    }
+    #[cfg(unix)]
+    {
+        PathBuf::from("/etc/term-agent/agent.toml")
+    }
+}
+
+/// Fallback shell when `agent.toml` doesn't set `shell` and `$SHELL`
+/// isn't in the environment. On Windows we prefer `%ComSpec%` so we
+/// pick up custom shells configured by the user, falling back to the
+/// well-known `cmd.exe` location.
+fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        if let Some(c) = std::env::var_os("ComSpec") {
+            return c.to_string_lossy().into_owned();
+        }
+        r"C:\Windows\System32\cmd.exe".into()
+    }
+    #[cfg(unix)]
+    {
+        "/bin/sh".into()
+    }
 }
 
 async fn run_once(
@@ -244,7 +358,7 @@ where
 
     // In-agent session manager: drops tmux, owns PTYs + scrollback +
     // controller state across browser tab lifecycle.
-    let sessions = session::SessionManager::new(cfg.shell.clone());
+    let sessions = session::SessionManager::new(cfg.shell.clone(), cfg.limits);
 
     // Idle/exit sweeper: periodically drops sessions whose shells have
     // exited OR which have been detached longer than IDLE_TTL.
@@ -385,14 +499,6 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>, Fr
     Frame::from_payload(stream_id, ty, payload).map(Some)
 }
 
-/// Maximum number of in-flight paste uploads for one mux stream. Bounds
-/// concurrent tempfile descriptors a malicious browser can hold open.
-const MAX_PENDING_PASTES: usize = 32;
-/// Maximum number of distinct in-flight paste *groups* for one stream.
-/// Each group can hold up to `MAX_PENDING_PASTES` files; this caps
-/// total registry-side memory.
-const MAX_PENDING_GROUPS: usize = 32;
-
 /// One paste that is mid-transfer. Lives inside the per-stream task.
 struct PendingPaste {
     file:       fs::File,
@@ -523,6 +629,7 @@ async fn run_session_stream(
         let pending_pastes = pending_pastes.clone();
         let pending_groups = pending_groups.clone();
         let writer = writer.clone();
+        let limits = sessions.limits;
         async move {
             while let Some(body) = rx.recv().await {
                 match body {
@@ -534,7 +641,7 @@ async fn run_session_stream(
                     Body::PasteBegin { paste_id, total_size, group_id, group_size, name } => {
                         handle_paste_begin(
                             sid, paste_id, total_size, group_id, group_size, name,
-                            &pending_pastes, &pending_groups, &writer,
+                            &pending_pastes, &pending_groups, &writer, limits,
                         ).await;
                     }
                     Body::PasteChunk { paste_id, bytes } => {
@@ -650,9 +757,10 @@ async fn handle_paste_begin(
     pending_pastes: &tokio::sync::Mutex<HashMap<u32, PendingPaste>>,
     pending_groups: &tokio::sync::Mutex<HashMap<u32, PendingGroup>>,
     writer: &PrioTx,
+    limits: Limits,
 ) {
     let mut pp = pending_pastes.lock().await;
-    if pp.len() >= MAX_PENDING_PASTES {
+    if pp.len() >= limits.max_pending_pastes_per_stream {
         warn!(stream_id = sid, paste_id, "too many concurrent pastes; rejecting");
         drop(pp);
         send_paste_reject(writer, sid, paste_id, PASTE_REJECT_REGISTRY_FULL).await;
@@ -686,7 +794,7 @@ async fn handle_paste_begin(
             }
             g.total_declared = g.total_declared.saturating_add(total_size);
         } else {
-            if pg.len() >= MAX_PENDING_GROUPS {
+            if pg.len() >= limits.max_pending_groups_per_stream {
                 warn!(stream_id = sid, group_id, "too many concurrent paste groups; rejecting begin");
                 drop(pg);
                 drop(pp);
@@ -849,24 +957,57 @@ async fn handle_paste_end(
     }
 }
 
-/// Build a single bracketed-paste sequence
-/// `ESC[200~ p1 p2 ... pn ESC[201~` and write it to the shared PTY via
-/// the Session, so all attached viewers see the typed paths. Shells /
-/// readline / vim treat the lot as literal text and do not execute it.
-/// Trailing space lets the user keep typing without a gap.
+/// Inject the just-pasted file paths into the shared PTY. How depends
+/// on `session.paste_style`:
+///
+/// - **Bracketed** (`bash`, `zsh`, `pwsh`+PSReadLine, vim, …): wrap
+///   in `ESC[200~ … ESC[201~` so the shell knows it's literal text
+///   and doesn't expand globs or run readline bindings on it.
+/// - **Plain** (`cmd.exe`): space-separate; double-quote paths that
+///   contain spaces. cmd.exe doesn't understand bracketed paste —
+///   it would just display `^[[200~` and friends as literal chars.
+///
+/// In both cases the resulting line is written to the shared PTY via
+/// the Session, so all attached viewers see the typed paths.
 async fn inject_paste_paths(
     sid: u32,
     paths: Vec<PathBuf>,
     session: &Arc<session::Session>,
 ) {
-    let cap: usize = paths.iter().map(|p| p.as_os_str().len() + 1).sum::<usize>() + 16;
+    let cap: usize = paths.iter().map(|p| p.as_os_str().len() + 3).sum::<usize>() + 16;
     let mut seq = Vec::with_capacity(cap);
-    seq.extend_from_slice(b"\x1b[200~");
-    for (i, p) in paths.iter().enumerate() {
-        if i > 0 { seq.push(b' '); }
-        seq.extend_from_slice(p.as_os_str().as_encoded_bytes());
+
+    match session.paste_style {
+        session::PasteStyle::Bracketed => {
+            seq.extend_from_slice(b"\x1b[200~");
+            for (i, p) in paths.iter().enumerate() {
+                if i > 0 { seq.push(b' '); }
+                seq.extend_from_slice(p.as_os_str().as_encoded_bytes());
+            }
+            seq.extend_from_slice(b" \x1b[201~");
+        }
+        session::PasteStyle::Plain => {
+            for (i, p) in paths.iter().enumerate() {
+                if i > 0 { seq.push(b' '); }
+                let bytes = p.as_os_str().as_encoded_bytes();
+                // Quote if the path contains whitespace so cmd.exe
+                // treats it as a single arg. cmd.exe doesn't have a
+                // good way to escape an embedded `"`; in practice
+                // filenames don't contain it.
+                if bytes.iter().any(|b| matches!(b, b' ' | b'\t')) {
+                    seq.push(b'"');
+                    seq.extend_from_slice(bytes);
+                    seq.push(b'"');
+                } else {
+                    seq.extend_from_slice(bytes);
+                }
+            }
+            // Trailing space so the user can keep typing without a
+            // gap — matches the Bracketed branch's UX.
+            seq.push(b' ');
+        }
     }
-    seq.extend_from_slice(b" \x1b[201~");
+
     if let Err(e) = session.write_internal(&seq).await {
         warn!(stream_id = sid, error = %e, "pty write of pasted paths failed");
     }
@@ -876,19 +1017,38 @@ async fn inject_paste_paths(
 /// Returns the path used for pasted screenshots (does NOT create it; use
 /// [`ensure_paste_dir`]).
 ///
-/// We prefer `$XDG_RUNTIME_DIR/term-agent/paste` because systemd sets it
-/// on a per-uid tmpfs that is wiped on session/service exit. When the
-/// service runs as a system user (no XDG_RUNTIME_DIR), fall back to
-/// `/tmp/term-agent-<euid>/paste`.
+/// Per-platform:
+///
+/// - Unix: prefer `$XDG_RUNTIME_DIR/term-agent/paste` (systemd sets it
+///   on a per-uid tmpfs that is wiped on session/service exit). If the
+///   service runs as a system user with no XDG_RUNTIME_DIR, fall back
+///   to `/tmp/term-agent-<euid>/paste`.
+/// - Windows: use `%LOCALAPPDATA%\term-agent\paste` (per-user, ACL'd
+///   to that user by the OS). Falls back to `%TEMP%\term-agent\paste`
+///   when LOCALAPPDATA isn't set (uncommon — only Windows safe-mode /
+///   broken profiles).
 fn paste_root() -> &'static Path {
     static PASTE_ROOT: OnceLock<PathBuf> = OnceLock::new();
     PASTE_ROOT.get_or_init(|| {
-        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(rt).join("term-agent").join("paste")
-        } else {
-            // SAFETY: geteuid() is documented as always successful.
-            let uid = unsafe { libc::geteuid() };
-            PathBuf::from(format!("/tmp/term-agent-{uid}")).join("paste")
+        #[cfg(windows)]
+        {
+            if let Some(lad) = std::env::var_os("LOCALAPPDATA") {
+                return PathBuf::from(lad).join("term-agent").join("paste");
+            }
+            if let Some(tmp) = std::env::var_os("TEMP") {
+                return PathBuf::from(tmp).join("term-agent").join("paste");
+            }
+            PathBuf::from(r"C:\Windows\Temp\term-agent\paste")
+        }
+        #[cfg(unix)]
+        {
+            if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+                PathBuf::from(rt).join("term-agent").join("paste")
+            } else {
+                // SAFETY: geteuid() is documented as always successful.
+                let uid = unsafe { libc::geteuid() };
+                PathBuf::from(format!("/tmp/term-agent-{uid}")).join("paste")
+            }
         }
     })
 }
@@ -898,6 +1058,10 @@ fn paste_root() -> &'static Path {
 /// error if the directory cannot be created or its permissions cannot
 /// be enforced — better to fail the paste than to silently leak files
 /// into a world-readable location.
+///
+/// On Windows we skip the explicit 0700 chmod: `%LOCALAPPDATA%` is
+/// already per-user (ACL'd to the owning user + SYSTEM + Administrators
+/// by default), and subdirectories inherit that ACL.
 ///
 /// The hot path runs this every paste because `save_paste_file` cannot
 /// assume the dir survived since the previous call (PrivateTmp, manual
@@ -911,7 +1075,10 @@ async fn ensure_paste_dir() -> Result<&'static Path> {
     // (/tmp/term-agent-<uid>) is owned by us; refuse to follow a symlink
     // there so a hostile local user who pre-creates the path cannot
     // redirect our writes. XDG_RUNTIME_DIR is per-uid and tmpfs-backed,
-    // so the same defense is not necessary on that path.
+    // so the same defense is not necessary on that path. Windows
+    // LOCALAPPDATA is per-user too, but we still reject reparse points
+    // (junctions, symlinks) on the parent for the same belt-and-braces
+    // reason.
     if let Some(parent) = dir.parent() {
         match std::fs::symlink_metadata(parent) {
             Ok(md) if md.file_type().is_symlink() => {
@@ -926,10 +1093,14 @@ async fn ensure_paste_dir() -> Result<&'static Path> {
 
     fs::create_dir_all(dir).await
         .with_context(|| format!("create_dir_all {}", dir.display()))?;
-    // Re-apply perms unconditionally (umask may have left them looser,
-    // or the dir may have been recreated by something else with 0755).
-    fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await
-        .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        // Re-apply perms unconditionally (umask may have left them
+        // looser, or the dir may have been recreated by something else
+        // with 0755).
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await
+            .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    }
 
     // Best-effort: prune any pasted files older than 1 hour. Runs once
     // per save, but a single readdir/<N stats> is cheap and bounds long-

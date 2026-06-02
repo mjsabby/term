@@ -50,10 +50,13 @@ use term_common::frame::{
 };
 use term_common::osc::OscScanner;
 
-/// 8 MiB byte ring of recent PTY output. Replayed on attach.
-pub const SCROLLBACK_CAP_BYTES: usize = 8 * 1024 * 1024;
+/// 8 MiB byte ring of recent PTY output. Replayed on attach. Used as
+/// the default when `agent.toml` doesn't override
+/// `limits.scrollback_cap_bytes`.
+pub const DEFAULT_SCROLLBACK_CAP_BYTES: usize = 8 * 1024 * 1024;
 /// Default idle TTL — sessions with no attached client this long are
-/// dropped by the sweeper.
+/// dropped by the sweeper. Used as the default when `agent.toml`
+/// doesn't override `limits.idle_ttl_secs`.
 pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Broadcast channel capacity (events). With ~16 KiB PTY reads, ~1024
 /// events ≈ 16 MiB worst-case buffer per slow subscriber.
@@ -119,10 +122,53 @@ pub struct Session {
     pub id:           SessionId,
     #[allow(dead_code)]
     pub created_at:   Instant,
+    /// Per-session unguessable token. Set as `TERM_DL_TOKEN` in the
+    /// spawned shell's env; `term-dl` echoes it in every download OSC.
+    /// Without this, any PTY output containing
+    /// `ESC ] 5111 ; dl ; <path> BEL` would trigger a download —
+    /// `cat /etc/motd` on a hostile host could exfiltrate files.
+    pub dl_token:     String,
+    /// How to inject pasted file paths into the shell when a paste
+    /// completes. Derived from the configured `shell` at spawn time.
+    pub paste_style:  PasteStyle,
     broadcast_tx:     broadcast::Sender<SessionEvent>,
     pty:              crate::pty::AsyncPty,
     inner:            Mutex<SessionInner>,
     next_download_id: AtomicU32,
+}
+
+/// How `inject_paste_paths` (in `main.rs`) formats pasted file paths
+/// before typing them into the PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteStyle {
+    /// `\x1b[200~ p1 p2 ... pn \x1b[201~`. Works with shells that
+    /// understand bracketed paste mode: bash/zsh/fish via readline,
+    /// PSReadLine in pwsh ≥ 7.2, vim, less, …
+    Bracketed,
+    /// Space-separated, with paths containing spaces quoted with `"…"`.
+    /// Used for `cmd.exe` because it interprets the bracketed-paste
+    /// markers as literal `^[[200~` text instead of consuming them.
+    Plain,
+}
+
+impl PasteStyle {
+    /// Derive a paste style from the configured `shell` knob (raw
+    /// argv string from `agent.toml`).
+    pub fn from_shell(shell: &str) -> Self {
+        let prog = std::path::Path::new(
+            shell.split_whitespace().next().unwrap_or(""),
+        )
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+        // cmd.exe (with or without .exe suffix, case-insensitive
+        // because Windows file system is mostly case-insensitive).
+        if prog.eq_ignore_ascii_case("cmd.exe") || prog.eq_ignore_ascii_case("cmd") {
+            PasteStyle::Plain
+        } else {
+            PasteStyle::Bracketed
+        }
+    }
 }
 
 struct SessionInner {
@@ -152,19 +198,38 @@ impl Session {
     /// Spawn the configured shell in a fresh PTY (no tmux wrapper)
     /// via the cross-platform [`crate::pty::AsyncPty`]. Replaces
     /// `tmux new-session -A -s <id> -- <shell>`.
-    pub fn spawn(id: SessionId, shell: &str, initial_size: (u16, u16)) -> Result<Arc<Self>> {
+    ///
+    /// `scrollback_cap` bounds the per-session scrollback ring; set
+    /// via `agent.toml`'s `limits.scrollback_cap_bytes`.
+    pub fn spawn(
+        id: SessionId,
+        shell: &str,
+        initial_size: (u16, u16),
+        scrollback_cap: usize,
+    ) -> Result<Arc<Self>> {
         let (program, args) = crate::pty::split_shell(shell);
         let (rows, cols) = initial_size;
+        // 16 random bytes → 22 base64url-no-pad chars. ~128 bits of
+        // entropy; an attacker who can only print bytes into the PTY
+        // can't guess this in any practical time.
+        let dl_token = {
+            let mut buf = [0u8; 16];
+            term_common::random::fill(&mut buf);
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+        };
         // systemd service units inherit no TERM and no locale. Set a
         // terminfo-capable TERM, advertise truecolor, pick a UTF-8
-        // locale. Same env we used to pass to tmux.
-        let env: &[(&str, &str)] = &[
-            ("TERM",      "xterm-256color"),
-            ("COLORTERM", "truecolor"),
-            ("LANG",      "C.UTF-8"),
-            ("LC_ALL",    "C.UTF-8"),
+        // locale. Same env we used to pass to tmux. Plus the
+        // per-session download token (see Session::dl_token).
+        let env: Vec<(&str, &str)> = vec![
+            ("TERM",           "xterm-256color"),
+            ("COLORTERM",      "truecolor"),
+            ("LANG",           "C.UTF-8"),
+            ("LC_ALL",         "C.UTF-8"),
+            ("TERM_DL_TOKEN",  dl_token.as_str()),
         ];
-        let pty = crate::pty::AsyncPty::spawn(&program, &args, env, rows, cols)
+        let pty = crate::pty::AsyncPty::spawn(&program, &args, &env, rows, cols)
             .with_context(|| format!("spawn {program}"))?;
 
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAP);
@@ -172,6 +237,8 @@ impl Session {
         let session = Arc::new(Session {
             id:               id.clone(),
             created_at:       Instant::now(),
+            dl_token,
+            paste_style:      PasteStyle::from_shell(shell),
             broadcast_tx:     tx.clone(),
             pty,
             next_download_id: AtomicU32::new(1),
@@ -179,7 +246,7 @@ impl Session {
                 controller:       None,
                 last_size:        initial_size,
                 attached:         HashMap::new(),
-                scrollback:       ByteRing::new(SCROLLBACK_CAP_BYTES),
+                scrollback:       ByteRing::new(scrollback_cap),
                 last_attached_at: Instant::now(),
                 exited:           false,
             }),
@@ -208,33 +275,48 @@ impl Session {
                     let _ = session_for_reader.broadcast_tx.send(SessionEvent::Data(chunk));
                 }
                 for payload in captured {
-                    if let Some(path) = parse_dl_osc(&payload) {
-                        let s = session_for_reader.clone();
-                        let session_id_for_log = session_id_for_log.clone();
-                        tokio::spawn(async move {
-                            let id = s.next_download_id.fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = stream_download(&s, id, &path).await {
+                    match parse_dl_osc(&payload) {
+                        Some((token, path)) => {
+                            // Token gate: refuse downloads whose token
+                            // doesn't match this session's. Defeats the
+                            // "hostile printf in PTY output" attack;
+                            // only term-dl invocations from inside the
+                            // attached shell get TERM_DL_TOKEN.
+                            if token != session_for_reader.dl_token {
                                 warn!(
                                     session = %session_id_for_log,
-                                    download_id = id,
-                                    path = %path.display(),
-                                    error = %e,
-                                    "download failed",
+                                    "rejecting dl OSC: token mismatch (hostile PTY output?)",
                                 );
-                                let _ = s.broadcast_tx.send(SessionEvent::DownloadEnd {
-                                    id, status: DOWNLOAD_STATUS_CANCEL,
-                                });
-                                let line = format!(
-                                    "\rterm-dl: {}: {e}\r\n",
-                                    path.display(),
-                                );
-                                let _ = s.write_internal(line.as_bytes()).await;
+                                continue;
                             }
-                        });
-                    } else {
-                        warn!(session=%session_id_for_log,
-                              payload=?String::from_utf8_lossy(&payload),
-                              "ignoring unknown app OSC");
+                            let s = session_for_reader.clone();
+                            let session_id_for_log = session_id_for_log.clone();
+                            tokio::spawn(async move {
+                                let id = s.next_download_id.fetch_add(1, Ordering::Relaxed);
+                                if let Err(e) = stream_download(&s, id, &path).await {
+                                    warn!(
+                                        session = %session_id_for_log,
+                                        download_id = id,
+                                        path = %path.display(),
+                                        error = %e,
+                                        "download failed",
+                                    );
+                                    let _ = s.broadcast_tx.send(SessionEvent::DownloadEnd {
+                                        id, status: DOWNLOAD_STATUS_CANCEL,
+                                    });
+                                    let line = format!(
+                                        "\rterm-dl: {}: {e}\r\n",
+                                        path.display(),
+                                    );
+                                    let _ = s.write_internal(line.as_bytes()).await;
+                                }
+                            });
+                        }
+                        None => {
+                            warn!(session=%session_id_for_log,
+                                  payload=?String::from_utf8_lossy(&payload),
+                                  "ignoring unknown app OSC");
+                        }
                     }
                 }
             }
@@ -397,16 +479,25 @@ impl Session {
     }
 }
 
-/// Parse a `5111;` OSC payload — currently only `dl;<utf-8 path>` is
-/// recognised. Returns `Some(path)` if the OSC asked for a download,
-/// `None` otherwise.
-fn parse_dl_osc(payload: &[u8]) -> Option<PathBuf> {
-    let semi = payload.iter().position(|&b| b == b';')?;
-    let cmd = &payload[..semi];
-    let arg = &payload[semi + 1..];
+/// Parse a `5111;` OSC payload. We recognise:
+///
+///   `dl;<token>;<path>`     — request a download of `<path>`. The
+///                              token must match the session's
+///                              `TERM_DL_TOKEN` (caller checks).
+///
+/// Returns `Some((token, path))` if the OSC asked for a download,
+/// `None` otherwise. The token is borrowed from the input; the path
+/// is the remainder after the second `;` (so paths may legally
+/// contain `;`).
+fn parse_dl_osc(payload: &[u8]) -> Option<(String, PathBuf)> {
+    let semi1 = payload.iter().position(|&b| b == b';')?;
+    let cmd = &payload[..semi1];
     if cmd != b"dl" { return None; }
-    let s = std::str::from_utf8(arg).ok()?;
-    Some(PathBuf::from(s))
+    let rest = &payload[semi1 + 1..];
+    let semi2 = rest.iter().position(|&b| b == b';')?;
+    let token = std::str::from_utf8(&rest[..semi2]).ok()?.to_owned();
+    let path  = std::str::from_utf8(&rest[semi2 + 1..]).ok()?;
+    Some((token, PathBuf::from(path)))
 }
 
 /// Registry of all live sessions on this agent. Look up or spawn on
@@ -414,15 +505,19 @@ fn parse_dl_osc(payload: &[u8]) -> Option<PathBuf> {
 /// `gc_pass`.
 pub struct SessionManager {
     pub shell: String,
-    pub idle_ttl: Duration,
+    /// Resolved resource limits (from `agent.toml`'s `[limits]` table
+    /// plus defaults). The agent's per-stream task reads the
+    /// `max_pending_*` knobs from here; the session manager itself
+    /// uses `idle_ttl` and `scrollback_cap_bytes`.
+    pub limits: crate::Limits,
     map: Mutex<HashMap<SessionId, Arc<Session>>>,
 }
 
 impl SessionManager {
-    pub fn new(shell: String) -> Arc<Self> {
+    pub fn new(shell: String, limits: crate::Limits) -> Arc<Self> {
         Arc::new(SessionManager {
             shell,
-            idle_ttl: DEFAULT_IDLE_TTL,
+            limits,
             map: Mutex::new(HashMap::new()),
         })
     }
@@ -441,7 +536,9 @@ impl SessionManager {
             // Stale (shell exited but not yet GC'd) — replace.
             map.remove(id);
         }
-        let s = Session::spawn(id.clone(), &self.shell, initial_size)?;
+        let s = Session::spawn(
+            id.clone(), &self.shell, initial_size, self.limits.scrollback_cap_bytes,
+        )?;
         map.insert(id.clone(), s.clone());
         info!(session = %id, shell = %self.shell, "session spawned");
         Ok(s)
@@ -458,7 +555,7 @@ impl SessionManager {
     }
 
     /// One pass: drop any session that has exited OR whose idle time
-    /// since last detach exceeds `idle_ttl`.
+    /// since last detach exceeds `limits.idle_ttl`.
     pub async fn gc_pass(&self) {
         let now = Instant::now();
         let to_drop: Vec<(SessionId, Arc<Session>)> = {
@@ -469,7 +566,7 @@ impl SessionManager {
                 let idle  = now.saturating_duration_since(inner.last_attached_at);
                 let detached = inner.attached.is_empty();
                 let exited = inner.exited;
-                if exited || (detached && idle > self.idle_ttl) {
+                if exited || (detached && idle > self.limits.idle_ttl) {
                     drops.push((id.clone(), s.clone()));
                 }
             }
@@ -562,10 +659,245 @@ mod tests {
     }
 
     #[test]
-    fn parse_dl_osc_extracts_path() {
-        assert_eq!(parse_dl_osc(b"dl;/tmp/foo"), Some(PathBuf::from("/tmp/foo")));
-        assert_eq!(parse_dl_osc(b"dl;"), Some(PathBuf::from("")));
-        assert_eq!(parse_dl_osc(b"xx;/tmp/foo"), None);
+    fn parse_dl_osc_extracts_token_and_path() {
+        assert_eq!(
+            parse_dl_osc(b"dl;TOK123;/tmp/foo"),
+            Some(("TOK123".into(), PathBuf::from("/tmp/foo"))),
+        );
+        // Empty token is structurally valid (caller's check rejects it).
+        assert_eq!(
+            parse_dl_osc(b"dl;;/tmp/foo"),
+            Some((String::new(), PathBuf::from("/tmp/foo"))),
+        );
+        // Paths may legally contain ';' — we split only on the first
+        // two semicolons.
+        assert_eq!(
+            parse_dl_osc(b"dl;TOK;/tmp/a;b;c"),
+            Some(("TOK".into(), PathBuf::from("/tmp/a;b;c"))),
+        );
+        assert_eq!(parse_dl_osc(b"xx;TOK;/tmp/foo"), None);
         assert_eq!(parse_dl_osc(b"nosemicolon"), None);
+        assert_eq!(parse_dl_osc(b"dl;onlyonesemi"), None);
+    }
+
+    #[test]
+    fn paste_style_picks_plain_for_cmd_exe() {
+        assert_eq!(PasteStyle::from_shell("cmd.exe"), PasteStyle::Plain);
+        assert_eq!(PasteStyle::from_shell("CMD.EXE"), PasteStyle::Plain);
+        // Plain `cmd` (no .exe) — rare but accept it.
+        assert_eq!(PasteStyle::from_shell("cmd /K prompt $G"), PasteStyle::Plain);
+        // Full Windows path. `Path::file_name` only treats `\` as a
+        // separator on Windows, so the basename-extraction assertion
+        // only makes sense there.
+        #[cfg(windows)]
+        assert_eq!(
+            PasteStyle::from_shell(r"C:\Windows\System32\cmd.exe /Q"),
+            PasteStyle::Plain,
+        );
+    }
+
+    #[test]
+    fn paste_style_picks_bracketed_for_real_shells() {
+        for s in [
+            "/bin/bash",
+            "/bin/bash -l",
+            "/usr/bin/zsh",
+            "fish",
+            "powershell.exe -NoLogo",
+            "pwsh.exe",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "",  // empty falls through to bracketed too
+        ] {
+            assert_eq!(
+                PasteStyle::from_shell(s),
+                PasteStyle::Bracketed,
+                "shell {s:?} should be bracketed",
+            );
+        }
+    }
+
+    // ---- integration tests over a real shell + session lifecycle ----
+    //
+    // These spawn `/bin/sh` so they're cfg(unix). On Windows they
+    // silently no-op (`return;` once we detect /bin/sh is missing).
+
+    /// Drain `event_rx` for up to `dur`, returning everything seen.
+    /// Stops early once an `is_done` predicate returns true on the
+    /// accumulated event vector.
+    #[cfg(unix)]
+    async fn drain_events_until<F>(
+        rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+        dur: Duration,
+        is_done: F,
+    ) -> Vec<SessionEvent>
+    where F: Fn(&[SessionEvent]) -> bool
+    {
+        let deadline = Instant::now() + dur;
+        let mut out = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { break; }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    out.push(ev);
+                    if is_done(&out) { break; }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Return the concatenation of all `Data` event payloads in `evs`.
+    #[cfg(unix)]
+    fn collect_data(evs: &[SessionEvent]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for ev in evs {
+            if let SessionEvent::Data(b) = ev { out.extend_from_slice(b); }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_attach_writes_and_reads() {
+        // Spawn a real shell, write a command, read echo back.
+        if !std::path::Path::new("/bin/sh").exists() { return; }
+        let session = Session::spawn(
+            "test-attach".into(),
+            "/bin/sh",
+            (24, 80),
+            crate::session::DEFAULT_SCROLLBACK_CAP_BYTES,
+        ).expect("spawn");
+
+        let mut attach = session.attach(1, (24, 80)).await;
+        assert!(attach.became_controller);
+
+        // Write "echo TEST_NEEDLE\n" (controller writes are honored).
+        session.write_input_from(1, b"echo TEST_NEEDLE\n").await;
+
+        let evs = drain_events_until(&mut attach.event_rx, Duration::from_secs(3), |evs| {
+            let data = collect_data(evs);
+            data.windows(11).any(|w| w == b"TEST_NEEDLE")
+        }).await;
+        let data = collect_data(&evs);
+        assert!(
+            data.windows(11).any(|w| w == b"TEST_NEEDLE"),
+            "expected TEST_NEEDLE in PTY output, got {:?}",
+            String::from_utf8_lossy(&data),
+        );
+
+        // Exit the shell so the session cleans up.
+        session.write_input_from(1, b"exit\n").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_dl_token_mismatch_silently_drops() {
+        // Spawn a real shell. Inject an OSC with the wrong dl token
+        // and confirm no DownloadBegin event fires.
+        if !std::path::Path::new("/bin/sh").exists() { return; }
+
+        // Create a real file the download could read if it weren't
+        // gated by the token.
+        let tmp = std::env::temp_dir().join(format!(
+            "term-agent-dl-test-{}", std::process::id(),
+        ));
+        std::fs::write(&tmp, b"file-contents-for-test").expect("write tmp");
+
+        let session = Session::spawn(
+            "test-token".into(),
+            "/bin/sh",
+            (24, 80),
+            crate::session::DEFAULT_SCROLLBACK_CAP_BYTES,
+        ).expect("spawn");
+        let mut attach = session.attach(1, (24, 80)).await;
+
+        // Print the OSC with a WRONG token via printf inside the shell.
+        // Use printf %b to emit literal ESC bytes.
+        let path_str = tmp.to_str().unwrap();
+        let osc_wrong = format!(
+            "printf '\\033]5111;dl;WRONG_TOKEN;{path}\\07'\n",
+            path = path_str,
+        );
+        session.write_input_from(1, osc_wrong.as_bytes()).await;
+
+        let evs = drain_events_until(&mut attach.event_rx, Duration::from_secs(2), |evs| {
+            evs.iter().any(|e| matches!(e, SessionEvent::DownloadBegin { .. }))
+        }).await;
+        let saw_dl = evs.iter().any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
+        assert!(!saw_dl, "wrong-token OSC must NOT trigger a DownloadBegin");
+
+        // Now do it with the CORRECT token: capture the session's
+        // token first, then inject a matching OSC.
+        let good_token = session.dl_token.clone();
+        let osc_ok = format!(
+            "printf '\\033]5111;dl;{tok};{path}\\07'\n",
+            tok = good_token,
+            path = path_str,
+        );
+        session.write_input_from(1, osc_ok.as_bytes()).await;
+
+        let evs2 = drain_events_until(&mut attach.event_rx, Duration::from_secs(2), |evs| {
+            evs.iter().any(|e| matches!(e, SessionEvent::DownloadEnd { .. }))
+        }).await;
+        let saw_begin = evs2.iter().any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
+        let saw_end   = evs2.iter().any(|e| matches!(
+            e, SessionEvent::DownloadEnd { status, .. } if *status == DOWNLOAD_STATUS_OK
+        ));
+        assert!(saw_begin, "correct-token OSC must trigger DownloadBegin");
+        assert!(saw_end,   "correct-token OSC must finish with DownloadEnd(OK)");
+
+        let _ = std::fs::remove_file(&tmp);
+        session.write_input_from(1, b"exit\n").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_reattach_replays_scrollback() {
+        if !std::path::Path::new("/bin/sh").exists() { return; }
+        let session = Session::spawn(
+            "test-replay".into(),
+            "/bin/sh",
+            (24, 80),
+            crate::session::DEFAULT_SCROLLBACK_CAP_BYTES,
+        ).expect("spawn");
+
+        // First attach + write something the shell echoes.
+        let mut attach1 = session.attach(1, (24, 80)).await;
+        session.write_input_from(1, b"echo REPLAY_NEEDLE\n").await;
+        let _ = drain_events_until(&mut attach1.event_rx, Duration::from_secs(2), |evs| {
+            collect_data(evs).windows(13).any(|w| w == b"REPLAY_NEEDLE")
+        }).await;
+        // Detach the first stream.
+        session.detach(1).await;
+
+        // Second attach: scrollback should contain REPLAY_NEEDLE.
+        let attach2 = session.attach(2, (24, 80)).await;
+        assert!(
+            attach2.scrollback.windows(13).any(|w| w == b"REPLAY_NEEDLE"),
+            "expected scrollback to replay the prior echo; got {:?}",
+            String::from_utf8_lossy(&attach2.scrollback),
+        );
+
+        session.write_input_from(2, b"exit\n").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_manager_respects_custom_idle_ttl() {
+        // We don't actually wait the TTL out — just verify the field
+        // is plumbed through.
+        let limits = crate::Limits {
+            scrollback_cap_bytes: 64 * 1024,
+            idle_ttl: Duration::from_millis(50),
+            max_pending_pastes_per_stream: 4,
+            max_pending_groups_per_stream: 4,
+        };
+        let mgr = SessionManager::new("/bin/sh".into(), limits);
+        assert_eq!(mgr.limits.idle_ttl, Duration::from_millis(50));
+        assert_eq!(mgr.limits.scrollback_cap_bytes, 64 * 1024);
+        assert_eq!(mgr.limits.max_pending_pastes_per_stream, 4);
+        assert_eq!(mgr.limits.max_pending_groups_per_stream, 4);
     }
 }

@@ -234,6 +234,106 @@ main {
 .term-pane .xterm-viewport,
 .term-pane .xterm-screen { width: 100% !important; height: 100% !important; }
 
+/* ----- in-flight transfer overlay (per-tab) ----- */
+.term-pane .transfers {
+  position: absolute;
+  right: 16px;
+  bottom: 12px;
+  min-width: 280px;
+  max-width: 420px;
+  z-index: 5;
+  background: rgba(17, 20, 28, 0.92);
+  border: 1px solid #1e2230;
+  border-radius: 6px;
+  padding: 8px 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  font-size: 12px;
+  pointer-events: none;          /* don't intercept terminal clicks */
+}
+.term-pane .transfers[hidden] { display: none; }
+.term-pane .transfer {
+  display: grid;
+  grid-template-columns: 14px 1fr 90px 110px;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.term-pane .transfer .dir {
+  text-align: center;
+  color: #94a3c4;
+}
+.term-pane .transfer .name {
+  color: #cdd6f4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.term-pane .transfer .bar {
+  height: 6px;
+  background: #1e2230;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.term-pane .transfer .bar-fill {
+  height: 100%;
+  background: #5876b6;
+  transition: width .08s linear;
+}
+.term-pane .transfer .bytes {
+  color: #6c7086;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ----- first-attach hints overlay (per-tab) ----- */
+.term-pane .hints {
+  position: absolute;
+  left: 16px;
+  top: 12px;
+  z-index: 5;
+  background: rgba(17, 20, 28, 0.94);
+  border: 1px solid #1e2230;
+  border-radius: 6px;
+  padding: 10px 30px 10px 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  font-size: 12px;
+  color: #cdd6f4;
+  pointer-events: auto;
+  animation: hint-fade-in .25s ease-out;
+}
+.term-pane .hints[hidden] { display: none; }
+.term-pane .hints .hint {
+  padding: 2px 0;
+}
+.term-pane .hints .hint-key {
+  display: inline-block;
+  font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+  color: #94a3c4;
+  background: #1a1d28;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-right: 6px;
+  border: 1px solid #313244;
+}
+.term-pane .hints-close {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  background: transparent;
+  border: 0;
+  color: #6c7086;
+  font-size: 16px;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.term-pane .hints-close:hover { color: #f38ba8; }
+@keyframes hint-fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 /* ----- search bar ----- */
 #search-bar {
   position: absolute;

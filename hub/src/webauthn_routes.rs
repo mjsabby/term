@@ -15,25 +15,41 @@ use anyhow::Context;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
+use base64::Engine;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
-use uuid::Uuid;
-use webauthn_rs::prelude::*;
 
 use crate::auth::{mint_token, store_token, ttl_secs};
 use crate::state::{gc, AppState, PendingLogin, PENDING_LOGIN_TTL};
 use term_common::creds::{self, CredentialStore};
 use term_common::envelope::{issued_at_now, EnvelopeInner, SignedEnvelope};
 use term_common::flock::FileLock;
+use term_common::webauthn::{
+    self, AuthenticationResponse, Challenge, PublicKeyCredentialCreationOptions,
+    PublicKeyCredentialRequestOptions, StoredCredentialView,
+};
+
+/// Wrapper to keep the SPA's `prepCreateOptions(ccr.publicKey)` shape
+/// working without changing the JS: the browser reads `ccr.publicKey`.
+#[derive(Debug, Serialize)]
+pub struct CcrEnvelope {
+    #[serde(rename = "publicKey")]
+    pub public_key: PublicKeyCredentialCreationOptions,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RcrEnvelope {
+    #[serde(rename = "publicKey")]
+    pub public_key: PublicKeyCredentialRequestOptions,
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct RegisterStartReq {}
 
 #[derive(Debug, Serialize)]
 pub struct RegisterStartResp {
-    /// `CreationChallengeResponse` from webauthn-rs. The browser passes
-    /// `.publicKey` straight to `navigator.credentials.create`.
-    pub ccr: CreationChallengeResponse,
+    pub ccr: CcrEnvelope,
     /// Opaque to the browser; lands back inside the paste blob.
     pub envelope: SignedEnvelope,
     /// Repeat of rp_id/origin/ttl so the SPA can show useful UI.
@@ -46,35 +62,35 @@ pub async fn register_start(
     State(state): State<AppState>,
     Json(_req): Json<RegisterStartReq>,
 ) -> Result<Json<RegisterStartResp>, (StatusCode, String)> {
-    // Each registration gets a brand-new opaque user handle. We never use
-    // it to associate credentials with a user (any credential = admin).
-    let user_id = Uuid::new_v4();
-    let user_name = format!("term-admin-{}", &user_id.simple().to_string()[..8]);
+    // 16 random bytes for the per-registration user handle — WebAuthn
+    // requires one; we never use it again.
+    let mut user_id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut user_id);
+    let user_name = format!(
+        "term-admin-{}",
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(user_id)[..8],
+    );
 
-    // Don't exclude existing credentials at the protocol layer. The
-    // SecurityKey authenticator may not enforce this anyway, and we also
-    // check for duplicates server-side in hub-admin.
-    let (ccr, reg_state) = state
-        .webauthn
-        .start_securitykey_registration(user_id, &user_name, "term admin", None, None, None)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("start_securitykey_registration: {e:?}"),
-            )
-        })?;
+    let challenge = Challenge::random();
+    let ccr = CcrEnvelope {
+        public_key: PublicKeyCredentialCreationOptions::build(
+            &state.cfg.rp_id,
+            &state.cfg.rp_name,
+            user_id,
+            &user_name,
+            "term admin",
+            &challenge,
+        ),
+    };
 
     let inner = EnvelopeInner {
         rp_id: state.cfg.rp_id.clone(),
         origin: state.cfg.origin(),
         issued_at: issued_at_now(),
-        state: reg_state,
+        challenge_b64u: challenge.to_b64url(),
     };
     let envelope = SignedEnvelope::sign(inner, &state.secret).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("sign envelope: {e:?}"),
-        )
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("sign envelope: {e:?}"))
     })?;
     Ok(Json(RegisterStartResp {
         ccr,
@@ -88,17 +104,14 @@ pub async fn register_start(
 #[derive(Debug, Serialize)]
 pub struct LoginStartResp {
     pub nonce: String,
-    pub rcr: RequestChallengeResponse,
+    pub rcr: RcrEnvelope,
 }
 
 pub async fn login_start(
     State(state): State<AppState>,
 ) -> Result<Json<LoginStartResp>, (StatusCode, String)> {
     let store = CredentialStore::load(&state.cfg.data_dir).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("load credentials.json: {e}"),
-        )
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("load credentials.json: {e}"))
     })?;
     if store.credentials.is_empty() {
         return Err((
@@ -106,16 +119,20 @@ pub async fn login_start(
             "no credentials registered yet; register one first".into(),
         ));
     }
-    let creds: Vec<SecurityKey> = store.credentials.iter().map(|c| c.credential.clone()).collect();
-    let (rcr, auth_state) = state
-        .webauthn
-        .start_securitykey_authentication(&creds)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("start_securitykey_authentication: {e:?}"),
-            )
-        })?;
+    let mut allowed_ids = Vec::with_capacity(store.credentials.len());
+    for c in &store.credentials {
+        allowed_ids.push(c.credential_id().map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("decode credential id: {e}"))
+        })?);
+    }
+    let challenge = Challenge::random();
+    let rcr = RcrEnvelope {
+        public_key: PublicKeyCredentialRequestOptions::build(
+            &state.cfg.rp_id,
+            &challenge,
+            &allowed_ids,
+        ),
+    };
 
     let nonce = mint_token(); // re-use the random-token helper
     let mut pending = state.pending_logins.lock().await;
@@ -123,7 +140,8 @@ pub async fn login_start(
     pending.insert(
         nonce.clone(),
         PendingLogin {
-            state: auth_state,
+            challenge,
+            allowed_ids,
             expires_at: SystemTime::now() + PENDING_LOGIN_TTL,
         },
     );
@@ -133,7 +151,7 @@ pub async fn login_start(
 #[derive(Debug, Deserialize)]
 pub struct LoginFinishReq {
     pub nonce: String,
-    pub response: PublicKeyCredential,
+    pub response: AuthenticationResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,16 +171,46 @@ pub async fn login_finish(
     };
     let pending = pending.ok_or((StatusCode::UNAUTHORIZED, "unknown or expired nonce".into()))?;
 
-    let auth_result = state
-        .webauthn
-        .finish_securitykey_authentication(&req.response, &pending.state)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e:?}")))?;
+    // Load the current store. We look up the credential by raw id.
+    // Reading credentials.json on every login is fine — it's tiny and
+    // sits in the page cache.
+    let store = CredentialStore::load(&state.cfg.data_dir).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("load credentials.json: {e}"))
+    })?;
 
-    // Persist updated credential counter if necessary.
-    if auth_result.needs_update() {
-        if let Err(e) = persist_counter_update(&state, &auth_result).await {
-            // Don't fail the login — counter persistence is best-effort and
-            // re-derivable on the next successful auth.
+    // We need to keep the cred lookup simple: copy the 65-byte SEC1
+    // public key into the view we hand to `finish_authenticate`.
+    let lookup = |id: &[u8]| -> Option<StoredCredentialView> {
+        // Reject ids the server didn't offer in login_start: a stale
+        // assertion against a removed credential should not succeed.
+        if !pending.allowed_ids.iter().any(|a| a.as_slice() == id) {
+            return None;
+        }
+        let c = store.find_by_id(id)?;
+        let pk = c.credential_public_key().ok()?;
+        Some(StoredCredentialView {
+            credential_public_key: pk,
+            sign_count: c.sign_count,
+        })
+    };
+
+    let auth = webauthn::finish_authenticate(
+        &req.response,
+        &pending.challenge,
+        &state.cfg.rp_id,
+        &state.cfg.origin(),
+        lookup,
+    ).map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
+
+    // Persist updated credential counter if it advanced.
+    if auth.sign_count_advanced {
+        if let Err(e) = persist_counter_update(
+            &state,
+            &auth.credential_id,
+            auth.new_sign_count,
+        ).await {
+            // Don't fail the login — counter persistence is best-effort
+            // and re-derivable on the next successful auth.
             warn!(error = ?e, "failed to persist counter update");
         }
     }
@@ -177,27 +225,20 @@ pub async fn login_finish(
 
 async fn persist_counter_update(
     state: &AppState,
-    res: &AuthenticationResult,
+    cred_id: &[u8],
+    new_sign_count: u32,
 ) -> anyhow::Result<()> {
     let data_dir = state.cfg.data_dir.clone();
-    let cred_id = res.cred_id().clone();
-    let res = res.clone();
-    // Move the blocking file IO off the async runtime.
+    let cred_id = cred_id.to_vec();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         creds::ensure_lock_file(&data_dir).context("ensure lock file")?;
         let _g = FileLock::acquire_exclusive(&creds::lock_path(&data_dir)).context("flock")?;
         let mut store = CredentialStore::load(&data_dir).context("load store")?;
-        let mut changed = false;
-        for c in &mut store.credentials {
-            if c.credential.cred_id() == &cred_id {
-                if c.credential.update_credential(&res) == Some(true) {
-                    changed = true;
-                }
-                break;
+        if let Some(c) = store.find_by_id_mut(&cred_id) {
+            if new_sign_count > c.sign_count {
+                c.sign_count = new_sign_count;
+                store.save_atomic(&data_dir).context("save store")?;
             }
-        }
-        if changed {
-            store.save_atomic(&data_dir).context("save store")?;
         }
         Ok(())
     })

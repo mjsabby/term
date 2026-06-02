@@ -105,10 +105,19 @@ Mirror of paste, opposite direction, triggered by the `term-dl <path>`
 helper running inside a shell on the agent host:
 
 ```
-term-dl  →  ESC ] 5111 ; dl ; <absolute path> BEL   (on its stdout, into the PTY)
+term-dl  →  ESC ] 5111 ; dl ; <token> ; <absolute path> BEL   (on its stdout, into the PTY)
 agent    →  download-begin / download-chunk × N / download-end(0)   (on the same mux stream)
 browser  →  builds a Blob, triggers `<a download>` save
 ```
+
+`<token>` is the value of `TERM_DL_TOKEN`, a 16-byte random secret
+the agent sets in the session shell's environment at spawn time and
+keeps for the life of the session. The agent compares the token on
+the OSC against the session's stored token and silently drops the
+download request on any mismatch. This prevents a hostile process
+(or a stray `cat /etc/motd` on an untrusted host) from spoofing the
+OSC to exfiltrate files — without the env var, no process running
+inside the shell can know the right token.
 
 The agent's PTY-output OSC scanner consumes our application-private
 `5111;` OSCs without forwarding them to the browser (so the user
@@ -307,6 +316,46 @@ sudo systemctl enable --now term-agent.service     # on each agent host
 
 Then browse to `https://term.<your-domain>/`, register a passkey,
 paste the blob on the hub host, log in.
+
+### Windows agent
+
+`term-agent.exe` + `term-dl.exe` run on Windows 10 / 11 / Server 2019+
+(ConPTY required). The full workspace — including `term-hub.exe` +
+`hub-admin.exe` — also builds on Windows now that the webauthn stack
+is hand-rolled (no `openssl-sys`).
+
+```powershell
+# 1. Build (release, MSVC toolchain — install Rust via https://rustup.rs).
+.\scripts\build.ps1
+
+# 2. From an elevated PowerShell on the agent host. The PSK comes from
+#    add-machine.sh on your hub host. Substitute your hub address.
+.\scripts\install-agent.ps1 `
+    -Hub        term.xyz.com:7700 `
+    -MachineId  win-laptop `
+    -Psk        '<base64 psk>' `
+    -Shell      'C:\Windows\System32\cmd.exe'
+```
+
+The script:
+
+- Installs `term-agent.exe` (and `term-dl.exe` if built) to
+  `%ProgramFiles%\term-agent\`.
+- Writes `%ProgramData%\term-agent\agent.toml` with a tight ACL
+  (SYSTEM + Administrators full control, the run-as user read-only).
+- Registers a Scheduled Task `term-agent` that runs at the run-as
+  user's logon, restarts on failure, and keeps running for the life
+  of the session.
+
+Single-user model: one agent per Windows user account. `-RunAsUser`
+defaults to the user invoking the installer (which is almost always
+what you want); pass it explicitly only if you're installing for a
+different account. If you want multiple users on the same machine to
+expose shells, give each its own `machine_id` + PSK and run the
+installer once per user with `-TaskName` overridden.
+
+To uninstall: `Unregister-ScheduledTask -TaskName term-agent
+-Confirm:$false` and remove the install dirs.
 
 ## Security notes
 

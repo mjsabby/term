@@ -21,12 +21,13 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
 use serde::Deserialize;
-use webauthn_rs::prelude::{Url, WebauthnBuilder};
 
 use term_common::creds::{self, CredentialStore, StoredCredential};
 use term_common::envelope::{self, PasteBlob};
 use term_common::flock::FileLock;
+use term_common::webauthn;
 
 const DEFAULT_HUB_CONFIG: &str = "/etc/term-hub/hub.toml";
 const DEFAULT_DATA_DIR: &str = "/var/lib/term-hub";
@@ -116,31 +117,26 @@ fn cmd_add(args: &[String]) -> Result<()> {
     let paste: PasteBlob = envelope::decode_paste_blob(blob_text.trim())
         .context("decode paste blob (not valid base64+json)")?;
 
-    let response = paste.response.clone();
-    let label_in = paste.label.clone();
+    let response = paste.response;
+    let label_in = paste.label;
     let inner = paste
         .envelope
         .verify(&secret)
         .context("envelope verification failed")?;
 
-    let rp_id = inner.rp_id.clone();
-    let origin = Url::parse(&inner.origin).context("envelope origin url")?;
-    let webauthn = WebauthnBuilder::new(&rp_id, &origin)
-        .context("WebauthnBuilder::new")?
-        .rp_name("term")
-        .danger_set_user_presence_only_security_keys(true)
-        .build()
-        .context("WebauthnBuilder::build")?;
-    let sk = webauthn
-        .finish_securitykey_registration(&response, &inner.state)
-        .context("finish_securitykey_registration")?;
+    let challenge = inner.challenge().context("envelope challenge")?;
 
-    // Pick a label. Hub UI may have supplied one; otherwise prompt-friendly
-    // default with the credential id prefix.
-    let cred_id_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD_NO_PAD,
-        sk.cred_id().as_ref(),
-    );
+    let registered = webauthn::finish_register(
+        &response,
+        &challenge,
+        &inner.rp_id,
+        &inner.origin,
+    ).context("finish_register")?;
+
+    let cred_id_b64 = base64::engine::general_purpose::STANDARD_NO_PAD
+        .encode(&registered.credential_id);
+    let pubkey_b64 = base64::engine::general_purpose::STANDARD_NO_PAD
+        .encode(registered.credential_public_key);
     let label = label_in
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("cred-{}", &cred_id_b64[..cred_id_b64.len().min(8)]));
@@ -149,18 +145,16 @@ fn cmd_add(args: &[String]) -> Result<()> {
     creds::ensure_lock_file(&dir).context("ensure lock")?;
     let _guard = FileLock::acquire_exclusive(&creds::lock_path(&dir)).context("flock")?;
     let mut store = CredentialStore::load(&dir).context("load credentials.json")?;
-    if store
-        .credentials
-        .iter()
-        .any(|c| c.credential.cred_id() == sk.cred_id())
-    {
+    if store.credentials.iter().any(|c| c.credential_id_b64 == cred_id_b64) {
         bail!("credential already registered (id={cred_id_b64})");
     }
     let added_at = iso8601_now();
     store.credentials.push(StoredCredential {
         label: label.clone(),
         added_at,
-        credential: sk,
+        credential_id_b64: cred_id_b64.clone(),
+        credential_public_key_b64: pubkey_b64,
+        sign_count: registered.sign_count,
     });
     store.save_atomic(&dir).context("save credentials.json")?;
 
@@ -176,11 +170,7 @@ fn cmd_list() -> Result<()> {
         return Ok(());
     }
     for c in &store.credentials {
-        let id = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD_NO_PAD,
-            c.credential.cred_id().as_ref(),
-        );
-        println!("{}\t{}\t{}", c.label, c.added_at, id);
+        println!("{}\t{}\t{}", c.label, c.added_at, c.credential_id_b64);
     }
     Ok(())
 }
@@ -193,11 +183,8 @@ fn cmd_remove(args: &[String]) -> Result<()> {
     let mut store = CredentialStore::load(&dir)?;
     let before = store.credentials.len();
     store.credentials.retain(|c| {
-        let id = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD_NO_PAD,
-            c.credential.cred_id().as_ref(),
-        );
-        !(c.label == *target || id == *target || id.starts_with(target))
+        let id = &c.credential_id_b64;
+        !(c.label == *target || id == target || id.starts_with(target))
     });
     let removed = before - store.credentials.len();
     if removed == 0 {

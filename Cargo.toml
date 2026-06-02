@@ -23,7 +23,7 @@ rand             = "0.8"
 url              = "2"
 toml             = "0.8"
 uuid             = { version = "1", features = ["v4", "serde"] }
-webauthn-rs      = { version = "0.5.5", features = ["danger-allow-state-serialisation", "danger-user-presence-only-security-keys"] }
+p256             = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [profile.release]
 lto = "thin"

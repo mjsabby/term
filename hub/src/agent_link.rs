@@ -22,8 +22,8 @@
 //! once a new agent link is installed.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
@@ -83,6 +83,9 @@ pub struct SessionInfoEnvelope {
 
 /// Handle the hub keeps for one connected agent.
 pub struct AgentLink {
+    /// Echo of the agent's machine_id (from its Hello frame). Cached
+    /// here so /metrics can label time-series without re-locking.
+    pub machine_id:     String,
     writer:         PrioTx,
     next_stream_id: AtomicU32,
     streams:        Mutex<HashMap<u32, mpsc::Sender<Body>>>,
@@ -96,6 +99,18 @@ pub struct AgentLink {
     /// SessionList / KillSessionAck comes back.
     next_request_id: AtomicU32,
     pending_rpcs:    Mutex<HashMap<u32, oneshot::Sender<Body>>>,
+
+    // ---- /metrics counters ----
+    /// Bytes read from the agent socket (full wire frames, header
+    /// + payload). Incremented after each successful read_frame.
+    pub bytes_in:   AtomicU64,
+    /// Bytes written toward the agent socket. Incremented after
+    /// `send_frame` queues the encoded bytes.
+    pub bytes_out:  AtomicU64,
+    /// Total frames seen on the reader side.
+    pub frames_in:  AtomicU64,
+    /// Total frames queued on the writer side.
+    pub frames_out: AtomicU64,
 }
 
 /// Send half of a mux stream, held by the browser→agent task.
@@ -143,7 +158,18 @@ impl AgentLink {
             FrameType::PasteBegin | FrameType::PasteChunk | FrameType::PasteEnd => &self.writer.lo,
             _ => &self.writer.hi,
         };
-        half.send(f.encode()).await.map_err(|_| ())
+        let encoded = f.encode();
+        let n = encoded.len() as u64;
+        half.send(encoded).await.map_err(|_| ())?;
+        self.bytes_out.fetch_add(n, Ordering::Relaxed);
+        self.frames_out.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Number of mux streams currently open against this agent.
+    /// Used by /metrics. Cheap: just a HashMap len under a Mutex.
+    pub async fn stream_count(&self) -> usize {
+        self.streams.lock().await.len()
     }
 
     /// Ask the agent for the current session list. Times out after
@@ -288,7 +314,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     // ---- hello + auth -----------------------------------------------------
-    let hello_frame = timeout(HELLO_DEADLINE, read_frame(&mut reader))
+    let (hello_frame, hello_bytes_in) = timeout(HELLO_DEADLINE, read_frame(&mut reader))
         .await
         .map_err(|_| anyhow!("hello timeout from {peer}"))?
         .context("read hello")?
@@ -327,13 +353,22 @@ where
     // ---- link + writer ----------------------------------------------------
     let (write_tx, mut write_rx) = prio_channel(HUB_WRITER_HI_BYTES, HUB_WRITER_LO_BYTES);
     let link = Arc::new(AgentLink {
+        machine_id:      hello.machine_id.clone(),
         writer:          write_tx.clone(),
         next_stream_id:  AtomicU32::new(1),
         streams:         Mutex::new(HashMap::new()),
         notify_close:    tokio::sync::Notify::new(),
         next_request_id: AtomicU32::new(1),
         pending_rpcs:    Mutex::new(HashMap::new()),
+        bytes_in:        AtomicU64::new(0),
+        bytes_out:       AtomicU64::new(0),
+        frames_in:       AtomicU64::new(0),
+        frames_out:      AtomicU64::new(0),
     });
+
+    // The hello frame counts toward bytes_in too.
+    link.bytes_in.fetch_add(hello_bytes_in, Ordering::Relaxed);
+    link.frames_in.fetch_add(1, Ordering::Relaxed);
 
     // Atomically replace any prior link for this machine. If we evict an
     // old link, tell its reader/writer to bail so its TCP gets torn down
@@ -389,7 +424,11 @@ where
                 }
                 r = timeout(IDLE_DEADLINE, read_frame(&mut reader)) => {
                     match r {
-                        Ok(Ok(Some(f))) => Some(f),
+                        Ok(Ok(Some((f, bytes)))) => {
+                            link_for_read.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+                            link_for_read.frames_in.fetch_add(1, Ordering::Relaxed);
+                            Some(f)
+                        }
                         Ok(Ok(None))    => return Ok(()),
                         Ok(Err(e))      => return Err(e.into()),
                         Err(_)          => bail!("idle timeout (>{IDLE_DEADLINE:?})"),
@@ -460,7 +499,10 @@ where
     Ok(())
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>, FrameError> {
+/// Read one wire frame, returning the parsed frame plus the total
+/// number of bytes consumed (header + payload). Counted into
+/// `bytes_in` on the AgentLink by the caller.
+async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<(Frame, u64)>, FrameError> {
     let mut hdr = [0u8; HEADER_LEN];
     match r.read_exact(&mut hdr).await {
         Ok(_) => {}
@@ -473,7 +515,8 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>, Fr
     let (ty, len) = Frame::validate_header(stream_id, ty_byte, len)?;
     let mut payload = vec![0u8; len as usize];
     if len > 0 { r.read_exact(&mut payload).await?; }
-    Frame::from_payload(stream_id, ty, payload).map(Some)
+    let total = HEADER_LEN as u64 + len as u64;
+    Frame::from_payload(stream_id, ty, payload).map(|f| Some((f, total)))
 }
 
 /// Acceptor task for the agent listener. Loops accepting TCP; if a

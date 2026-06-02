@@ -10,6 +10,7 @@ mod agent_link;
 mod api_routes;
 mod auth;
 mod config;
+mod metrics;
 mod proxy;
 mod state;
 mod static_assets;
@@ -26,8 +27,6 @@ use rustls_acme::{caches::DirCache, AcmeConfig};
 use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
-use webauthn_rs::prelude::Url;
-use webauthn_rs::WebauthnBuilder;
 
 use config::{HubConfig, TlsMode};
 use state::AppState;
@@ -53,16 +52,17 @@ async fn main() -> Result<()> {
     let _ = rustls_acme::futures_rustls::rustls::crypto::aws_lc_rs::default_provider()
         .install_default();
 
-    let origin_url = Url::parse(&cfg.origin()).context("parse origin url")?;
-    let webauthn = WebauthnBuilder::new(&cfg.rp_id, &origin_url)
-        .context("WebauthnBuilder::new")?
-        .rp_name(&cfg.rp_name)
-        .danger_set_user_presence_only_security_keys(true)
-        .build()
-        .context("WebauthnBuilder::build")?;
+    // Sanity-check the origin URL while we're here — it must be a valid
+    // URL that the browser will use as its `Origin:` header. We don't
+    // need the parsed form; we'll compare strings in webauthn_routes.
+    {
+        let origin = cfg.origin();
+        url::Url::parse(&origin)
+            .with_context(|| format!("origin {origin:?} is not a valid URL"))?;
+    }
 
     let cfg = Arc::new(cfg);
-    let app_state = AppState::new(cfg.clone(), secret, webauthn);
+    let app_state = AppState::new(cfg.clone(), secret);
 
     let app = Router::new()
         .route("/webauthn/register/start", post(webauthn_routes::register_start))
@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
                                            axum::routing::delete(api_routes::kill_session))
         .route("/api/me",                  get(api_routes::me))
         .route("/api/logout",              post(api_routes::logout))
+        .route("/metrics",                 get(metrics::handler))
         .route("/ws/term/{machine_id}",    get(proxy::term_ws))
         .fallback(static_assets::handler)
         .layer(TraceLayer::new_for_http())

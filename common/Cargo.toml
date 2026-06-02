@@ -5,6 +5,15 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+## `hub` pulls in p256 (ECDSA verify) + serde_json for our hand-rolled
+## webauthn + credential-store + envelope code. Enabled by default so
+## hub + hub-admin keep working unchanged. The agent disables it with
+## `default-features = false` so it doesn't drag p256 into the
+## tiny Windows binary it doesn't need.
+default = ["hub"]
+hub = ["dep:p256"]
+
 [dependencies]
 serde       = { workspace = true }
 serde_json  = { workspace = true }
@@ -12,6 +21,10 @@ thiserror   = { workspace = true }
 base64      = { workspace = true }
 hmac        = { workspace = true }
 sha2        = { workspace = true }
-webauthn-rs = { workspace = true }
-libc        = "0.2"
+p256        = { workspace = true, optional = true }
 tokio       = { workspace = true }
+
+## `libc` is only used by the Unix-only `flock` module. Keeping it
+## target-gated avoids a useless Windows dependency.
+[target.'cfg(unix)'.dependencies]
+libc        = "0.2"

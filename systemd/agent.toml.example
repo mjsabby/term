@@ -1,4 +1,5 @@
-## Agent config — copy to /etc/term-agent/agent.toml and edit.
+## Agent config — copy to /etc/term-agent/agent.toml (Linux) or
+## %PROGRAMDATA%\term-agent\agent.toml (Windows) and edit.
 ##
 ## The agent dials the hub. No inbound port is opened on this host.
 
@@ -24,12 +25,44 @@ tls         = "on"
 # server_name = "term.xyz.com"
 
 ## Shell spawned in a fresh PTY by the in-agent session manager.
-## Defaults to /bin/sh. Supports an argv-style string — the first word
-## is the program, the rest are passed as arguments. For a login shell:
-##   shell = "/bin/bash -l"
+## Defaults to $SHELL / /bin/sh on Unix, and %ComSpec% / cmd.exe on
+## Windows. Supports an argv-style string — the first word is the
+## program, the rest are passed as arguments.
+##
+## Examples:
+##   Unix (login shell):       shell = "/bin/bash -l"
+##   Windows (PowerShell 7):   shell = "C:\\Program Files\\PowerShell\\7\\pwsh.exe -NoLogo"
+##   Windows (legacy):         shell = "C:\\Windows\\System32\\cmd.exe /Q"
+##   Windows (Windows PS):     shell = "powershell -NoLogo -NoProfile"
+##
 ## Argv is split on ASCII whitespace; no quoting/escaping. If you need
 ## spaces in arguments, point this at a wrapper script.
 shell       = "/bin/bash"
 
 ## (Legacy, ignored as of Phase 4.2: the agent no longer wraps in tmux.)
 # tmux        = "/usr/bin/tmux"
+
+## --- Resource limits (all optional; defaults shown) -----------------
+##
+## Tune these only if you know why. Defaults match what was hardcoded
+## before Phase 4.5; agents on memory-constrained machines may want
+## smaller scrollback or fewer pending pastes.
+##
+# [limits]
+#
+# ## Per-session scrollback ring, in bytes. Replayed verbatim on attach.
+# ## Bigger ring = more history at the cost of RAM.
+# scrollback_cap_bytes = 8388608        # 8 MiB
+#
+# ## How long a session with zero attached clients survives before the
+# ## sweeper kills the shell. In seconds.
+# idle_ttl_secs = 86400                 # 24 h
+#
+# ## Cap on in-flight chunked-paste uploads per stream (per browser tab).
+# ## Each holds an open tempfile FD plus a buffer.
+# max_pending_pastes_per_stream = 32
+#
+# ## Cap on distinct in-flight paste groups per stream. A group =
+# ## one "paste action" (e.g. Ctrl-V on a multi-file clipboard, or a
+# ## multi-file drag-and-drop).
+# max_pending_groups_per_stream = 32

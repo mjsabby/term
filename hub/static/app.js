@@ -608,6 +608,28 @@ function openTab(machineId, sessionId, activate) {
   $('#terminal-container').appendChild(paneEl);
   term.open(paneEl);
 
+  // Transfer panel: floats over the bottom-right of this pane and
+  // shows one row per in-flight paste / download. Hidden when empty.
+  // Populated by setTransfer / updateTransfer / clearTransfer.
+  const transfersEl = document.createElement('div');
+  transfersEl.className = 'transfers';
+  transfersEl.hidden = true;
+  paneEl.appendChild(transfersEl);
+
+  // Hints overlay: shown on first activation. Three tips for new
+  // users (paste, drag-drop, term-dl). Dismissable via the × button;
+  // dismissal is per-tab and per-page-load (no localStorage).
+  const hintsEl = document.createElement('div');
+  hintsEl.className = 'hints';
+  hintsEl.hidden = true;
+  hintsEl.innerHTML = `
+    <button type="button" class="hints-close" title="dismiss">×</button>
+    <div class="hint"><span class="hint-key">drag</span> drop files anywhere in the terminal to upload</div>
+    <div class="hint"><span class="hint-key">Ctrl-V</span> paste files or text from the clipboard</div>
+    <div class="hint"><span class="hint-key">term-dl</span> &lt;path&gt; — download a file from this host</div>
+  `;
+  paneEl.appendChild(hintsEl);
+
   // WebGL renderer: 5–10× faster than the DOM renderer. Must be loaded
   // *after* term.open() so the element exists. Fall back to DOM if the
   // GPU context is lost or unavailable.
@@ -670,6 +692,9 @@ function openTab(machineId, sessionId, activate) {
 
   const tab = {
     machineId, sessionId, term, fit, search, serialize, paneEl, tabEl, statusEl: status,
+    transfersEl, hintsEl,
+    _transfers: new Map(),
+    _hintsDismissed: false,
     ctrlPill, ctrlLabel, ctrlBtn,
     controllerStatus: 0, // CONTROLLER_STATUS_NONE
     ws: null, dataDisposable: null, resizeDisposable: null,
@@ -677,6 +702,12 @@ function openTab(machineId, sessionId, activate) {
   };
   tabs.push(tab);
   writeFragment(tabs);
+
+  hintsEl.querySelector('.hints-close').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    tab._hintsDismissed = true;
+    hintsEl.hidden = true;
+  });
 
   attachClipboardHandlers(tab);
 
@@ -704,6 +735,73 @@ function openTab(machineId, sessionId, activate) {
   connectTab(tab);
 
   if (activate) activateTab(tabs.indexOf(tab));
+}
+
+// ----- transfer progress overlay --------------------------------------------
+//
+// Per-tab floating panel that lists one row per in-flight transfer
+// (paste = browser→agent, download = agent→browser) with a progress
+// bar. Auto-hides when empty. Drives off the existing paste-send loop
+// (sendPasteFile, sendPasteFiles) and the download-receive handlers
+// (onDownloadBegin/Chunk/End).
+
+function setTransfer(tab, key, info) {
+  tab._transfers.set(key, info);
+  renderTransfers(tab);
+}
+function updateTransfer(tab, key, done) {
+  const t = tab._transfers.get(key);
+  if (!t) return;
+  t.done = done;
+  renderTransfers(tab);
+}
+function clearTransfer(tab, key) {
+  if (tab._transfers.delete(key)) renderTransfers(tab);
+}
+function renderTransfers(tab) {
+  const panel = tab.transfersEl;
+  if (!panel) return;
+  if (tab._transfers.size === 0) {
+    panel.hidden = true;
+    panel.textContent = '';
+    return;
+  }
+  // Rebuild from scratch — sets are small (a few rows) and this avoids
+  // tracking per-row DOM nodes.
+  panel.textContent = '';
+  for (const [, t] of tab._transfers) {
+    const row = document.createElement('div');
+    row.className = 'transfer';
+    const pct = t.total > 0 ? Math.min(100, (t.done * 100 / t.total)) : 0;
+    const dir = document.createElement('span');
+    dir.className = 'dir';
+    dir.textContent = t.kind === 'paste' ? '↑' : '↓';
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = t.name;
+    name.title = t.name;
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fill = document.createElement('div');
+    fill.className = 'bar-fill';
+    fill.style.width = pct.toFixed(1) + '%';
+    bar.appendChild(fill);
+    const bytes = document.createElement('span');
+    bytes.className = 'bytes';
+    bytes.textContent = `${humanBytes(t.done)} / ${humanBytes(t.total)}`;
+    row.appendChild(dir);
+    row.appendChild(name);
+    row.appendChild(bar);
+    row.appendChild(bytes);
+    panel.appendChild(row);
+  }
+  panel.hidden = false;
+}
+function humanBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
 }
 
 // ----- clipboard / paste / drag-and-drop glue --------------------------------
@@ -806,6 +904,10 @@ async function sendPasteFile(tab, blob, groupId, groupSize) {
 
   try {
     tab.ws.send(encodePasteBegin(pasteId, size, groupId, groupSize, name));
+    const transferKey = `p:${pasteId}`;
+    setTransfer(tab, transferKey, {
+      kind: 'paste', name, done: 0, total: size, groupId,
+    });
 
     const big = size > MAX_PASTE_CHUNK_BYTES;
     if (big) flash(`uploading ${name} (${(size / 1024 / 1024).toFixed(1)} MiB)…`);
@@ -817,10 +919,12 @@ async function sendPasteFile(tab, blob, groupId, groupSize) {
     while (offset < size) {
       if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) {
         flash('terminal disconnected mid-paste');
+        clearTransfer(tab, transferKey);
         return false;
       }
       // Agent rejected this paste mid-stream — stop wasting bytes.
       if (tab._abortedPastes && tab._abortedPastes.has(pasteId)) {
+        clearTransfer(tab, transferKey);
         return false;
       }
       // Backpressure: don't read+send the next chunk until the WS has
@@ -830,6 +934,7 @@ async function sendPasteFile(tab, blob, groupId, groupSize) {
         await waitForDrain(tab.ws, SEND_HIGH_WATER / 2);
         if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) {
           flash('terminal disconnected mid-paste');
+          clearTransfer(tab, transferKey);
           return false;
         }
       }
@@ -839,15 +944,19 @@ async function sendPasteFile(tab, blob, groupId, groupSize) {
       // Re-check after the await.
       if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) {
         flash('terminal disconnected mid-paste');
+        clearTransfer(tab, transferKey);
         return false;
       }
       if (tab._abortedPastes && tab._abortedPastes.has(pasteId)) {
+        clearTransfer(tab, transferKey);
         return false;
       }
       tab.ws.send(encodePasteChunk(pasteId, buf));
       offset = end;
+      updateTransfer(tab, transferKey, offset);
     }
     tab.ws.send(encodePasteEnd(pasteId, PASTE_STATUS_OK));
+    clearTransfer(tab, transferKey);
     if (big) flash(`uploaded ${name}`);
     return true;
   } catch (e) {
@@ -858,6 +967,7 @@ async function sendPasteFile(tab, blob, groupId, groupSize) {
         tab.ws.send(encodePasteEnd(pasteId, PASTE_STATUS_CANCEL));
       }
     } catch (_) {}
+    clearTransfer(tab, `p:${pasteId}`);
     return false;
   } finally {
     if (tab._pasteToGroup) tab._pasteToGroup.delete(pasteId);
@@ -935,6 +1045,9 @@ function handleDownloadBegin(tab, payload) {
     return;
   }
   tab._downloads.set(downloadId, { name, totalSize, received: 0, chunks: [] });
+  setTransfer(tab, `d:${downloadId}`, {
+    kind: 'download', name, done: 0, total: totalSize,
+  });
   if (totalSize > MAX_PASTE_CHUNK_BYTES) {
     flash(`downloading ${name} (${(totalSize / 1024 / 1024).toFixed(1)} MiB)…`);
   }
@@ -950,6 +1063,7 @@ function handleDownloadChunk(tab, payload) {
     // Agent overran its own declaration. Drop the download to avoid
     // saving a too-large file (the agent will also have logged this).
     tab._downloads.delete(downloadId);
+    clearTransfer(tab, `d:${downloadId}`);
     flash(`download "${dl.name}" overran declared size; discarded`);
     return;
   }
@@ -957,6 +1071,7 @@ function handleDownloadChunk(tab, payload) {
   // owned Uint8Array.
   dl.chunks.push(new Uint8Array(chunk));
   dl.received += chunk.length;
+  updateTransfer(tab, `d:${downloadId}`, dl.received);
 }
 
 function handleDownloadEnd(tab, payload) {
@@ -966,6 +1081,7 @@ function handleDownloadEnd(tab, payload) {
   const dl = tab._downloads.get(downloadId);
   if (!dl) return;
   tab._downloads.delete(downloadId);
+  clearTransfer(tab, `d:${downloadId}`);
 
   if (status === DOWNLOAD_STATUS_CANCEL) {
     flash(`download "${dl.name}" cancelled`);
@@ -1248,6 +1364,16 @@ function activateTab(idx) {
     t.tabEl.classList.toggle('active', on);
   });
   const t = tabs[idx];
+  // First-activation hints overlay. Skip if already dismissed.
+  if (!t._hintsDismissed && !t._hintsShown) {
+    t._hintsShown = true;
+    t.hintsEl.hidden = false;
+    // Auto-dismiss after 12 seconds so it doesn't linger forever
+    // for users who never explicitly close it.
+    setTimeout(() => {
+      if (!t._hintsDismissed) { t._hintsDismissed = true; t.hintsEl.hidden = true; }
+    }, 12000);
+  }
   // Refit once visible.
   requestAnimationFrame(() => {
     sendResizeIfReady(t);

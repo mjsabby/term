@@ -1,18 +1,27 @@
 //! Shared types for the term hub/agent system.
 //!
-//! Three independent modules:
+//! Module set varies by feature / target:
 //!
-//! - [`frame`]: the length-prefixed binary protocol used both hub<->agent
-//!   (over TCP) and browser<->hub (as WebSocket binary messages). Keep
-//!   identical so the hub can act as a near-trivial relay.
-//! - [`creds`]: on-disk credential store (`credentials.json`) and the
-//!   secret-key file used to HMAC-sign out-of-band registration envelopes.
-//! - [`envelope`]: HMAC-signed registration envelope used by the OOB
-//!   passkey paste flow. Produced by the hub, verified by `hub-admin`.
+//! - [`frame`], [`osc`], [`prio`]: always available. Used by both
+//!   the agent and the hub.
+//! - [`webauthn`], [`creds`], [`envelope`]: gated behind the `hub`
+//!   feature (default-on). Used by hub + hub-admin. The agent
+//!   disables the feature so it doesn't drag in `p256` for our
+//!   ECDSA verifier.
+//! - [`flock`]: gated behind `cfg(unix)`. Used by hub + hub-admin to
+//!   serialize concurrent `credentials.json` writes. The agent
+//!   doesn't touch credentials, so the Windows agent build doesn't
+//!   need a Windows file-lock impl.
 
+#[cfg(feature = "hub")]
 pub mod creds;
+#[cfg(feature = "hub")]
 pub mod envelope;
+#[cfg(feature = "hub")]
 pub mod flock;
 pub mod frame;
 pub mod osc;
 pub mod prio;
+pub mod random;
+#[cfg(feature = "hub")]
+pub mod webauthn;

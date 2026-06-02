@@ -1,0 +1,146 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel in-flight runs on the same ref so PR pushes don't queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep cold-build noise (compiled deps progress) out of step logs.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            artifact_ext: .exe
+            run_tests: true
+          - target: aarch64-pc-windows-msvc
+            # `windows-11-arm` is GitHub's hosted ARM64 Windows runner
+            # (public preview as of 2025). If it ever disappears or
+            # times out, swap for `windows-2022` and add
+            # `cross_compile: true` so the build target differs from
+            # the host arch.
+            runner: windows-11-arm
+            artifact_ext: .exe
+            run_tests: true
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            artifact_ext: ''
+            run_tests: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            artifact_ext: ''
+            run_tests: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Bust cache when the lockfile or rust version changes.
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.toml') }}-v1
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      - name: clippy
+        # `-D warnings` makes any clippy warning fail the build; we
+        # already keep the tree warning-free.
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      - name: test
+        if: matrix.run_tests
+        # Tests live in term-common (126) + term-agent (14); the other
+        # crates have no unit tests yet (covered by integration tests
+        # in a follow-up). `--workspace` still runs all of them.
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: build release
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: collect binaries
+        shell: bash
+        env:
+          EXT: ${{ matrix.artifact_ext }}
+          TGT: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          for b in term-hub term-agent hub-admin term-dl; do
+            src="target/${TGT}/release/${b}${EXT}"
+            if [[ -f "$src" ]]; then
+              cp "$src" "artifacts/${b}${EXT}"
+            else
+              echo "MISSING: $src" >&2
+              exit 1
+            fi
+          done
+          ls -la artifacts
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: term-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+          # 14 days is enough to download a CI build for manual smoke
+          # testing without storing forever.
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Linux-only formatting + dep audit. Runs in parallel with build.
+  # ---------------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # The repo doesn't currently enforce rustfmt style; we still run
+      # `--check` so any drift shows up as a non-blocking warning. To
+      # promote to a hard error: change `continue-on-error: true` to
+      # `false` and commit a rustfmt.toml.
+      - name: rustfmt --check
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: cargo tree (no openssl)
+        # Belt-and-braces: Phase 4.4 removed openssl-sys; if a future
+        # change reintroduces it (e.g. via a new dep), fail loudly here
+        # rather than discover it in a Windows build later.
+        run: |
+          set -euo pipefail
+          if cargo tree --workspace --format '{p}' | grep -E '^(openssl|openssl-sys|webauthn-rs)\b' ; then
+            echo "::error::reintroduced openssl/webauthn-rs as a dep" >&2
+            exit 1
+          fi
+          echo "ok: no openssl/webauthn-rs in the dep tree"

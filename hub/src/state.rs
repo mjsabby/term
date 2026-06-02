@@ -2,14 +2,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::Mutex;
-use webauthn_rs::prelude::*;
-use webauthn_rs::Webauthn;
 
 use crate::agent_link::AgentLink;
 use crate::config::HubConfig;
+use term_common::webauthn::Challenge;
 
 /// Bearer-token lifetime (no refresh; user re-auths via passkey).
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
@@ -24,7 +23,8 @@ pub struct AppState(pub Arc<AppStateInner>);
 pub struct AppStateInner {
     pub cfg: Arc<HubConfig>,
     pub secret: [u8; 32],
-    pub webauthn: Webauthn,
+    /// Process-start time. Used by /metrics for `term_hub_uptime_seconds`.
+    pub start_time: Instant,
     pub pending_logins: Mutex<HashMap<String, PendingLogin>>,
     pub sessions: Mutex<HashMap<String, Session>>,
     /// Currently-connected agents, keyed by `machine_id`. Replaced atomically
@@ -35,7 +35,12 @@ pub struct AppStateInner {
 }
 
 pub struct PendingLogin {
-    pub state: SecurityKeyAuthentication,
+    pub challenge: Challenge,
+    /// Raw credential ids we offered in `allowCredentials`. Used to
+    /// narrow the lookup in `login_finish` to credentials known at
+    /// `login_start` time, so a stale assertion against a removed
+    /// credential can't succeed.
+    pub allowed_ids: Vec<Vec<u8>>,
     pub expires_at: SystemTime,
 }
 
@@ -44,11 +49,11 @@ pub struct Session {
 }
 
 impl AppState {
-    pub fn new(cfg: Arc<HubConfig>, secret: [u8; 32], webauthn: Webauthn) -> Self {
+    pub fn new(cfg: Arc<HubConfig>, secret: [u8; 32]) -> Self {
         AppState(Arc::new(AppStateInner {
             cfg,
             secret,
-            webauthn,
+            start_time: Instant::now(),
             pending_logins: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),

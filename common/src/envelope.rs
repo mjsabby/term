@@ -1,16 +1,22 @@
 //! HMAC-signed registration envelope.
 //!
-//! The hub generates a [`SecurityKeyRegistration`] in `/webauthn/register/start`
-//! and wraps it together with the RP context in an envelope that we sign
-//! with a host-local HMAC secret. The browser hands the operator a single
-//! base64 blob containing this envelope **plus** the credential creation
-//! response. `hub-admin` verifies the HMAC and the TTL before completing
-//! registration.
+//! Used as a bag of bytes to round-trip the registration challenge from
+//! the hub through the operator's browser to `hub-admin add-passkey`
+//! on the hub host. The hub doesn't keep server-side registration
+//! state — the envelope IS the state, signed by a host-local HMAC key
+//! so the operator can't trivially forge it (and so the browser can't
+//! either).
 //!
-//! Rationale: webauthn-rs explicitly warns against trusting the
-//! registration state if it round-trips through the client. Adding an
-//! HMAC keyed to a host-local secret turns the paste blob into an
-//! operator-authorized handoff that the client cannot tamper with.
+//! Wire shape — opaque to the browser, deserialized only by hub-admin:
+//!
+//! ```text
+//! SignedEnvelope { inner: EnvelopeInner, hmac_b64: String }
+//! EnvelopeInner   { rp_id, origin, issued_at, challenge_b64 }
+//! ```
+//!
+//! Plus a `PasteBlob { envelope, response, label }` that bundles the
+//! envelope with the navigator.credentials.create response so the
+//! operator pastes a single base64 string into `hub-admin`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +24,8 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use webauthn_rs::prelude::{RegisterPublicKeyCredential, SecurityKeyRegistration};
+
+use crate::webauthn::{Challenge, RegistrationResponse};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -31,7 +38,14 @@ pub struct EnvelopeInner {
     pub rp_id: String,
     pub origin: String,
     pub issued_at: u64,
-    pub state: SecurityKeyRegistration,
+    /// Base64url-no-pad of the 32-byte challenge.
+    pub challenge_b64u: String,
+}
+
+impl EnvelopeInner {
+    pub fn challenge(&self) -> Result<Challenge, EnvelopeError> {
+        Challenge::from_b64url(&self.challenge_b64u).map_err(|e| EnvelopeError::Decode(e.to_string()))
+    }
 }
 
 /// Wire format of the envelope: JSON body + base64 HMAC tag.
@@ -47,7 +61,7 @@ pub struct SignedEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasteBlob {
     pub envelope: SignedEnvelope,
-    pub response: RegisterPublicKeyCredential,
+    pub response: RegistrationResponse,
     /// Optional human-readable label provided by the operator.
     #[serde(default)]
     pub label: Option<String>,
