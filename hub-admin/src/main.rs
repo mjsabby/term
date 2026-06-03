@@ -126,17 +126,13 @@ fn cmd_add(args: &[String]) -> Result<()> {
 
     let challenge = inner.challenge().context("envelope challenge")?;
 
-    let registered = webauthn::finish_register(
-        &response,
-        &challenge,
-        &inner.rp_id,
-        &inner.origin,
-    ).context("finish_register")?;
+    let registered = webauthn::finish_register(&response, &challenge, &inner.rp_id, &inner.origin)
+        .context("finish_register")?;
 
-    let cred_id_b64 = base64::engine::general_purpose::STANDARD_NO_PAD
-        .encode(&registered.credential_id);
-    let pubkey_b64 = base64::engine::general_purpose::STANDARD_NO_PAD
-        .encode(registered.credential_public_key);
+    let cred_id_b64 =
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(&registered.credential_id);
+    let pubkey_b64 =
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(registered.credential_public_key);
     let label = label_in
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("cred-{}", &cred_id_b64[..cred_id_b64.len().min(8)]));
@@ -145,7 +141,11 @@ fn cmd_add(args: &[String]) -> Result<()> {
     creds::ensure_lock_file(&dir).context("ensure lock")?;
     let _guard = FileLock::acquire_exclusive(&creds::lock_path(&dir)).context("flock")?;
     let mut store = CredentialStore::load(&dir).context("load credentials.json")?;
-    if store.credentials.iter().any(|c| c.credential_id_b64 == cred_id_b64) {
+    if store
+        .credentials
+        .iter()
+        .any(|c| c.credential_id_b64 == cred_id_b64)
+    {
         bail!("credential already registered (id={cred_id_b64})");
     }
     let added_at = iso8601_now();
@@ -200,10 +200,7 @@ fn cmd_secret_info() -> Result<()> {
     let dir = data_dir();
     let secret = creds::load_or_create_secret(&dir)?;
     let h = Sha256::digest(secret);
-    let fp = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD_NO_PAD,
-        &h[..8],
-    );
+    let fp = base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &h[..8]);
     println!("data_dir: {}", dir.display());
     println!("secret_fingerprint: {fp}");
     Ok(())

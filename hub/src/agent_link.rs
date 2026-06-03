@@ -22,8 +22,8 @@
 //! once a new agent link is installed.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
@@ -34,9 +34,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use term_common::frame::{
-    Body, Frame, FrameType, HelloPayload, HELLO_VERSION, KILL_STATUS_OK,
-};
+use term_common::frame::{Body, Frame, FrameType, HelloPayload, HELLO_VERSION, KILL_STATUS_OK};
 use term_common::prio::{prio_channel, PrioTx};
 use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 
@@ -52,30 +50,30 @@ use crate::state::AppState;
 //     1 MiB; 16 MiB total lets ~16 chunks queue before the WS reader
 //     pauses, which TCP-backpressures the browser. Old item-based cap
 //     (256 items × 1 MiB) was 256 MiB worst case.
-const HUB_WRITER_HI_BYTES: usize =  4 * 1024 * 1024;
+const HUB_WRITER_HI_BYTES: usize = 4 * 1024 * 1024;
 const HUB_WRITER_LO_BYTES: usize = 16 * 1024 * 1024;
-const STREAM_CHAN_CAP:   usize    = 64;
+const STREAM_CHAN_CAP: usize = 64;
 /// Hard cap on concurrent mux streams the hub will open against a single
 /// agent. Bounds per-agent task / memory growth from a client that opens
 /// an unbounded number of tabs or WebSockets. Generous enough for normal
 /// multi-tab use; the agent's own `limits.max_sessions` caps the costlier
 /// shell-spawn side.
 pub const MAX_STREAMS_PER_AGENT: usize = 256;
-const HELLO_DEADLINE:    Duration = Duration::from_secs(10);
-const IDLE_DEADLINE:     Duration = Duration::from_secs(90);
+const HELLO_DEADLINE: Duration = Duration::from_secs(10);
+const IDLE_DEADLINE: Duration = Duration::from_secs(90);
 /// Wait this long for a session-admin RPC response from the agent
 /// before failing the HTTP call back to the browser.
-const RPC_DEADLINE:      Duration = Duration::from_secs(5);
+const RPC_DEADLINE: Duration = Duration::from_secs(5);
 
 /// JSON shape the agent sends in a `SessionList` response and the hub
 /// re-serialises for the browser admin panel.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionInfo {
-    pub id:             String,
+    pub id: String,
     /// Seconds since this session was last attached or detached.
-    pub idle_secs:      u64,
+    pub idle_secs: u64,
     /// Number of browser tabs currently attached.
-    pub attached:       usize,
+    pub attached: usize,
     /// Whether there is a current controller (any one of the attached
     /// streams).
     pub has_controller: bool,
@@ -90,30 +88,30 @@ pub struct SessionInfoEnvelope {
 pub struct AgentLink {
     /// Echo of the agent's machine_id (from its Hello frame). Cached
     /// here so /metrics can label time-series without re-locking.
-    pub machine_id:     String,
-    writer:         PrioTx,
+    pub machine_id: String,
+    writer: PrioTx,
     next_stream_id: AtomicU32,
-    streams:        Mutex<HashMap<u32, mpsc::Sender<Body>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<Body>>>,
     /// Fired when the link is evicted from the agents map (e.g. by a
     /// fresh connection from the same machine_id). The connection's
     /// reader loop selects on this notification and exits.
-    notify_close:   tokio::sync::Notify,
+    notify_close: tokio::sync::Notify,
     /// Per-link RPC plumbing: each ListSessions / KillSession call
     /// allocates a fresh `request_id`, parks an oneshot here, and
     /// awaits. The reader loop fires the oneshot when the matching
     /// SessionList / KillSessionAck comes back.
     next_request_id: AtomicU32,
-    pending_rpcs:    Mutex<HashMap<u32, oneshot::Sender<Body>>>,
+    pending_rpcs: Mutex<HashMap<u32, oneshot::Sender<Body>>>,
 
     // ---- /metrics counters ----
     /// Bytes read from the agent socket (full wire frames, header
     /// + payload). Incremented after each successful read_frame.
-    pub bytes_in:   AtomicU64,
+    pub bytes_in: AtomicU64,
     /// Bytes written toward the agent socket. Incremented after
     /// `send_frame` queues the encoded bytes.
-    pub bytes_out:  AtomicU64,
+    pub bytes_out: AtomicU64,
     /// Total frames seen on the reader side.
-    pub frames_in:  AtomicU64,
+    pub frames_in: AtomicU64,
     /// Total frames queued on the writer side.
     pub frames_out: AtomicU64,
 }
@@ -121,20 +119,20 @@ pub struct AgentLink {
 /// Send half of a mux stream, held by the browser→agent task.
 pub struct StreamSink {
     pub id: u32,
-    link:    Arc<AgentLink>,
-    _guard:  Arc<StreamGuard>,
+    link: Arc<AgentLink>,
+    _guard: Arc<StreamGuard>,
 }
 
 /// Receive half of a mux stream, held by the agent→browser task.
 pub struct StreamSource {
-    rx:      mpsc::Receiver<Body>,
-    _guard:  Arc<StreamGuard>,
+    rx: mpsc::Receiver<Body>,
+    _guard: Arc<StreamGuard>,
 }
 
 /// Both halves of a stream share this guard. When the last `Arc` to it
 /// is dropped, we remove the stream from the registry and send `Close`.
 struct StreamGuard {
-    id:   u32,
+    id: u32,
     link: Arc<AgentLink>,
 }
 
@@ -142,14 +140,23 @@ impl AgentLink {
     pub async fn open_stream(self: &Arc<Self>) -> (StreamSink, StreamSource) {
         let id = loop {
             let c = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
-            if c != 0 { break c; }
+            if c != 0 {
+                break c;
+            }
         };
         let (tx, rx) = mpsc::channel(STREAM_CHAN_CAP);
         self.streams.lock().await.insert(id, tx);
-        let guard = Arc::new(StreamGuard { id, link: self.clone() });
+        let guard = Arc::new(StreamGuard {
+            id,
+            link: self.clone(),
+        });
         (
-            StreamSink   { id, link: self.clone(), _guard: guard.clone() },
-            StreamSource { rx,                     _guard: guard          },
+            StreamSink {
+                id,
+                link: self.clone(),
+                _guard: guard.clone(),
+            },
+            StreamSource { rx, _guard: guard },
         )
     }
 
@@ -184,8 +191,8 @@ impl AgentLink {
         let body = self.rpc(Frame::list_sessions).await?;
         match body {
             Body::SessionList { json, .. } => {
-                let env: SessionInfoEnvelope = serde_json::from_slice(&json)
-                    .context("decode SessionList JSON")?;
+                let env: SessionInfoEnvelope =
+                    serde_json::from_slice(&json).context("decode SessionList JSON")?;
                 Ok(env.sessions)
             }
             other => bail!("unexpected RPC response: {:?}", other.kind()),
@@ -221,7 +228,7 @@ impl AgentLink {
             bail!("agent link writer closed");
         }
         let body = match timeout(RPC_DEADLINE, rx).await {
-            Ok(Ok(b))  => b,
+            Ok(Ok(b)) => b,
             Ok(Err(_)) => {
                 self.pending_rpcs.lock().await.remove(&request_id);
                 bail!("agent dropped before responding");
@@ -243,27 +250,27 @@ trait BodyKind {
 impl BodyKind for Body {
     fn kind(&self) -> &'static str {
         match self {
-            Body::Data(_)              => "Data",
-            Body::Resize { .. }        => "Resize",
-            Body::Open { .. }          => "Open",
-            Body::Close                => "Close",
-            Body::Ping(_)              => "Ping",
-            Body::Pong(_)              => "Pong",
-            Body::Hello(_)             => "Hello",
-            Body::PasteBegin { .. }    => "PasteBegin",
-            Body::PasteChunk { .. }    => "PasteChunk",
-            Body::PasteEnd { .. }      => "PasteEnd",
-            Body::PasteReject { .. }   => "PasteReject",
+            Body::Data(_) => "Data",
+            Body::Resize { .. } => "Resize",
+            Body::Open { .. } => "Open",
+            Body::Close => "Close",
+            Body::Ping(_) => "Ping",
+            Body::Pong(_) => "Pong",
+            Body::Hello(_) => "Hello",
+            Body::PasteBegin { .. } => "PasteBegin",
+            Body::PasteChunk { .. } => "PasteChunk",
+            Body::PasteEnd { .. } => "PasteEnd",
+            Body::PasteReject { .. } => "PasteReject",
             Body::DownloadBegin { .. } => "DownloadBegin",
             Body::DownloadChunk { .. } => "DownloadChunk",
-            Body::DownloadEnd { .. }   => "DownloadEnd",
-            Body::AcquireControl       => "AcquireControl",
-            Body::ReleaseControl       => "ReleaseControl",
-            Body::TakeControl          => "TakeControl",
+            Body::DownloadEnd { .. } => "DownloadEnd",
+            Body::AcquireControl => "AcquireControl",
+            Body::ReleaseControl => "ReleaseControl",
+            Body::TakeControl => "TakeControl",
             Body::ControllerChanged { .. } => "ControllerChanged",
-            Body::ListSessions { .. }  => "ListSessions",
-            Body::SessionList { .. }   => "SessionList",
-            Body::KillSession { .. }   => "KillSession",
+            Body::ListSessions { .. } => "ListSessions",
+            Body::SessionList { .. } => "SessionList",
+            Body::KillSession { .. } => "KillSession",
             Body::KillSessionAck { .. } => "KillSessionAck",
         }
     }
@@ -271,18 +278,25 @@ impl BodyKind for Body {
 
 impl StreamSink {
     pub async fn send(&self, body: Body) -> Result<(), ()> {
-        self.link.send_frame(Frame { stream_id: self.id, body }).await
+        self.link
+            .send_frame(Frame {
+                stream_id: self.id,
+                body,
+            })
+            .await
     }
 }
 
 impl StreamSource {
-    pub async fn recv(&mut self) -> Option<Body> { self.rx.recv().await }
+    pub async fn recv(&mut self) -> Option<Body> {
+        self.rx.recv().await
+    }
 }
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         let link = self.link.clone();
-        let id   = self.id;
+        let id = self.id;
         tokio::spawn(async move {
             link.streams.lock().await.remove(&id);
             let _ = link.send_frame(Frame::close(id)).await;
@@ -292,9 +306,13 @@ impl Drop for StreamGuard {
 
 /// Constant-time byte comparison.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
+    if a.len() != b.len() {
+        return false;
+    }
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) { diff |= x ^ y; }
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
     diff == 0
 }
 
@@ -330,7 +348,11 @@ where
         _ => bail!("first frame must be Hello on stream 0"),
     };
     if hello.version != HELLO_VERSION {
-        bail!("hello version mismatch: agent={} hub={}", hello.version, HELLO_VERSION);
+        bail!(
+            "hello version mismatch: agent={} hub={}",
+            hello.version,
+            HELLO_VERSION
+        );
     }
     if !is_valid_machine_id(&hello.machine_id) {
         bail!("invalid machine_id in hello");
@@ -344,7 +366,7 @@ where
         .ok_or_else(|| anyhow!("unknown machine_id: {}", hello.machine_id))?
         .clone();
 
-    let claimed  = decode_psk(&hello.psk_b64).context("decode claimed psk")?;
+    let claimed = decode_psk(&hello.psk_b64).context("decode claimed psk")?;
     let expected = decode_psk(&machine.psk).context("decode configured psk")?;
     if !ct_eq(&claimed, &expected) {
         bail!("psk mismatch for machine {}", hello.machine_id);
@@ -358,17 +380,17 @@ where
     // ---- link + writer ----------------------------------------------------
     let (write_tx, mut write_rx) = prio_channel(HUB_WRITER_HI_BYTES, HUB_WRITER_LO_BYTES);
     let link = Arc::new(AgentLink {
-        machine_id:      hello.machine_id.clone(),
-        writer:          write_tx.clone(),
-        next_stream_id:  AtomicU32::new(1),
-        streams:         Mutex::new(HashMap::new()),
-        notify_close:    tokio::sync::Notify::new(),
+        machine_id: hello.machine_id.clone(),
+        writer: write_tx.clone(),
+        next_stream_id: AtomicU32::new(1),
+        streams: Mutex::new(HashMap::new()),
+        notify_close: tokio::sync::Notify::new(),
         next_request_id: AtomicU32::new(1),
-        pending_rpcs:    Mutex::new(HashMap::new()),
-        bytes_in:        AtomicU64::new(0),
-        bytes_out:       AtomicU64::new(0),
-        frames_in:       AtomicU64::new(0),
-        frames_out:      AtomicU64::new(0),
+        pending_rpcs: Mutex::new(HashMap::new()),
+        bytes_in: AtomicU64::new(0),
+        bytes_out: AtomicU64::new(0),
+        frames_in: AtomicU64::new(0),
+        frames_out: AtomicU64::new(0),
     });
 
     // The hello frame counts toward bytes_in too.
@@ -440,15 +462,20 @@ where
                     }
                 }
             };
-            let f = match f_opt { Some(f) => f, None => return Ok(()) };
+            let f = match f_opt {
+                Some(f) => f,
+                None => return Ok(()),
+            };
             match (f.stream_id, f.body) {
-                (0, Body::Ping(p))  => { let _ = link_for_read.send_frame(Frame::pong(p)).await; }
-                (0, Body::Pong(_))  => { /* track RTT later */ }
+                (0, Body::Ping(p)) => {
+                    let _ = link_for_read.send_frame(Frame::pong(p)).await;
+                }
+                (0, Body::Pong(_)) => { /* track RTT later */ }
                 (0, Body::Hello(_)) => bail!("hello after registration"),
                 // Admin RPC responses: route back to the parked oneshot.
                 (0, body @ (Body::SessionList { .. } | Body::KillSessionAck { .. })) => {
                     let request_id = match &body {
-                        Body::SessionList    { request_id, .. } => *request_id,
+                        Body::SessionList { request_id, .. } => *request_id,
                         Body::KillSessionAck { request_id, .. } => *request_id,
                         _ => unreachable!(),
                     };
@@ -459,15 +486,17 @@ where
                         debug!(request_id, "RPC response with no waiter; dropping");
                     }
                 }
-                (0, _)              => bail!("unexpected control frame"),
-                (sid, body)         => {
+                (0, _) => bail!("unexpected control frame"),
+                (sid, body) => {
                     let tx = {
                         let map = link_for_read.streams.lock().await;
                         map.get(&sid).cloned()
                     };
                     match tx {
-                        Some(tx) => { let _ = tx.send(body).await; }
-                        None     => debug!(sid, "frame for unknown stream; agent should send Close"),
+                        Some(tx) => {
+                            let _ = tx.send(body).await;
+                        }
+                        None => debug!(sid, "frame for unknown stream; agent should send Close"),
                     }
                 }
             }
@@ -491,9 +520,9 @@ where
     // (held by some still-running WS handler) is keeping a writer clone
     // alive transitively.
     link.notify_close.notify_waiters();
-    drop(link);          // our local Arc
+    drop(link); // our local Arc
     drop(link_for_read); // reader's Arc
-    drop(write_tx);      // our local sender
+    drop(write_tx); // our local sender
     let _ = writer_task.await;
 
     if let Err(e) = read_result {
@@ -524,7 +553,10 @@ pub async fn run_acceptor(
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(s) => s,
-            Err(e) => { warn!(error = %e, "agent accept error"); continue; }
+            Err(e) => {
+                warn!(error = %e, "agent accept error");
+                continue;
+            }
         };
         let _ = sock.set_nodelay(true);
         let state = state.clone();
@@ -542,7 +574,9 @@ pub async fn run_acceptor(
                 }
             }
             .await;
-            if let Err(e) = result { warn!(error = %e, "agent connection failed"); }
+            if let Err(e) = result {
+                warn!(error = %e, "agent connection failed");
+            }
         });
     }
 }

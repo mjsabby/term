@@ -98,7 +98,10 @@ pub enum StoreError {
     #[error("io({path:?}): {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("parse({path:?}): {source}")]
-    Parse { path: PathBuf, source: serde_json::Error },
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     #[error("base64: {0}")]
     Base64(String),
     #[error("stored public key is {0} bytes, expected 65")]
@@ -110,8 +113,9 @@ impl CredentialStore {
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
         let path = credentials_path(data_dir);
         match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| StoreError::Parse { path, source: e }),
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).map_err(|e| StoreError::Parse { path, source: e })
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(StoreError::Io { path, source: e }),
         }
@@ -131,16 +135,25 @@ impl CredentialStore {
         {
             let mut opts = OpenOptions::new();
             opts.write(true).create(true).truncate(true);
-            #[cfg(unix)] opts.mode(0o600);
-            let mut tmp = opts.open(&tmp_path)
-                .map_err(|e| StoreError::Io { path: tmp_path.clone(), source: e })?;
-            tmp.write_all(&body)
-                .map_err(|e| StoreError::Io { path: tmp_path.clone(), source: e })?;
-            tmp.sync_all()
-                .map_err(|e| StoreError::Io { path: tmp_path.clone(), source: e })?;
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut tmp = opts.open(&tmp_path).map_err(|e| StoreError::Io {
+                path: tmp_path.clone(),
+                source: e,
+            })?;
+            tmp.write_all(&body).map_err(|e| StoreError::Io {
+                path: tmp_path.clone(),
+                source: e,
+            })?;
+            tmp.sync_all().map_err(|e| StoreError::Io {
+                path: tmp_path.clone(),
+                source: e,
+            })?;
         }
-        std::fs::rename(&tmp_path, &final_path)
-            .map_err(|e| StoreError::Io { path: final_path.clone(), source: e })?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| StoreError::Io {
+            path: final_path.clone(),
+            source: e,
+        })?;
 
         // fsync the directory so the rename is durable across crashes.
         if let Some(parent) = final_path.parent() {
@@ -154,13 +167,17 @@ impl CredentialStore {
     /// Find a credential by its raw id bytes.
     pub fn find_by_id(&self, id: &[u8]) -> Option<&StoredCredential> {
         let target = base64::engine::general_purpose::STANDARD_NO_PAD.encode(id);
-        self.credentials.iter().find(|c| c.credential_id_b64 == target)
+        self.credentials
+            .iter()
+            .find(|c| c.credential_id_b64 == target)
     }
 
     /// Find a credential by its raw id bytes (mutable).
     pub fn find_by_id_mut(&mut self, id: &[u8]) -> Option<&mut StoredCredential> {
         let target = base64::engine::general_purpose::STANDARD_NO_PAD.encode(id);
-        self.credentials.iter_mut().find(|c| c.credential_id_b64 == target)
+        self.credentials
+            .iter_mut()
+            .find(|c| c.credential_id_b64 == target)
     }
 }
 
@@ -176,9 +193,12 @@ pub fn ensure_lock_file(data_dir: &Path) -> Result<PathBuf, StoreError> {
     if !p.exists() {
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(false);
-        #[cfg(unix)] opts.mode(0o600);
-        opts.open(&p)
-            .map_err(|e| StoreError::Io { path: p.clone(), source: e })?;
+        #[cfg(unix)]
+        opts.mode(0o600);
+        opts.open(&p).map_err(|e| StoreError::Io {
+            path: p.clone(),
+            source: e,
+        })?;
     }
     Ok(p)
 }
@@ -191,8 +211,10 @@ pub fn load_or_create_secret(data_dir: &Path) -> Result<[u8; 32], StoreError> {
     match File::open(&path) {
         Ok(mut f) => {
             let mut buf = [0u8; 32];
-            f.read_exact(&mut buf)
-                .map_err(|e| StoreError::Io { path: path.clone(), source: e })?;
+            f.read_exact(&mut buf).map_err(|e| StoreError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
             Ok(buf)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -202,13 +224,20 @@ pub fn load_or_create_secret(data_dir: &Path) -> Result<[u8; 32], StoreError> {
             crate::random::fill(&mut buf);
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
-            #[cfg(unix)] opts.mode(0o600);
-            let mut f = opts.open(&path)
-                .map_err(|e| StoreError::Io { path: path.clone(), source: e })?;
-            f.write_all(&buf)
-                .map_err(|e| StoreError::Io { path: path.clone(), source: e })?;
-            f.sync_all()
-                .map_err(|e| StoreError::Io { path: path.clone(), source: e })?;
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut f = opts.open(&path).map_err(|e| StoreError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+            f.write_all(&buf).map_err(|e| StoreError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+            f.sync_all().map_err(|e| StoreError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
             Ok(buf)
         }
         Err(e) => Err(StoreError::Io { path, source: e }),

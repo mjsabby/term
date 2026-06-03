@@ -31,16 +31,18 @@ pub enum CborError {
 const MAX_STRING: u64 = 64 * 1024;
 const MAX_NESTING: u32 = 6;
 
-pub const MAJOR_UINT:  u8 = 0;
-pub const MAJOR_NINT:  u8 = 1;
+pub const MAJOR_UINT: u8 = 0;
+pub const MAJOR_NINT: u8 = 1;
 pub const MAJOR_BYTES: u8 = 2;
-pub const MAJOR_TEXT:  u8 = 3;
+pub const MAJOR_TEXT: u8 = 3;
 pub const MAJOR_ARRAY: u8 = 4;
-pub const MAJOR_MAP:   u8 = 5;
+pub const MAJOR_MAP: u8 = 5;
 
 fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], CborError> {
     if buf.len() < n {
-        return Err(CborError::Eof { need: n - buf.len() });
+        return Err(CborError::Eof {
+            need: n - buf.len(),
+        });
     }
     let (head, rest) = buf.split_at(n);
     *buf = rest;
@@ -49,7 +51,9 @@ fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], CborError> {
 
 /// Read one initial byte, returning `(major, additional_info)`.
 fn peek_header(buf: &[u8]) -> Result<(u8, u8), CborError> {
-    if buf.is_empty() { return Err(CborError::Eof { need: 1 }); }
+    if buf.is_empty() {
+        return Err(CborError::Eof { need: 1 });
+    }
     let b = buf[0];
     Ok((b >> 5, b & 0x1f))
 }
@@ -84,7 +88,10 @@ pub fn read_head(buf: &mut &[u8]) -> Result<(u8, u64), CborError> {
 pub fn read_uint(buf: &mut &[u8]) -> Result<u64, CborError> {
     let (m, v) = read_head(buf)?;
     if m != MAJOR_UINT {
-        return Err(CborError::WrongMajor { expected: MAJOR_UINT, got: m });
+        return Err(CborError::WrongMajor {
+            expected: MAJOR_UINT,
+            got: m,
+        });
     }
     Ok(v)
 }
@@ -94,12 +101,21 @@ pub fn read_uint(buf: &mut &[u8]) -> Result<u64, CborError> {
 pub fn read_int(buf: &mut &[u8]) -> Result<i64, CborError> {
     let (m, v) = read_head(buf)?;
     match m {
-        MAJOR_UINT => i64::try_from(v).map_err(|_| CborError::TooLarge { n: v, cap: i64::MAX as u64 }),
+        MAJOR_UINT => i64::try_from(v).map_err(|_| CborError::TooLarge {
+            n: v,
+            cap: i64::MAX as u64,
+        }),
         MAJOR_NINT => {
             let neg = -1i128 - v as i128;
-            i64::try_from(neg).map_err(|_| CborError::TooLarge { n: v, cap: i64::MAX as u64 })
+            i64::try_from(neg).map_err(|_| CborError::TooLarge {
+                n: v,
+                cap: i64::MAX as u64,
+            })
         }
-        _ => Err(CborError::WrongMajor { expected: MAJOR_UINT, got: m }),
+        _ => Err(CborError::WrongMajor {
+            expected: MAJOR_UINT,
+            got: m,
+        }),
     }
 }
 
@@ -107,10 +123,16 @@ pub fn read_int(buf: &mut &[u8]) -> Result<i64, CborError> {
 pub fn read_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], CborError> {
     let (m, len) = read_head(buf)?;
     if m != MAJOR_BYTES {
-        return Err(CborError::WrongMajor { expected: MAJOR_BYTES, got: m });
+        return Err(CborError::WrongMajor {
+            expected: MAJOR_BYTES,
+            got: m,
+        });
     }
     if len > MAX_STRING {
-        return Err(CborError::TooLarge { n: len, cap: MAX_STRING });
+        return Err(CborError::TooLarge {
+            n: len,
+            cap: MAX_STRING,
+        });
     }
     take(buf, len as usize)
 }
@@ -119,10 +141,16 @@ pub fn read_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], CborError> {
 pub fn read_text<'a>(buf: &mut &'a [u8]) -> Result<&'a str, CborError> {
     let (m, len) = read_head(buf)?;
     if m != MAJOR_TEXT {
-        return Err(CborError::WrongMajor { expected: MAJOR_TEXT, got: m });
+        return Err(CborError::WrongMajor {
+            expected: MAJOR_TEXT,
+            got: m,
+        });
     }
     if len > MAX_STRING {
-        return Err(CborError::TooLarge { n: len, cap: MAX_STRING });
+        return Err(CborError::TooLarge {
+            n: len,
+            cap: MAX_STRING,
+        });
     }
     let raw = take(buf, len as usize)?;
     std::str::from_utf8(raw).map_err(|_| CborError::Utf8)
@@ -132,7 +160,10 @@ pub fn read_text<'a>(buf: &mut &'a [u8]) -> Result<&'a str, CborError> {
 pub fn read_map_header(buf: &mut &[u8]) -> Result<u64, CborError> {
     let (m, n) = read_head(buf)?;
     if m != MAJOR_MAP {
-        return Err(CborError::WrongMajor { expected: MAJOR_MAP, got: m });
+        return Err(CborError::WrongMajor {
+            expected: MAJOR_MAP,
+            got: m,
+        });
     }
     Ok(n)
 }
@@ -144,17 +175,26 @@ pub fn skip_value(buf: &mut &[u8]) -> Result<(), CborError> {
 }
 
 fn skip_value_depth(buf: &mut &[u8], depth: u32) -> Result<(), CborError> {
-    if depth > MAX_NESTING { return Err(CborError::NestingTooDeep); }
+    if depth > MAX_NESTING {
+        return Err(CborError::NestingTooDeep);
+    }
     let (major, len) = read_head(buf)?;
     match major {
         MAJOR_UINT | MAJOR_NINT => Ok(()),
         MAJOR_BYTES | MAJOR_TEXT => {
-            if len > MAX_STRING { return Err(CborError::TooLarge { n: len, cap: MAX_STRING }); }
+            if len > MAX_STRING {
+                return Err(CborError::TooLarge {
+                    n: len,
+                    cap: MAX_STRING,
+                });
+            }
             take(buf, len as usize)?;
             Ok(())
         }
         MAJOR_ARRAY => {
-            for _ in 0..len { skip_value_depth(buf, depth + 1)?; }
+            for _ in 0..len {
+                skip_value_depth(buf, depth + 1)?;
+            }
             Ok(())
         }
         MAJOR_MAP => {
@@ -186,7 +226,7 @@ mod tests {
 
     #[test]
     fn read_uint_64bit() {
-        let mut b: &[u8] = &[0x1b, 0,0,0,0, 0,0,0x01,0x00];
+        let mut b: &[u8] = &[0x1b, 0, 0, 0, 0, 0, 0, 0x01, 0x00];
         assert_eq!(read_uint(&mut b).unwrap(), 256);
     }
 
@@ -236,12 +276,12 @@ mod tests {
     fn skip_value_handles_nested_map() {
         // {0: {1: [2, 3]}, 4: 5}  — skip the whole thing
         let cbor = &[
-            0xa2,                   // map(2)
-              0x00,                 // key 0
-              0xa1,                 // map(1)
-                0x01,               // key 1
-                0x82, 0x02, 0x03,   // array [2,3]
-              0x04, 0x05,           // 4 -> 5
+            0xa2, // map(2)
+            0x00, // key 0
+            0xa1, // map(1)
+            0x01, // key 1
+            0x82, 0x02, 0x03, // array [2,3]
+            0x04, 0x05, // 4 -> 5
         ];
         let mut b: &[u8] = cbor;
         skip_value(&mut b).unwrap();
@@ -267,21 +307,30 @@ mod tests {
     fn rejects_too_large_string() {
         // Major 2, info 27 → next 8 bytes = length. 1 MiB > 64 KiB cap.
         let mut b: &[u8] = &[
-            0x5b, 0,0,0,0, 0,0x10,0,0, // length 0x100000 = 1 MiB
+            0x5b, 0, 0, 0, 0, 0, 0x10, 0, 0, // length 0x100000 = 1 MiB
         ];
-        assert!(matches!(read_bytes(&mut b), Err(CborError::TooLarge { .. })));
+        assert!(matches!(
+            read_bytes(&mut b),
+            Err(CborError::TooLarge { .. })
+        ));
     }
 
     #[test]
     fn rejects_wrong_major() {
         let mut b: &[u8] = &[0x05]; // uint, not bytes
-        assert!(matches!(read_bytes(&mut b), Err(CborError::WrongMajor { .. })));
+        assert!(matches!(
+            read_bytes(&mut b),
+            Err(CborError::WrongMajor { .. })
+        ));
     }
 
     #[test]
     fn rejects_indefinite_length() {
         // 0x9f = array(*) — indefinite length, not supported.
         let mut b: &[u8] = &[0x9f, 0xff];
-        assert!(matches!(skip_value(&mut b), Err(CborError::UnsupportedInfo { .. })));
+        assert!(matches!(
+            skip_value(&mut b),
+            Err(CborError::UnsupportedInfo { .. })
+        ));
     }
 }

@@ -20,22 +20,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use rustls::pki_types::ServerName;
 use serde::Deserialize;
+use term_common::frame::{
+    Body, Frame, FrameType, HelloPayload, CONTROLLER_STATUS_NONE, CONTROLLER_STATUS_OTHER,
+    CONTROLLER_STATUS_SELF, HELLO_VERSION, MAX_DATA_LEN, MAX_PASTE_TOTAL_BYTES,
+    PASTE_REJECT_DUPLICATE_PASTE, PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_NOT_CONTROLLER,
+    PASTE_REJECT_OPEN_FAILED, PASTE_REJECT_REGISTRY_FULL, PASTE_REJECT_SIZE_MISMATCH,
+    PASTE_REJECT_WRITE_FAILED, PASTE_STATUS_CANCEL,
+};
+use term_common::prio::{item_prio_channel, prio_channel, ItemPrioRx, ItemPrioTx, PrioTx};
+use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
-use term_common::frame::{
-    Body, Frame, FrameType, HelloPayload, HELLO_VERSION,
-    CONTROLLER_STATUS_NONE, CONTROLLER_STATUS_OTHER, CONTROLLER_STATUS_SELF,
-    MAX_DATA_LEN, MAX_PASTE_TOTAL_BYTES, PASTE_REJECT_DUPLICATE_PASTE,
-    PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_NOT_CONTROLLER, PASTE_REJECT_OPEN_FAILED,
-    PASTE_REJECT_REGISTRY_FULL, PASTE_REJECT_SIZE_MISMATCH, PASTE_REJECT_WRITE_FAILED,
-    PASTE_STATUS_CANCEL,
-};
-use term_common::prio::{item_prio_channel, prio_channel, ItemPrioRx, ItemPrioTx, PrioTx};
-use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 
 #[derive(Debug, Deserialize)]
 struct AgentConfig {
@@ -89,9 +88,15 @@ struct AgentConfig {
     #[serde(default, rename = "tmux")]
     _legacy_tmux: Option<String>,
 }
-fn default_tls() -> String { "on".into() }
-fn default_tunnel_auth_header() -> String { "X-Tunnel-Authorization".into() }
-fn default_tunnel_auth_scheme() -> String { "tunnel".into() }
+fn default_tls() -> String {
+    "on".into()
+}
+fn default_tunnel_auth_header() -> String {
+    "X-Tunnel-Authorization".into()
+}
+fn default_tunnel_auth_scheme() -> String {
+    "tunnel".into()
+}
 
 /// Per-agent resource limits, all optional in `agent.toml`. Resolved
 /// into a `Limits` struct at startup with the defaults below.
@@ -126,21 +131,21 @@ struct ConfigLimits {
 /// applied so the rest of the agent sees a single concrete value.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    pub scrollback_cap_bytes:          usize,
-    pub idle_ttl:                      Duration,
+    pub scrollback_cap_bytes: usize,
+    pub idle_ttl: Duration,
     pub max_pending_pastes_per_stream: usize,
     pub max_pending_groups_per_stream: usize,
-    pub max_sessions:                  usize,
+    pub max_sessions: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            scrollback_cap_bytes:          session::DEFAULT_SCROLLBACK_CAP_BYTES,
-            idle_ttl:                      session::DEFAULT_IDLE_TTL,
+            scrollback_cap_bytes: session::DEFAULT_SCROLLBACK_CAP_BYTES,
+            idle_ttl: session::DEFAULT_IDLE_TTL,
             max_pending_pastes_per_stream: DEFAULT_MAX_PENDING_PASTES,
             max_pending_groups_per_stream: DEFAULT_MAX_PENDING_GROUPS,
-            max_sessions:                  DEFAULT_MAX_SESSIONS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 }
@@ -150,29 +155,34 @@ impl ConfigLimits {
         let d = Limits::default();
         Limits {
             scrollback_cap_bytes: self.scrollback_cap_bytes.unwrap_or(d.scrollback_cap_bytes),
-            idle_ttl: self.idle_ttl_secs.map(Duration::from_secs).unwrap_or(d.idle_ttl),
-            max_pending_pastes_per_stream: self.max_pending_pastes_per_stream
+            idle_ttl: self
+                .idle_ttl_secs
+                .map(Duration::from_secs)
+                .unwrap_or(d.idle_ttl),
+            max_pending_pastes_per_stream: self
+                .max_pending_pastes_per_stream
                 .unwrap_or(d.max_pending_pastes_per_stream),
-            max_pending_groups_per_stream: self.max_pending_groups_per_stream
+            max_pending_groups_per_stream: self
+                .max_pending_groups_per_stream
                 .unwrap_or(d.max_pending_groups_per_stream),
             max_sessions: self.max_sessions.unwrap_or(d.max_sessions),
         }
     }
 }
 
-const WRITE_HI_BYTES:    usize    = 4 * 1024 * 1024;
-const WRITE_LO_BYTES:    usize    = 16 * 1024 * 1024;
+const WRITE_HI_BYTES: usize = 4 * 1024 * 1024;
+const WRITE_LO_BYTES: usize = 16 * 1024 * 1024;
 /// Per-stream hi-priority queue (Data, Resize, Close). Keystrokes are
 /// tiny so 8 items ≈ a few KiB.
-const STREAM_HI_CAP:     usize    = 8;
+const STREAM_HI_CAP: usize = 8;
 /// Per-stream lo-priority queue (PasteBegin/Chunk/End). PasteChunk
 /// holds up to 1 MiB; 8 items ≈ 8 MiB worst case per active paste
 /// stream. Old item-based queue of 64 was 64 MiB worst case.
-const STREAM_LO_CAP:     usize    = 8;
-const PING_INTERVAL:     Duration = Duration::from_secs(30);
-const IDLE_DEADLINE:     Duration = Duration::from_secs(90);
+const STREAM_LO_CAP: usize = 8;
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+const IDLE_DEADLINE: Duration = Duration::from_secs(90);
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
-const RECONNECT_MAX:     Duration = Duration::from_secs(60);
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
 /// A connection that lasted at least this long is considered "healthy"
 /// — a clean close after this is treated as a normal disconnect (fast
 /// reset of backoff). Anything shorter is treated as a likely rejection
@@ -181,7 +191,7 @@ const RECONNECT_MAX:     Duration = Duration::from_secs(60);
 /// with no error frame, so we cannot distinguish the two by the
 /// returned `Result` alone). Without this guard, a misconfigured agent
 /// reconnects ~4x/second forever and spams both logs.
-const HEALTHY_SESSION:   Duration = Duration::from_secs(30);
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
 /// Default for `limits.max_pending_pastes_per_stream`.
 const DEFAULT_MAX_PENDING_PASTES: usize = 32;
@@ -213,7 +223,9 @@ async fn main() -> Result<()> {
         toml::from_str(&s).with_context(|| format!("parsing {}", cfg_path.display()))?
     };
 
-    let shell = cfg.shell.clone()
+    let shell = cfg
+        .shell
+        .clone()
         .or_else(|| std::env::var("SHELL").ok())
         .unwrap_or_else(default_shell);
 
@@ -232,7 +244,7 @@ async fn main() -> Result<()> {
     });
 
     let tls_on = match cfg.tls.as_str() {
-        "on"  | "true"  => true,
+        "on" | "true" => true,
         "off" | "false" => false,
         other => bail!("invalid tls = {other:?}; use \"on\" or \"off\""),
     };
@@ -254,8 +266,11 @@ async fn main() -> Result<()> {
     info!(
         "term-agent: hub={} machine_id={} tls={} server_name={} shell={} \
          scrollback_cap={} idle_ttl={:?} max_pastes={} max_groups={} max_sessions={}",
-        resolved.hub, resolved.machine_id, if resolved.tls_on { "on" } else { "off" },
-        resolved.server_name, resolved.shell,
+        resolved.hub,
+        resolved.machine_id,
+        if resolved.tls_on { "on" } else { "off" },
+        resolved.server_name,
+        resolved.shell,
         resolved.limits.scrollback_cap_bytes,
         resolved.limits.idle_ttl,
         resolved.limits.max_pending_pastes_per_stream,
@@ -275,7 +290,10 @@ async fn main() -> Result<()> {
         let lasted = started.elapsed();
         match result {
             Ok(()) if lasted >= HEALTHY_SESSION => {
-                info!("hub closed connection cleanly after {:?}; reconnecting", lasted);
+                info!(
+                    "hub closed connection cleanly after {:?}; reconnecting",
+                    lasted
+                );
                 backoff = RECONNECT_INITIAL;
                 sleep(Duration::from_millis(250)).await;
             }
@@ -358,10 +376,7 @@ fn default_shell() -> String {
     }
 }
 
-async fn run_once(
-    cfg: Arc<ResolvedConfig>,
-    tls: tokio_rustls::TlsConnector,
-) -> Result<()> {
+async fn run_once(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -> Result<()> {
     // WebSocket transport (through an HTTP/WS perimeter such as a Dev
     // Tunnel) when `hub` is a ws[s] URL; raw TCP/TLS to `host:port`
     // otherwise.
@@ -378,10 +393,7 @@ async fn run_once(
     if cfg.tls_on {
         let sn = ServerName::try_from(cfg.server_name.clone())
             .context("server_name must be a valid DNS name")?;
-        let tls_stream = tls
-            .connect(sn, tcp)
-            .await
-            .context("tls handshake")?;
+        let tls_stream = tls.connect(sn, tcp).await.context("tls handshake")?;
         let (r, w) = tokio::io::split(tls_stream);
         run_session(cfg, ByteStreamRecv(r), ByteStreamSend(w)).await
     } else {
@@ -411,7 +423,9 @@ where
     let (write_tx, mut write_rx) = prio_channel(WRITE_HI_BYTES, WRITE_LO_BYTES);
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = write_rx.recv().await {
-            if writer.send(bytes).await.is_err() { break; }
+            if writer.send(bytes).await.is_err() {
+                break;
+            }
         }
         writer.close().await;
     });
@@ -445,8 +459,7 @@ where
 
     // Per-stream registry. Each stream gets a priority channel so
     // interactive Data/Resize never sit behind 1 MiB PasteChunks.
-    let streams: Arc<Mutex<HashMap<u32, ItemPrioTx<Body>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let streams: Arc<Mutex<HashMap<u32, ItemPrioTx<Body>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Pinger.
     let ping_writer = write_tx.clone();
@@ -455,7 +468,12 @@ where
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
-            if send_frame_to_hub(&ping_writer, Frame::ping(vec![])).await.is_err() { return; }
+            if send_frame_to_hub(&ping_writer, Frame::ping(vec![]))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
     });
 
@@ -556,11 +574,11 @@ where
 
 /// One paste that is mid-transfer. Lives inside the per-stream task.
 struct PendingPaste {
-    file:       fs::File,
-    path:       PathBuf,
+    file: fs::File,
+    path: PathBuf,
     total_size: u64,
-    written:    u64,
-    group_id:   u32,
+    written: u64,
+    group_id: u32,
 }
 
 /// One paste group that is mid-transfer: the set of `group_size` files
@@ -568,8 +586,8 @@ struct PendingPaste {
 /// Finished paths are buffered here until all `group_size` pastes
 /// complete, then injected into the PTY in one bracketed-paste block.
 struct PendingGroup {
-    group_size:     u32,
-    finished:       Vec<PathBuf>,
+    group_size: u32,
+    finished: Vec<PathBuf>,
     /// Sum of `total_size` declared by every PasteBegin in this group.
     /// Bounded by `MAX_PASTE_TOTAL_BYTES`: a single paste action cannot
     /// claim more than 4 GiB of aggregate file bytes, even split across
@@ -603,7 +621,8 @@ async fn run_session_stream(
             let _ = send_frame_to_hub(
                 &writer,
                 Frame::data(sid, format!("\r\nterm-agent: {e}\r\n").into_bytes()),
-            ).await;
+            )
+            .await;
             return Ok(());
         }
     };
@@ -622,9 +641,9 @@ async fn run_session_stream(
     // Tell this browser who the current controller is, in *its own*
     // reference frame (it doesn't know its hub-allocated sid).
     let initial_status = match attach.current_controller {
-        None      => CONTROLLER_STATUS_NONE,
+        None => CONTROLLER_STATUS_NONE,
         Some(c) if c == sid => CONTROLLER_STATUS_SELF,
-        _         => CONTROLLER_STATUS_OTHER,
+        _ => CONTROLLER_STATUS_OTHER,
     };
     let _ = send_frame_to_hub(&writer, Frame::controller_changed(sid, initial_status)).await;
 
@@ -647,37 +666,62 @@ async fn run_session_stream(
                     Ok(Data(bytes)) => {
                         for chunk in bytes.chunks(MAX_DATA_LEN as usize) {
                             if send_frame_to_hub(&writer, Frame::data(sid, chunk.to_vec()))
-                                .await.is_err()
-                            { return; }
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                     Ok(ControllerChanged { controller }) => {
-                        let status = if controller == term_common::frame::CONTROLLER_NONE_STREAM_ID {
+                        let status = if controller == term_common::frame::CONTROLLER_NONE_STREAM_ID
+                        {
                             CONTROLLER_STATUS_NONE
                         } else if controller == sid {
                             CONTROLLER_STATUS_SELF
                         } else {
                             CONTROLLER_STATUS_OTHER
                         };
-                        if send_frame_to_hub(&writer,
-                            Frame::controller_changed(sid, status)).await.is_err()
-                        { return; }
+                        if send_frame_to_hub(&writer, Frame::controller_changed(sid, status))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
-                    Ok(DownloadBegin { id, total_size, name }) => {
-                        if send_frame_to_hub(&writer,
-                            Frame::download_begin(sid, id, total_size, name)).await.is_err()
-                        { return; }
+                    Ok(DownloadBegin {
+                        id,
+                        total_size,
+                        name,
+                    }) => {
+                        if send_frame_to_hub(
+                            &writer,
+                            Frame::download_begin(sid, id, total_size, name),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
                     }
                     Ok(DownloadChunk { id, bytes }) => {
-                        if send_frame_to_hub(&writer,
-                            Frame::download_chunk(sid, id, bytes.as_ref().clone()))
-                            .await.is_err()
-                        { return; }
+                        if send_frame_to_hub(
+                            &writer,
+                            Frame::download_chunk(sid, id, bytes.as_ref().clone()),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
                     }
                     Ok(DownloadEnd { id, status }) => {
-                        if send_frame_to_hub(&writer,
-                            Frame::download_end(sid, id, status)).await.is_err()
-                        { return; }
+                        if send_frame_to_hub(&writer, Frame::download_end(sid, id, status))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                     Ok(Closed) => {
                         let _ = send_frame_to_hub(&writer, Frame::close(sid)).await;
@@ -704,10 +748,22 @@ async fn run_session_stream(
                 match body {
                     Body::Data(b) => session.write_input_from(sid, &b).await,
                     Body::Resize { rows, cols } => session.resize_for(sid, rows, cols).await,
-                    Body::AcquireControl => { session.acquire_control(sid).await; }
-                    Body::ReleaseControl => { session.release_control(sid).await; }
-                    Body::TakeControl    => { session.take_control(sid).await; }
-                    Body::PasteBegin { paste_id, total_size, group_id, group_size, name } => {
+                    Body::AcquireControl => {
+                        session.acquire_control(sid).await;
+                    }
+                    Body::ReleaseControl => {
+                        session.release_control(sid).await;
+                    }
+                    Body::TakeControl => {
+                        session.take_control(sid).await;
+                    }
+                    Body::PasteBegin {
+                        paste_id,
+                        total_size,
+                        group_id,
+                        group_size,
+                        name,
+                    } => {
                         // Pasting saves a file and types its path into
                         // the shared PTY — an input action. Gate it on
                         // the control lease like keystrokes/resize;
@@ -715,13 +771,21 @@ async fn run_session_stream(
                         // injecting into the controller's shell.
                         if session.is_controller(sid).await {
                             handle_paste_begin(
-                                sid, paste_id, total_size, group_id, group_size, name,
-                                &pending_pastes, &pending_groups, &writer, limits,
-                            ).await;
+                                sid,
+                                paste_id,
+                                total_size,
+                                group_id,
+                                group_size,
+                                name,
+                                &pending_pastes,
+                                &pending_groups,
+                                &writer,
+                                limits,
+                            )
+                            .await;
                         } else {
-                            send_paste_reject(
-                                &writer, sid, paste_id, PASTE_REJECT_NOT_CONTROLLER,
-                            ).await;
+                            send_paste_reject(&writer, sid, paste_id, PASTE_REJECT_NOT_CONTROLLER)
+                                .await;
                         }
                     }
                     Body::PasteChunk { paste_id, bytes } => {
@@ -729,9 +793,15 @@ async fn run_session_stream(
                     }
                     Body::PasteEnd { paste_id, status } => {
                         handle_paste_end(
-                            sid, paste_id, status,
-                            &pending_pastes, &pending_groups, &session, &writer,
-                        ).await;
+                            sid,
+                            paste_id,
+                            status,
+                            &pending_pastes,
+                            &pending_groups,
+                            &session,
+                            &writer,
+                        )
+                        .await;
                     }
                     Body::Close => break,
                     _ => debug!("ignored body on session stream"),
@@ -777,7 +847,7 @@ async fn run_session_stream(
 async fn send_frame_to_hub(w: &PrioTx, f: Frame) -> Result<(), Vec<u8>> {
     let half = match f.ty() {
         FrameType::DownloadChunk => &w.lo,
-        _                        => &w.hi,
+        _ => &w.hi,
     };
     half.send(f.encode()).await
 }
@@ -791,22 +861,26 @@ async fn build_session_list_json(sessions: &Arc<session::SessionManager>) -> Vec
 
     #[derive(Serialize)]
     struct Info {
-        id:             String,
-        idle_secs:      u64,
-        attached:       usize,
+        id: String,
+        idle_secs: u64,
+        attached: usize,
         has_controller: bool,
     }
     #[derive(Serialize)]
-    struct Envelope { sessions: Vec<Info> }
+    struct Envelope {
+        sessions: Vec<Info>,
+    }
 
     let now = std::time::Instant::now();
     let live = sessions.list().await;
     let mut out = Vec::with_capacity(live.len());
     for s in live {
         out.push(Info {
-            id:             s.id.clone(),
-            idle_secs:      now.saturating_duration_since(s.last_attached_at().await).as_secs(),
-            attached:       s.attached_count().await,
+            id: s.id.clone(),
+            idle_secs: now
+                .saturating_duration_since(s.last_attached_at().await)
+                .as_secs(),
+            attached: s.attached_count().await,
             has_controller: s.controller().await.is_some(),
         });
     }
@@ -817,12 +891,7 @@ async fn build_session_list_json(sessions: &Arc<session::SessionManager>) -> Vec
 /// Send a PasteReject(paste_id, reason) frame back to the hub on this
 /// stream. Best-effort: silent failure on a closed writer is fine
 /// because the stream is dying anyway.
-async fn send_paste_reject(
-    writer: &PrioTx,
-    sid: u32,
-    paste_id: u32,
-    reason: u8,
-) {
+async fn send_paste_reject(writer: &PrioTx, sid: u32, paste_id: u32, reason: u8) {
     let _ = send_frame_to_hub(writer, Frame::paste_reject(sid, paste_id, reason)).await;
 }
 
@@ -841,7 +910,10 @@ async fn handle_paste_begin(
 ) {
     let mut pp = pending_pastes.lock().await;
     if pp.len() >= limits.max_pending_pastes_per_stream {
-        warn!(stream_id = sid, paste_id, "too many concurrent pastes; rejecting");
+        warn!(
+            stream_id = sid,
+            paste_id, "too many concurrent pastes; rejecting"
+        );
         drop(pp);
         send_paste_reject(writer, sid, paste_id, PASTE_REJECT_REGISTRY_FULL).await;
         return;
@@ -861,38 +933,52 @@ async fn handle_paste_begin(
         if let Some(g) = pg.get_mut(&group_id) {
             if g.total_declared.saturating_add(total_size) > MAX_PASTE_TOTAL_BYTES {
                 warn!(
-                    stream_id = sid, paste_id, group_id,
-                    declared = g.total_declared, adding = total_size,
+                    stream_id = sid,
+                    paste_id,
+                    group_id,
+                    declared = g.total_declared,
+                    adding = total_size,
                     "group aggregate would exceed 4 GiB; rejecting and cancelling group"
                 );
                 let to_drop = pg.remove(&group_id).unwrap().finished;
                 drop(pg);
                 drop(pp);
-                for path in to_drop { let _ = fs::remove_file(&path).await; }
+                for path in to_drop {
+                    let _ = fs::remove_file(&path).await;
+                }
                 send_paste_reject(writer, sid, paste_id, PASTE_REJECT_GROUP_OVERSIZE).await;
                 return;
             }
             g.total_declared = g.total_declared.saturating_add(total_size);
         } else {
             if pg.len() >= limits.max_pending_groups_per_stream {
-                warn!(stream_id = sid, group_id, "too many concurrent paste groups; rejecting begin");
+                warn!(
+                    stream_id = sid,
+                    group_id, "too many concurrent paste groups; rejecting begin"
+                );
                 drop(pg);
                 drop(pp);
                 send_paste_reject(writer, sid, paste_id, PASTE_REJECT_REGISTRY_FULL).await;
                 return;
             }
             if total_size > MAX_PASTE_TOTAL_BYTES {
-                warn!(stream_id = sid, paste_id, total_size, "single file exceeds 4 GiB; rejecting");
+                warn!(
+                    stream_id = sid,
+                    paste_id, total_size, "single file exceeds 4 GiB; rejecting"
+                );
                 drop(pg);
                 drop(pp);
                 send_paste_reject(writer, sid, paste_id, PASTE_REJECT_GROUP_OVERSIZE).await;
                 return;
             }
-            pg.insert(group_id, PendingGroup {
-                group_size,
-                finished: Vec::new(),
-                total_declared: total_size,
-            });
+            pg.insert(
+                group_id,
+                PendingGroup {
+                    group_size,
+                    finished: Vec::new(),
+                    total_declared: total_size,
+                },
+            );
         }
     }
     match open_paste_file(&name).await {
@@ -903,9 +989,16 @@ async fn handle_paste_begin(
                 path = %path.display(),
                 "paste begin"
             );
-            pp.insert(paste_id, PendingPaste {
-                file, path, total_size, written: 0, group_id,
-            });
+            pp.insert(
+                paste_id,
+                PendingPaste {
+                    file,
+                    path,
+                    total_size,
+                    written: 0,
+                    group_id,
+                },
+            );
         }
         Err(e) => {
             warn!(error = %e, "paste begin: open file failed");
@@ -935,7 +1028,10 @@ async fn handle_paste_chunk(
         return;
     };
     if p.written.saturating_add(bytes.len() as u64) > p.total_size {
-        warn!(stream_id = sid, paste_id, "chunk exceeds total_size; cancelling paste");
+        warn!(
+            stream_id = sid,
+            paste_id, "chunk exceeds total_size; cancelling paste"
+        );
         if let Some(p) = pp.remove(&paste_id) {
             drop(pp);
             let _ = fs::remove_file(&p.path).await;
@@ -991,8 +1087,10 @@ async fn handle_paste_end(
     // PASTE_STATUS_OK
     if p.written != p.total_size {
         warn!(
-            stream_id = sid, paste_id,
-            written = p.written, expected = p.total_size,
+            stream_id = sid,
+            paste_id,
+            written = p.written,
+            expected = p.total_size,
             "paste size mismatch; dropping"
         );
         let _ = fs::remove_file(&p.path).await;
@@ -1049,11 +1147,7 @@ async fn handle_paste_end(
 ///
 /// In both cases the resulting line is written to the shared PTY via
 /// the Session, so all attached viewers see the typed paths.
-async fn inject_paste_paths(
-    sid: u32,
-    paths: Vec<PathBuf>,
-    session: &Arc<session::Session>,
-) {
+async fn inject_paste_paths(sid: u32, paths: Vec<PathBuf>, session: &Arc<session::Session>) {
     // Belt to the PasteBegin suspenders: if control moved to a different
     // stream while this paste was uploading, don't type the paths into
     // someone else's PTY. Drop the now-orphaned tempfiles.
@@ -1075,14 +1169,18 @@ async fn inject_paste_paths(
         session::PasteStyle::Bracketed => {
             seq.extend_from_slice(b"\x1b[200~");
             for (i, p) in paths.iter().enumerate() {
-                if i > 0 { seq.push(b' '); }
+                if i > 0 {
+                    seq.push(b' ');
+                }
                 seq.extend_from_slice(p.as_os_str().as_encoded_bytes());
             }
             seq.extend_from_slice(b" \x1b[201~");
         }
         session::PasteStyle::Plain => {
             for (i, p) in paths.iter().enumerate() {
-                if i > 0 { seq.push(b' '); }
+                if i > 0 {
+                    seq.push(b' ');
+                }
                 let bytes = p.as_os_str().as_encoded_bytes();
                 // Quote if the path contains whitespace so cmd.exe
                 // treats it as a single arg. cmd.exe doesn't have a
@@ -1106,7 +1204,6 @@ async fn inject_paste_paths(
         warn!(stream_id = sid, error = %e, "pty write of pasted paths failed");
     }
 }
-
 
 /// Returns the path used for pasted screenshots (does NOT create it; use
 /// [`ensure_paste_dir`]).
@@ -1179,20 +1276,25 @@ async fn ensure_paste_dir() -> Result<&'static Path> {
                 bail!("paste parent {} is a symlink; refusing", parent.display());
             }
             Ok(md) if !md.file_type().is_dir() => {
-                bail!("paste parent {} exists and is not a directory", parent.display());
+                bail!(
+                    "paste parent {} exists and is not a directory",
+                    parent.display()
+                );
             }
             _ => {} // missing-or-dir: fine, create_dir_all will handle it
         }
     }
 
-    fs::create_dir_all(dir).await
+    fs::create_dir_all(dir)
+        .await
         .with_context(|| format!("create_dir_all {}", dir.display()))?;
     #[cfg(unix)]
     {
         // Re-apply perms unconditionally (umask may have left them
         // looser, or the dir may have been recreated by something else
         // with 0755).
-        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
             .with_context(|| format!("chmod 0700 {}", dir.display()))?;
     }
 
@@ -1225,7 +1327,9 @@ async fn sweep_old_paste_files(dir: &Path) {
             Ok(m) => m,
             Err(_) => continue,
         };
-        if !md.is_file() { continue; }
+        if !md.is_file() {
+            continue;
+        }
         let mtime = match md.modified() {
             Ok(t) => t,
             Err(_) => continue,
@@ -1250,11 +1354,14 @@ fn sanitize_paste_name(input: &str) -> String {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let cleaned: String = basename.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-            c
-        } else {
-            '_'
+    let cleaned: String = basename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
         })
         .collect();
     // Don't allow leading '.' (hidden file) or '-' (looks like a CLI
@@ -1328,7 +1435,9 @@ async fn open_paste_file(name: &str) -> Result<(fs::File, PathBuf)> {
     opts.write(true).create_new(true);
     #[cfg(unix)]
     opts.mode(0o600);
-    let f = opts.open(&path).await
+    let f = opts
+        .open(&path)
+        .await
         .with_context(|| format!("creating fallback paste file {}", path.display()))?;
     Ok((f, path))
 }

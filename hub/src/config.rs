@@ -95,9 +95,15 @@ pub struct HubConfig {
     pub machines: Vec<MachineConfig>,
 }
 
-fn default_rp_name() -> String { "term".into() }
-fn default_data_dir() -> PathBuf { PathBuf::from("/var/lib/term-hub") }
-fn default_agent_bind() -> String { "[::]:7700".into() }
+fn default_rp_name() -> String {
+    "term".into()
+}
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/term-hub")
+}
+fn default_agent_bind() -> String {
+    "[::]:7700".into()
+}
 
 /// `[no_auth]` block: a second browser-facing listener with no auth.
 /// Intended to sit behind an external perimeter (Dev Tunnel, SSO
@@ -116,14 +122,18 @@ pub struct NoAuthConfig {
 
 impl HubConfig {
     pub fn origin(&self) -> String {
-        if let Some(p) = &self.public_origin { return p.clone(); }
+        if let Some(p) = &self.public_origin {
+            return p.clone();
+        }
         format!("https://{}", self.domain)
     }
     pub fn effective_bind(&self) -> String {
-        if let Some(b) = &self.bind { return b.clone(); }
+        if let Some(b) = &self.bind {
+            return b.clone();
+        }
         match self.tls {
             TlsMode::Acme | TlsMode::Files => "[::]:443".into(),
-            TlsMode::Off                   => "[::]:8080".into(),
+            TlsMode::Off => "[::]:8080".into(),
         }
     }
 
@@ -135,22 +145,20 @@ impl HubConfig {
     pub fn effective_no_auth(&self) -> anyhow::Result<Option<&NoAuthConfig>> {
         let env = std::env::var("TERM_HUB_NO_AUTH").ok();
         let want = match env.as_deref().map(str::trim) {
-            Some("on")  | Some("1") | Some("true")  | Some("yes") => Some(true),
-            Some("off") | Some("0") | Some("false") | Some("no")  => Some(false),
-            Some("")    | None                                    => None,
+            Some("on") | Some("1") | Some("true") | Some("yes") => Some(true),
+            Some("off") | Some("0") | Some("false") | Some("no") => Some(false),
+            Some("") | None => None,
             Some(other) => {
-                anyhow::bail!(
-                    "TERM_HUB_NO_AUTH={other:?} not recognised (expected on/off/1/0)"
-                );
+                anyhow::bail!("TERM_HUB_NO_AUTH={other:?} not recognised (expected on/off/1/0)");
             }
         };
         match (want, self.no_auth.as_ref()) {
-            (Some(false), _)       => Ok(None),
-            (Some(true), Some(c))  => Ok(Some(c)),
-            (Some(true), None)     => anyhow::bail!(
-                "TERM_HUB_NO_AUTH=on but no [no_auth] section in hub.toml"
-            ),
-            (None, opt)            => Ok(opt),
+            (Some(false), _) => Ok(None),
+            (Some(true), Some(c)) => Ok(Some(c)),
+            (Some(true), None) => {
+                anyhow::bail!("TERM_HUB_NO_AUTH=on but no [no_auth] section in hub.toml")
+            }
+            (None, opt) => Ok(opt),
         }
     }
 }
@@ -175,8 +183,11 @@ pub struct MachineConfig {
 /// safely embed it in URLs and the URL fragment.
 pub fn is_valid_machine_id(s: &str) -> bool {
     let n = s.len();
-    if n == 0 || n > 32 { return false; }
-    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if n == 0 || n > 32 {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 #[cfg(test)]

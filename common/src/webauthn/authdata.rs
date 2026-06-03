@@ -51,13 +51,17 @@ const HEADER_LEN: usize = 37; // 32 + 1 + 4
 #[derive(Debug, Clone, Copy)]
 pub struct AuthDataPrefix {
     pub rp_id_hash: [u8; 32],
-    pub flags:      u8,
+    pub flags: u8,
     pub sign_count: u32,
 }
 
 impl AuthDataPrefix {
-    pub fn user_present(&self) -> bool { self.flags & FLAG_UP != 0 }
-    pub fn attested_cred_data(&self) -> bool { self.flags & FLAG_AT != 0 }
+    pub fn user_present(&self) -> bool {
+        self.flags & FLAG_UP != 0
+    }
+    pub fn attested_cred_data(&self) -> bool {
+        self.flags & FLAG_AT != 0
+    }
 }
 
 /// Full registration-time parse (AT must be set). `credential_public_key`
@@ -80,7 +84,11 @@ pub fn parse_prefix(data: &[u8]) -> Result<AuthDataPrefix, AuthDataError> {
     rp_id_hash.copy_from_slice(&data[..32]);
     let flags = data[32];
     let sign_count = u32::from_be_bytes([data[33], data[34], data[35], data[36]]);
-    Ok(AuthDataPrefix { rp_id_hash, flags, sign_count })
+    Ok(AuthDataPrefix {
+        rp_id_hash,
+        flags,
+        sign_count,
+    })
 }
 
 /// Parse a registration-time authenticatorData, returning the prefix +
@@ -120,7 +128,12 @@ pub fn parse_attested(data: &[u8]) -> Result<AttestedCredentialData, AuthDataErr
 
     // We don't parse the ED block — its presence is allowed by the
     // spec. Don't error on trailing bytes; just ignore them.
-    Ok(AttestedCredentialData { prefix, aaguid, credential_id, credential_public_key })
+    Ok(AttestedCredentialData {
+        prefix,
+        aaguid,
+        credential_id,
+        credential_public_key,
+    })
 }
 
 #[cfg(test)]
@@ -150,14 +163,23 @@ mod tests {
         v.extend_from_slice(&[0x01, 0x02]);
         v.extend_from_slice(&[0x03, 0x26]);
         v.extend_from_slice(&[0x20, 0x01]);
-        v.extend_from_slice(&[0x21, 0x58, 32]); v.extend_from_slice(x);
-        v.extend_from_slice(&[0x22, 0x58, 32]); v.extend_from_slice(y);
+        v.extend_from_slice(&[0x21, 0x58, 32]);
+        v.extend_from_slice(x);
+        v.extend_from_slice(&[0x22, 0x58, 32]);
+        v.extend_from_slice(y);
         v
     }
 
     #[test]
     fn parses_prefix() {
-        let data = build([9u8; 32], FLAG_UP | FLAG_AT, 42, &[1, 2, 3], &[7u8; 32], &[8u8; 32]);
+        let data = build(
+            [9u8; 32],
+            FLAG_UP | FLAG_AT,
+            42,
+            &[1, 2, 3],
+            &[7u8; 32],
+            &[8u8; 32],
+        );
         let p = parse_prefix(&data).unwrap();
         assert_eq!(p.rp_id_hash, [9u8; 32]);
         assert_eq!(p.flags, FLAG_UP | FLAG_AT);
@@ -186,20 +208,33 @@ mod tests {
         // Strip the attested cred data so length doesn't lie about it.
         let data = data[..HEADER_LEN].to_vec();
         let err = parse_attested(&data).unwrap_err();
-        assert!(matches!(err, AuthDataError::MissingAttestedCredData), "got {err:?}");
+        assert!(
+            matches!(err, AuthDataError::MissingAttestedCredData),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn rejects_too_short() {
         let data = [0u8; 36];
-        assert!(matches!(parse_prefix(&data), Err(AuthDataError::TooShort { .. })));
+        assert!(matches!(
+            parse_prefix(&data),
+            Err(AuthDataError::TooShort { .. })
+        ));
     }
 
     #[test]
     fn tolerates_trailing_ed_bytes() {
         // Build a normal authData then append a CBOR map(0) (0xa0) as
         // a fake ED extensions block.
-        let mut data = build([0u8; 32], FLAG_UP | FLAG_AT | FLAG_ED, 7, &[1], &[3u8; 32], &[4u8; 32]);
+        let mut data = build(
+            [0u8; 32],
+            FLAG_UP | FLAG_AT | FLAG_ED,
+            7,
+            &[1],
+            &[3u8; 32],
+            &[4u8; 32],
+        );
         data.push(0xa0);
         let parsed = parse_attested(&data).unwrap();
         assert_eq!(parsed.credential_id, &[1]);

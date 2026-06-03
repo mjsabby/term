@@ -19,8 +19,7 @@ pub fn fill(buf: &mut [u8]) {
     #[cfg(unix)]
     {
         use std::io::Read;
-        let mut f = std::fs::File::open("/dev/urandom")
-            .expect("open /dev/urandom");
+        let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
         f.read_exact(buf).expect("read /dev/urandom");
     }
     #[cfg(windows)]
@@ -30,9 +29,9 @@ pub fn fill(buf: &mut [u8]) {
         unsafe extern "system" {
             fn BCryptGenRandom(
                 hAlgorithm: *mut core::ffi::c_void,
-                pbBuffer:   *mut u8,
-                cbBuffer:   u32,
-                dwFlags:    u32,
+                pbBuffer: *mut u8,
+                cbBuffer: u32,
+                dwFlags: u32,
             ) -> i32;
         }
         const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x02;

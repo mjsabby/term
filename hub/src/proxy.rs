@@ -47,7 +47,9 @@ pub async fn term_ws(
     } else {
         let (token, sp) = match token_from_ws_protocol(&headers) {
             Some(p) => p,
-            None    => return (StatusCode::UNAUTHORIZED, "missing bearer subprotocol").into_response(),
+            None => {
+                return (StatusCode::UNAUTHORIZED, "missing bearer subprotocol").into_response()
+            }
         };
         if !validate_token(&state, &token).await {
             return (StatusCode::UNAUTHORIZED, "invalid bearer").into_response();
@@ -72,7 +74,11 @@ pub async fn term_ws(
     // hub/agent memory by opening an unbounded number of tabs.
     if link.stream_count().await >= crate::agent_link::MAX_STREAMS_PER_AGENT {
         warn!(machine = %machine_id, "ws upgrade rejected: per-agent stream cap reached");
-        return (StatusCode::SERVICE_UNAVAILABLE, "agent stream limit reached").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent stream limit reached",
+        )
+            .into_response();
     }
 
     let machine_id = machine_id.clone();
@@ -91,7 +97,7 @@ pub async fn term_ws(
         .max_frame_size(WS_MAX_BYTES);
     let upgrade = match chosen_subprotocol {
         Some(sp) => upgrade.protocols([sp]),
-        None     => upgrade,
+        None => upgrade,
     };
     upgrade.on_upgrade(move |ws| async move { run_proxy(ws, link, machine_id).await })
 }
@@ -112,39 +118,56 @@ async fn run_proxy(
     let ws_to_stream = async {
         loop {
             let msg = match ws_rx.next().await {
-                Some(Ok(m))  => m,
-                Some(Err(e)) => { debug!(error=%e, "ws rx error"); break; }
-                None         => break,
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    debug!(error=%e, "ws rx error");
+                    break;
+                }
+                None => break,
             };
             match msg {
                 Message::Binary(data) => {
                     if data.len() < HEADER_LEN {
-                        warn!("ws frame shorter than header"); break;
+                        warn!("ws frame shorter than header");
+                        break;
                     }
                     let in_stream = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                     if in_stream != 0 {
-                        warn!("browser frame had non-zero stream id {in_stream}"); break;
+                        warn!("browser frame had non-zero stream id {in_stream}");
+                        break;
                     }
                     let ty_byte = data[4];
                     let len = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
                     let (ty, len) = match Frame::validate_header(stream_id, ty_byte, len) {
-                        Ok(v)  => v,
-                        Err(e) => { warn!(error=%e, "ws frame rejected"); break; }
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(error=%e, "ws frame rejected");
+                            break;
+                        }
                     };
                     if data.len() != HEADER_LEN + len as usize {
-                        warn!("ws frame length mismatch"); break;
+                        warn!("ws frame length mismatch");
+                        break;
                     }
-                    let body = match Frame::from_payload(stream_id, ty, data[HEADER_LEN..].to_vec()) {
-                        Ok(f)  => f.body,
-                        Err(e) => { warn!(error=%e, "ws frame payload rejected"); break; }
+                    let body = match Frame::from_payload(stream_id, ty, data[HEADER_LEN..].to_vec())
+                    {
+                        Ok(f) => f.body,
+                        Err(e) => {
+                            warn!(error=%e, "ws frame payload rejected");
+                            break;
+                        }
                     };
                     if sink.send(body).await.is_err() {
-                        debug!("agent link closed"); break;
+                        debug!("agent link closed");
+                        break;
                     }
                 }
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => { /* axum auto-pongs */ }
-                Message::Text(_)  => { warn!("unexpected text ws message"); break; }
+                Message::Text(_) => {
+                    warn!("unexpected text ws message");
+                    break;
+                }
             }
         }
     };

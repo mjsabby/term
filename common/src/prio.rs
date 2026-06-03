@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 /// is released when the receiver pulls the item.
 #[derive(Clone)]
 pub struct BytesTx {
-    tx:  mpsc::UnboundedSender<(OwnedSemaphorePermit, Vec<u8>)>,
+    tx: mpsc::UnboundedSender<(OwnedSemaphorePermit, Vec<u8>)>,
     sem: Arc<Semaphore>,
     /// Cached so we can reject obvious oversized sends synchronously
     /// instead of awaiting forever.
@@ -44,7 +44,14 @@ pub fn bytes_channel(cap_bytes: usize) -> (BytesTx, BytesRx) {
     let permits = cap_bytes.min(u32::MAX as usize);
     let sem = Arc::new(Semaphore::new(permits));
     let (tx, rx) = mpsc::unbounded_channel();
-    (BytesTx { tx, sem, cap: permits }, BytesRx { rx })
+    (
+        BytesTx {
+            tx,
+            sem,
+            cap: permits,
+        },
+        BytesRx { rx },
+    )
 }
 
 impl BytesTx {
@@ -60,7 +67,7 @@ impl BytesTx {
         }
         let n = bytes.len() as u32;
         let permit = match self.sem.clone().acquire_many_owned(n).await {
-            Ok(p)  => p,
+            Ok(p) => p,
             Err(_) => return Err(bytes), // semaphore closed
         };
         match self.tx.send((permit, bytes)) {
@@ -107,7 +114,12 @@ pub fn prio_channel(cap_hi_bytes: usize, cap_lo_bytes: usize) -> (PrioTx, PrioRx
     let (ltx, lrx) = bytes_channel(cap_lo_bytes);
     (
         PrioTx { hi: htx, lo: ltx },
-        PrioRx { hi: hrx, lo: lrx, hi_closed: false, lo_closed: false },
+        PrioRx {
+            hi: hrx,
+            lo: lrx,
+            hi_closed: false,
+            lo_closed: false,
+        },
     )
 }
 
@@ -116,7 +128,9 @@ impl PrioRx {
     /// once both halves are closed AND fully drained.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         loop {
-            if self.hi_closed && self.lo_closed { return None; }
+            if self.hi_closed && self.lo_closed {
+                return None;
+            }
             // The `if !self.X_closed` guards skip a closed half so we
             // don't busy-loop on its always-None recv future.
             tokio::select! {
@@ -150,7 +164,10 @@ pub struct ItemPrioTx<T> {
 
 impl<T> Clone for ItemPrioTx<T> {
     fn clone(&self) -> Self {
-        ItemPrioTx { hi: self.hi.clone(), lo: self.lo.clone() }
+        ItemPrioTx {
+            hi: self.hi.clone(),
+            lo: self.lo.clone(),
+        }
     }
 }
 
@@ -167,7 +184,12 @@ pub fn item_prio_channel<T>(cap_hi: usize, cap_lo: usize) -> (ItemPrioTx<T>, Ite
     let (ltx, lrx) = mpsc::channel(cap_lo);
     (
         ItemPrioTx { hi: htx, lo: ltx },
-        ItemPrioRx { hi: hrx, lo: lrx, hi_closed: false, lo_closed: false },
+        ItemPrioRx {
+            hi: hrx,
+            lo: lrx,
+            hi_closed: false,
+            lo_closed: false,
+        },
     )
 }
 
@@ -176,7 +198,9 @@ impl<T> ItemPrioRx<T> {
     /// once both halves are closed AND fully drained.
     pub async fn recv(&mut self) -> Option<T> {
         loop {
-            if self.hi_closed && self.lo_closed { return None; }
+            if self.hi_closed && self.lo_closed {
+                return None;
+            }
             tokio::select! {
                 biased;
                 v = self.hi.recv(), if !self.hi_closed => match v {
@@ -215,9 +239,7 @@ mod tests {
         // Third send must block until the receiver drains some. Spawn
         // it so we can advance the receiver in this task.
         let tx2 = tx.clone();
-        let send_handle = tokio::spawn(async move {
-            tx2.send(vec![0u8; 4]).await
-        });
+        let send_handle = tokio::spawn(async move { tx2.send(vec![0u8; 4]).await });
         // Without a recv, the send should still be waiting.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(!send_handle.is_finished());
@@ -256,7 +278,9 @@ mod tests {
         tx.hi.send(b"c".to_vec()).await.unwrap();
         drop(tx);
         let mut seen: Vec<Vec<u8>> = Vec::new();
-        while let Some(v) = rx.recv().await { seen.push(v); }
+        while let Some(v) = rx.recv().await {
+            seen.push(v);
+        }
         assert_eq!(seen.len(), 3);
         // After close + drain, recv must return None.
         assert!(rx.recv().await.is_none());
@@ -293,7 +317,9 @@ mod tests {
         tx.hi.send(11).await.unwrap();
         drop(tx);
         let mut seen = Vec::new();
-        while let Some(v) = rx.recv().await { seen.push(v); }
+        while let Some(v) = rx.recv().await {
+            seen.push(v);
+        }
         // hi values first, then lo, in send order within each half.
         assert_eq!(seen, vec![10, 11, 1, 2]);
         assert!(rx.recv().await.is_none());

@@ -43,9 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use portable_pty::{
-    native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize,
-};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
@@ -90,7 +88,12 @@ impl AsyncPty {
         let cols = cols.max(1);
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .context("openpty")?;
 
         let mut cmd = CommandBuilder::new(program);
@@ -98,7 +101,9 @@ impl AsyncPty {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let child = pair.slave.spawn_command(cmd)
+        let child = pair
+            .slave
+            .spawn_command(cmd)
             .with_context(|| format!("spawn {program}"))?;
         // The slave half is owned by the spawned child; drop our copy
         // so EOF propagates to us when the shell exits.
@@ -128,7 +133,8 @@ impl AsyncPty {
                 pty_reader_thread(
                     reader,
                     out_tx,
-                    #[cfg(windows)] dsr_reply_tx,
+                    #[cfg(windows)]
+                    dsr_reply_tx,
                 )
             })
             .context("spawn pty reader thread")?;
@@ -161,8 +167,13 @@ impl AsyncPty {
         let master = self.master.clone();
         tokio::task::spawn_blocking(move || {
             let m = master.blocking_lock();
-            m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-                .map_err(|e| anyhow!("pty resize: {e}"))
+            m.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| anyhow!("pty resize: {e}"))
         })
         .await
         .map_err(|e| anyhow!("spawn_blocking join: {e}"))?
@@ -249,7 +260,10 @@ const MAX_CSI_LEN: usize = 64;
 #[cfg(windows)]
 impl DsrScanner {
     fn new() -> Self {
-        Self { state: DsrState::Normal, args: Vec::new() }
+        Self {
+            state: DsrState::Normal,
+            args: Vec::new(),
+        }
     }
 
     /// Feed a chunk of PTY output. Returns
@@ -332,8 +346,8 @@ fn pty_reader_thread(
     let mut dsr = DsrScanner::new();
     loop {
         let n = match reader.read(&mut buf) {
-            Ok(0)  => break, // EOF: shell exited / handle closed
-            Ok(n)  => n,
+            Ok(0) => break, // EOF: shell exited / handle closed
+            Ok(n) => n,
             Err(e) => {
                 debug!(error = %e, "pty reader: read error; exiting");
                 break;
@@ -370,10 +384,7 @@ fn pty_reader_thread(
     }
 }
 
-fn pty_writer_thread(
-    mut writer: Box<dyn Write + Send>,
-    mut in_rx: mpsc::Receiver<Vec<u8>>,
-) {
+fn pty_writer_thread(mut writer: Box<dyn Write + Send>, mut in_rx: mpsc::Receiver<Vec<u8>>) {
     while let Some(bytes) = in_rx.blocking_recv() {
         if let Err(e) = writer.write_all(&bytes) {
             debug!(error = %e, "pty writer: write error; exiting");
@@ -402,7 +413,8 @@ fn pty_writer_thread(
 /// portable.
 pub fn split_shell(raw: &str) -> (String, Vec<String>) {
     let mut parts = raw.split_whitespace();
-    let program = parts.next()
+    let program = parts
+        .next()
         .map(|s| s.to_owned())
         .unwrap_or_else(default_shell_for_split);
     let args = parts.map(|s| s.to_owned()).collect();
@@ -410,7 +422,9 @@ pub fn split_shell(raw: &str) -> (String, Vec<String>) {
 }
 
 #[cfg(unix)]
-fn default_shell_for_split() -> String { "/bin/sh".into() }
+fn default_shell_for_split() -> String {
+    "/bin/sh".into()
+}
 #[cfg(windows)]
 fn default_shell_for_split() -> String {
     std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into())
@@ -493,10 +507,7 @@ mod tests {
     fn dsr_intercepts_multiple_queries() {
         let (fwd, replies) = run_dsr(b"a\x1b[6nb\x1b[6nc");
         assert_eq!(fwd, b"abc");
-        assert_eq!(replies, vec![
-            b"\x1b[1;1R".to_vec(),
-            b"\x1b[1;1R".to_vec(),
-        ]);
+        assert_eq!(replies, vec![b"\x1b[1;1R".to_vec(), b"\x1b[1;1R".to_vec(),]);
     }
 
     #[cfg(windows)]
@@ -518,7 +529,10 @@ mod tests {
         );
         assert_eq!(
             split_shell("powershell -NoLogo -NoProfile"),
-            ("powershell".into(), vec!["-NoLogo".into(), "-NoProfile".into()])
+            (
+                "powershell".into(),
+                vec!["-NoLogo".into(), "-NoProfile".into()]
+            )
         );
         assert_eq!(split_shell("   leading"), ("leading".into(), vec![]));
         // Empty input falls back to a platform default. We check the
@@ -541,8 +555,10 @@ mod tests {
             "/bin/sh",
             &["-c".into(), "printf 'hi'; exit 0".into()],
             &[("TERM", "xterm-256color")],
-            24, 80,
-        ).expect("spawn");
+            24,
+            80,
+        )
+        .expect("spawn");
 
         // Read until EOF. Allow up to 2s for the shell to print and
         // exit; PTY echoing means we may see the command before "hi".
@@ -550,16 +566,21 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() { break; }
+            if remaining.is_zero() {
+                break;
+            }
             let mut rx = pty.out_rx.lock().await;
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(b)) => got.extend(b),
-                Ok(None)    => break, // EOF
-                Err(_)      => break, // timeout
+                Ok(None) => break, // EOF
+                Err(_) => break,   // timeout
             }
         }
-        assert!(got.windows(2).any(|w| w == b"hi"),
-                "expected 'hi' in PTY output, got: {:?}", String::from_utf8_lossy(&got));
+        assert!(
+            got.windows(2).any(|w| w == b"hi"),
+            "expected 'hi' in PTY output, got: {:?}",
+            String::from_utf8_lossy(&got)
+        );
         assert!(pty.exited().await);
     }
 
@@ -576,8 +597,8 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn spawn_cmd_round_trip_windows() {
-        let comspec = std::env::var("ComSpec")
-            .unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        let comspec =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
         if !std::path::Path::new(&comspec).exists() {
             return;
         }
@@ -588,13 +609,16 @@ mod tests {
             &comspec,
             &["/Q".into(), "/K".into(), "prompt $G".into()],
             &[],
-            24, 80,
-        ).expect("spawn cmd.exe");
+            24,
+            80,
+        )
+        .expect("spawn cmd.exe");
 
         // Write `echo TERMHITEST\r\n` then read until we either see
         // the needle in the rasterized output or hit the deadline.
         const NEEDLE: &[u8] = b"TERMHITEST";
-        pty.in_tx.send(b"echo TERMHITEST\r\n".to_vec())
+        pty.in_tx
+            .send(b"echo TERMHITEST\r\n".to_vec())
             .await
             .expect("send echo command");
 
@@ -603,7 +627,9 @@ mod tests {
         let mut found = false;
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() { break; }
+            if remaining.is_zero() {
+                break;
+            }
             let mut rx = pty.out_rx.lock().await;
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(b)) => {
@@ -614,15 +640,18 @@ mod tests {
                     }
                 }
                 Ok(None) => break,
-                Err(_)   => break,
+                Err(_) => break,
             }
         }
         // Kill the child + drain so test teardown is clean.
         pty.kill().await;
 
-        assert!(found,
+        assert!(
+            found,
             "expected `TERMHITEST` in ConPTY output within 5s, \
              got {} bytes: {:?}",
-            got.len(), String::from_utf8_lossy(&got));
+            got.len(),
+            String::from_utf8_lossy(&got)
+        );
     }
 }

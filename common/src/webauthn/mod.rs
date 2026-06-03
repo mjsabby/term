@@ -56,7 +56,7 @@ pub struct PublicKeyCredentialCreationOptions {
 
 #[derive(Debug, Serialize)]
 pub struct RelyingParty {
-    pub id:   String,
+    pub id: String,
     pub name: String,
 }
 
@@ -65,8 +65,8 @@ pub struct UserInfo {
     /// Base64url-no-pad of a fresh 16-byte UUID — we re-issue per
     /// registration and never refer to it again. WebAuthn requires
     /// it; we don't.
-    pub id:           String,
-    pub name:         String,
+    pub id: String,
+    pub name: String,
     #[serde(rename = "displayName")]
     pub display_name: String,
 }
@@ -74,7 +74,7 @@ pub struct UserInfo {
 #[derive(Debug, Serialize)]
 pub struct PubKeyCredParam {
     #[serde(rename = "type")]
-    pub ty:  &'static str,
+    pub ty: &'static str,
     pub alg: i32,
 }
 
@@ -96,15 +96,23 @@ impl PublicKeyCredentialCreationOptions {
     ) -> Self {
         let user_id_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(user_id_16);
         PublicKeyCredentialCreationOptions {
-            rp:   RelyingParty { id: rp_id.into(), name: rp_name.into() },
+            rp: RelyingParty {
+                id: rp_id.into(),
+                name: rp_name.into(),
+            },
             user: UserInfo {
                 id: user_id_b64,
                 name: user_name.into(),
                 display_name: display_name.into(),
             },
             challenge: challenge.to_b64url(),
-            pub_key_cred_params: vec![PubKeyCredParam { ty: "public-key", alg: cose::ES256_ALG as i32 }],
-            authenticator_selection: AuthenticatorSelection { user_verification: "discouraged" },
+            pub_key_cred_params: vec![PubKeyCredParam {
+                ty: "public-key",
+                alg: cose::ES256_ALG as i32,
+            }],
+            authenticator_selection: AuthenticatorSelection {
+                user_verification: "discouraged",
+            },
             attestation: "none",
             timeout: 60_000,
         }
@@ -140,9 +148,9 @@ pub struct RegistrationInner {
 #[derive(Debug, Serialize)]
 pub struct PublicKeyCredentialRequestOptions {
     pub challenge: String,
-    pub timeout:   u32,
+    pub timeout: u32,
     #[serde(rename = "rpId")]
-    pub rp_id:     String,
+    pub rp_id: String,
     #[serde(rename = "allowCredentials")]
     pub allow_credentials: Vec<AllowedCredential>,
     #[serde(rename = "userVerification")]
@@ -329,8 +337,7 @@ where
 
     let verifying_key = VerifyingKey::from_sec1_bytes(&stored.credential_public_key)
         .map_err(|_| WebauthnError::InvalidStoredPubkey)?;
-    let sig = Signature::from_der(&signature)
-        .map_err(|_| WebauthnError::SignatureInvalid)?;
+    let sig = Signature::from_der(&signature).map_err(|_| WebauthnError::SignatureInvalid)?;
     verifying_key
         .verify(&msg, &sig)
         .map_err(|_| WebauthnError::SignatureInvalid)?;
@@ -341,7 +348,8 @@ where
     let advanced = prefix.sign_count > stored.sign_count;
     if !advanced && prefix.sign_count != 0 {
         return Err(WebauthnError::SignCountRegression {
-            got: prefix.sign_count, stored: stored.sign_count,
+            got: prefix.sign_count,
+            stored: stored.sign_count,
         });
     }
     Ok(AuthenticatedCredential {
@@ -375,7 +383,9 @@ fn check_rp_id_hash(got: &[u8; 32], rp_id: &str) -> Result<(), WebauthnError> {
     for (a, b) in got.iter().zip(expected.iter()) {
         diff |= a ^ b;
     }
-    if diff != 0 { return Err(WebauthnError::RpIdHashMismatch); }
+    if diff != 0 {
+        return Err(WebauthnError::RpIdHashMismatch);
+    }
     Ok(())
 }
 
@@ -394,9 +404,7 @@ fn extract_auth_data(att_obj: &[u8]) -> Result<Vec<u8>, WebauthnError> {
             cbor::skip_value(&mut buf)?;
         }
     }
-    auth_data.ok_or_else(|| {
-        WebauthnError::AttestationObject("missing authData field".into())
-    })
+    auth_data.ok_or_else(|| WebauthnError::AttestationObject("missing authData field".into()))
 }
 
 #[cfg(test)]
@@ -418,9 +426,15 @@ mod tests {
         v.extend_from_slice(b"\x68authData");
         // bytes header
         let n = auth_data.len();
-        if n <= 23 { v.push(0x40 + n as u8); }
-        else if n <= 255 { v.push(0x58); v.push(n as u8); }
-        else { v.push(0x59); v.extend_from_slice(&(n as u16).to_be_bytes()); }
+        if n <= 23 {
+            v.push(0x40 + n as u8);
+        } else if n <= 255 {
+            v.push(0x58);
+            v.push(n as u8);
+        } else {
+            v.push(0x59);
+            v.extend_from_slice(&(n as u16).to_be_bytes());
+        }
         v.extend_from_slice(auth_data);
         v
     }
@@ -450,8 +464,10 @@ mod tests {
         v.extend_from_slice(&[0x01, 0x02]);
         v.extend_from_slice(&[0x03, 0x26]);
         v.extend_from_slice(&[0x20, 0x01]);
-        v.extend_from_slice(&[0x21, 0x58, 32]); v.extend_from_slice(x);
-        v.extend_from_slice(&[0x22, 0x58, 32]); v.extend_from_slice(y);
+        v.extend_from_slice(&[0x21, 0x58, 32]);
+        v.extend_from_slice(x);
+        v.extend_from_slice(&[0x22, 0x58, 32]);
+        v.extend_from_slice(y);
         v
     }
 
@@ -464,8 +480,10 @@ mod tests {
         let point = vk.to_encoded_point(false); // uncompressed
         let bytes = point.as_bytes();
         assert_eq!(bytes[0], 0x04);
-        let mut x = [0u8; 32]; x.copy_from_slice(&bytes[1..33]);
-        let mut y = [0u8; 32]; y.copy_from_slice(&bytes[33..65]);
+        let mut x = [0u8; 32];
+        x.copy_from_slice(&bytes[1..33]);
+        let mut y = [0u8; 32];
+        y.copy_from_slice(&bytes[33..65]);
         (x, y)
     }
 
@@ -501,7 +519,7 @@ mod tests {
             raw_id: b64u_encode(cred_id),
             ty: "public-key".into(),
             response: RegistrationInner {
-                client_data_json:  b64u_encode(client_data_json.as_bytes()),
+                client_data_json: b64u_encode(client_data_json.as_bytes()),
                 attestation_object: b64u_encode(&att_obj),
             },
         };
@@ -545,7 +563,7 @@ mod tests {
             raw_id: b64u_encode(cred_id),
             ty: "public-key".into(),
             response: AuthenticationInner {
-                client_data_json:  b64u_encode(cd_bytes),
+                client_data_json: b64u_encode(cd_bytes),
                 authenticator_data: b64u_encode(&auth_data),
                 signature: b64u_encode(der.as_bytes()),
                 user_handle: None,
@@ -558,7 +576,8 @@ mod tests {
                 credential_public_key: sec1,
                 sign_count: 6,
             })
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(ok.credential_id, cred_id);
         assert_eq!(ok.new_sign_count, 7);
         assert!(ok.sign_count_advanced);
@@ -592,16 +611,23 @@ mod tests {
             raw_id: b64u_encode(b"id"),
             ty: "public-key".into(),
             response: AuthenticationInner {
-                client_data_json:  b64u_encode(client_data_json.as_bytes()),
+                client_data_json: b64u_encode(client_data_json.as_bytes()),
                 authenticator_data: b64u_encode(&auth_data),
                 signature: b64u_encode(sig.to_der().as_bytes()),
                 user_handle: None,
             },
         };
         let err = finish_authenticate(&resp, &challenge, rp_id, origin, |_| {
-            Some(StoredCredentialView { credential_public_key: sec1, sign_count: 0 })
-        }).unwrap_err();
-        assert!(matches!(err, WebauthnError::SignatureInvalid), "got {err:?}");
+            Some(StoredCredentialView {
+                credential_public_key: sec1,
+                sign_count: 0,
+            })
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, WebauthnError::SignatureInvalid),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -621,28 +647,35 @@ mod tests {
             raw_id: b64u_encode(b"id"),
             ty: "public-key".into(),
             response: AuthenticationInner {
-                client_data_json:  b64u_encode(cd.as_bytes()),
+                client_data_json: b64u_encode(cd.as_bytes()),
                 authenticator_data: b64u_encode(&auth_data),
                 signature: b64u_encode(b""),
                 user_handle: None,
             },
         };
-        let err = finish_authenticate(&resp, &challenge, rp_id, origin, |_| None)
-            .unwrap_err();
-        assert!(matches!(err, WebauthnError::UnknownCredential), "got {err:?}");
+        let err = finish_authenticate(&resp, &challenge, rp_id, origin, |_| None).unwrap_err();
+        assert!(
+            matches!(err, WebauthnError::UnknownCredential),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn check_rp_id_hash_matches() {
         let h = Sha256::digest(b"term.xyz.com");
-        let mut a = [0u8; 32]; a.copy_from_slice(&h);
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&h);
         check_rp_id_hash(&a, "term.xyz.com").unwrap();
     }
 
     #[test]
     fn check_rp_id_hash_rejects_mismatch() {
         let h = Sha256::digest(b"other");
-        let mut a = [0u8; 32]; a.copy_from_slice(&h);
-        assert!(matches!(check_rp_id_hash(&a, "term.xyz.com"), Err(WebauthnError::RpIdHashMismatch)));
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&h);
+        assert!(matches!(
+            check_rp_id_hash(&a, "term.xyz.com"),
+            Err(WebauthnError::RpIdHashMismatch)
+        ));
     }
 }
