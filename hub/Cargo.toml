@@ -38,3 +38,6 @@ term-common        = { path = "../common" }
 
 [dev-dependencies]
 tower              = { version = "0.5", features = ["util"] }
+## WebSocket client for the /agent/connect end-to-end test. `handshake`
+## only — the test speaks plain ws:// over a loopback TcpStream.
+tokio-tungstenite  = { version = "0.29", default-features = false, features = ["handshake"] }

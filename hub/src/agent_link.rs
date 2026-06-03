@@ -29,17 +29,16 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use term_common::frame::{
-    Body, Frame, FrameError, FrameType, HelloPayload, HEADER_LEN, HELLO_VERSION,
-    KILL_STATUS_OK,
+    Body, Frame, FrameType, HelloPayload, HELLO_VERSION, KILL_STATUS_OK,
 };
 use term_common::prio::{prio_channel, PrioTx};
+use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 
 use crate::config::{is_valid_machine_id, HubConfig};
 use crate::state::AppState;
@@ -309,18 +308,18 @@ fn decode_psk(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 
 /// Run the hello/auth/pump loop for one agent connection. Returns when
 /// the agent disconnects or any protocol error occurs.
-pub async fn handle_connection<R, W>(
+pub async fn handle_connection<FR, FW>(
     state: AppState,
-    mut reader: R,
-    mut writer: W,
+    mut reader: FR,
+    mut writer: FW,
     peer: String,
 ) -> anyhow::Result<()>
 where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    FR: FrameRecv + Send,
+    FW: FrameSend + Send + 'static,
 {
     // ---- hello + auth -----------------------------------------------------
-    let (hello_frame, hello_bytes_in) = timeout(HELLO_DEADLINE, read_frame(&mut reader))
+    let (hello_frame, hello_bytes_in) = timeout(HELLO_DEADLINE, reader.recv())
         .await
         .map_err(|_| anyhow!("hello timeout from {peer}"))?
         .context("read hello")?
@@ -408,13 +407,13 @@ where
                 _ = &mut evict => break,
                 msg = write_rx.recv() => match msg {
                     Some(bytes) => {
-                        if writer.write_all(&bytes).await.is_err() { break; }
+                        if writer.send(bytes).await.is_err() { break; }
                     }
                     None => break,
                 }
             }
         }
-        let _ = writer.shutdown().await;
+        writer.close().await;
     });
 
     // Reader loop.
@@ -428,7 +427,7 @@ where
                 _ = &mut evict => {
                     bail!("evicted by newer connection for same machine_id");
                 }
-                r = timeout(IDLE_DEADLINE, read_frame(&mut reader)) => {
+                r = timeout(IDLE_DEADLINE, reader.recv()) => {
                     match r {
                         Ok(Ok(Some((f, bytes)))) => {
                             link_for_read.bytes_in.fetch_add(bytes, Ordering::Relaxed);
@@ -505,26 +504,6 @@ where
     Ok(())
 }
 
-/// Read one wire frame, returning the parsed frame plus the total
-/// number of bytes consumed (header + payload). Counted into
-/// `bytes_in` on the AgentLink by the caller.
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<(Frame, u64)>, FrameError> {
-    let mut hdr = [0u8; HEADER_LEN];
-    match r.read_exact(&mut hdr).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(FrameError::Io(e)),
-    }
-    let stream_id = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-    let ty_byte   = hdr[4];
-    let len       = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]);
-    let (ty, len) = Frame::validate_header(stream_id, ty_byte, len)?;
-    let mut payload = vec![0u8; len as usize];
-    if len > 0 { r.read_exact(&mut payload).await?; }
-    let total = HEADER_LEN as u64 + len as u64;
-    Frame::from_payload(stream_id, ty, payload).map(|f| Some((f, total)))
-}
-
 /// Acceptor task for the agent listener. Loops accepting TCP; if a
 /// `TlsAcceptor` is provided, wraps each accepted socket and spawns
 /// `handle_connection` over the TLS stream, else over the raw TCP.
@@ -556,10 +535,10 @@ pub async fn run_acceptor(
                 if let Some(acceptor) = tls {
                     let tls = acceptor.accept(sock).await.context("tls accept")?;
                     let (r, w) = tokio::io::split(tls);
-                    handle_connection(state, r, w, peer).await
+                    handle_connection(state, ByteStreamRecv(r), ByteStreamSend(w), peer).await
                 } else {
                     let (r, w) = sock.into_split();
-                    handle_connection(state, r, w, peer).await
+                    handle_connection(state, ByteStreamRecv(r), ByteStreamSend(w), peer).await
                 }
             }
             .await;

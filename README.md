@@ -42,6 +42,12 @@ One persistent connection per agent carries any number of session
 streams. The same framing is used between browser and hub over WS,
 with `stream_id` pinned to 0 (the WS itself demultiplexes).
 
+The agent↔hub link runs over either a length-delimited TCP/TLS byte
+stream (raw `agent_bind`) or, when the agent dials a `wss://…` hub, one
+frame per binary WebSocket message — same frames, full mux (`stream_id`
+not pinned), so the rest of the protocol is identical on both
+transports.
+
 ```
 [stream_id:u32 BE][type:u8][len:u32 BE][payload:len]    (9-byte header)
 
@@ -442,6 +448,44 @@ Runtime overrides:
 The authed listener (443 or whatever `bind` is) and the no-auth
 listener can run side-by-side on the same hub process — you don't
 have to choose.
+
+#### Agents anywhere: dialing the hub over WebSocket
+
+The raw `agent_bind` (7700) is a plain TCP/mux socket, so it only works
+when the agent shares a network with the hub — a Dev Tunnel forwards
+HTTP/WebSocket, not arbitrary TCP. To put an agent on a machine that
+can only reach the hub *through* the tunnel, point its `hub` at the
+tunnel's `wss://…/agent/connect` URL instead of a `host:port`. The hub
+serves the same agent mux over a WebSocket route (`GET /agent/connect`,
+exposed on both listeners); each frame is one binary message. One
+tunnel-fronted hub can then serve agents on any machine that can reach
+the tunnel and present its access token.
+
+```toml
+## agent.toml on a remote machine
+hub               = "wss://abc-8080.usw2.devtunnels.ms/agent/connect"
+machine_id        = "remote-1"
+psk               = "<base64 psk>"
+## Perimeter (tunnel) token, read fresh on every reconnect and sent as
+## `X-Tunnel-Authorization: tunnel <token>` on the WS upgrade. Keep the
+## env var (or tunnel_token_file) refreshed out-of-band.
+tunnel_token_env  = "TERM_TUNNEL_TOKEN"
+```
+
+Transport is chosen by the `hub` value's scheme: `ws://` / `wss://`
+⇒ WebSocket; a bare `host:port` ⇒ the original raw TCP/TLS path
+(unchanged). Auth is layered: the **tunnel's** access policy gates who
+can reach `/agent/connect`, and the agent's **PSK** (in the Hello frame,
+constant-time compared) gates which `machine_id` it may register as.
+Because the WS route carries no browser `Origin` header, it isn't
+affected by the hub's origin check; and unlike the browser
+`WebSocket` API, the agent's native client *can* set the
+`X-Tunnel-Authorization` header, so no query-string token is needed.
+
+Header name and scheme are configurable for non-Dev-Tunnel perimeters
+(`tunnel_auth_header`, `tunnel_auth_scheme`) — e.g. an SSO proxy
+expecting `Authorization: Bearer <token>` would set
+`tunnel_auth_header = "Authorization"` and `tunnel_auth_scheme = "Bearer"`.
 
 ## Security notes
 
