@@ -52,10 +52,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-          components: clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GitHub-hosted runners ship rustup, so install the toolchain with
+          # it directly instead of a third-party action. `stable` tracks the
+          # latest stable release, matching the previous behavior.
+          rustup toolchain install stable \
+            --profile minimal \
+            --component clippy \
+            --target ${{ matrix.target }}
+          rustup default stable
+          rustc --version --verbose
+          cargo --version
 
       - name: Cache cargo registry + target
         uses: actions/cache@v4
@@ -121,9 +130,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          cargo --version
 
       # The repo doesn't currently enforce rustfmt style; we still run
       # `--check` so any drift shows up as a non-blocking warning. To
@@ -228,19 +241,31 @@ jobs:
           ls -la release
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.name }}
-          prerelease: true
-          fail_on_unmatched_files: true
-          files: release/*
-          body: |
-            Automated build of `${{ github.ref_name }}` @ `${{ steps.meta.outputs.short_sha }}`.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TITLE: ${{ steps.meta.outputs.name }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          # `gh` is preinstalled on GitHub-hosted runners; use it instead of a
+          # third-party release action. The contents:write permission set on
+          # this job lets the default GITHUB_TOKEN create the release + tag.
+          cat > release-notes.md <<EOF
+          Automated build of \`${GITHUB_REF_NAME}\` @ \`${SHORT_SHA}\`.
 
-            - Commit: ${{ github.sha }}
-            - Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            - Binaries: `term-hub`, `term-agent`, `hub-admin`, `term-dl`
-            - Targets: x86_64 / aarch64 × Linux (gnu) / Windows (msvc)
+          - Commit: ${GITHUB_SHA}
+          - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - Binaries: \`term-hub\`, \`term-agent\`, \`hub-admin\`, \`term-dl\`
+          - Targets: x86_64 / aarch64 × Linux (gnu) / Windows (msvc)
 
-            Verify downloads against `SHA256SUMS.txt`.
+          Verify downloads against \`SHA256SUMS.txt\`.
+          EOF
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --notes-file release-notes.md \
+            release/*
