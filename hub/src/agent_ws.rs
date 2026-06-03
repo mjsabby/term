@@ -12,8 +12,8 @@
 //! [`crate::agent_link::handle_connection`]; the WebSocket layer adds no
 //! hub-side auth of its own (the perimeter + PSK are the gates).
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use futures_util::sink::SinkExt;
@@ -21,7 +21,7 @@ use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use tracing::{info, warn};
 
 use term_common::frame::{Frame, FrameError, HEADER_LEN, MAX_PASTE_CHUNK_LEN};
-use term_common::transport::{frame_from_ws_payload, FrameRecv, FrameSend};
+use term_common::transport::{FrameRecv, FrameSend, frame_from_ws_payload};
 
 use crate::agent_link::handle_connection;
 use crate::state::AppState;
@@ -115,12 +115,12 @@ mod tests {
 
     use base64::Engine;
     use futures_util::SinkExt;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     use crate::config::{HubConfig, MachineConfig, TlsMode};
     use crate::state::AppState;
-    use term_common::frame::{Frame, HelloPayload, HELLO_VERSION};
+    use term_common::frame::{Frame, HELLO_VERSION, HelloPayload};
 
     const PSK_BYTES: [u8; 32] = [7u8; 32];
 

@@ -28,11 +28,11 @@ pub mod client_data;
 pub mod cose;
 
 use base64::Engine;
-use p256::ecdsa::{signature::Verifier as _, Signature, VerifyingKey};
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub use challenge::{Challenge, CHALLENGE_LEN};
+pub use challenge::{CHALLENGE_LEN, Challenge};
 
 // -------- creation (registration) options --------
 
@@ -410,7 +410,7 @@ fn extract_auth_data(att_obj: &[u8]) -> Result<Vec<u8>, WebauthnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::ecdsa::{signature::Signer as _, SigningKey};
+    use p256::ecdsa::{SigningKey, signature::Signer as _};
 
     /// Build an attestationObject of the form
     /// `{"fmt": "none", "attStmt": {}, "authData": h'<bytes>'}`.

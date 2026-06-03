@@ -280,7 +280,7 @@ mod tests {
         let mut input = Vec::from(&b"\x1b]5111;"[..]);
         input.extend(std::iter::repeat_n(b'a', MAX_OSC_LEN));
         input.push(b'\x1b'); // ESC at end of payload — would have been
-                             // remembered as "last was ESC" by the old impl
+        // remembered as "last was ESC" by the old impl
         input.extend_from_slice(b"NEEDLE_THAT_SHOULD_NOT_LEAK");
         input.push(b'\x07'); // real BEL terminator
         input.extend_from_slice(b"after");

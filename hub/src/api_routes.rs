@@ -1,9 +1,9 @@
 //! Authenticated JSON API routes.
 
+use axum::Json;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Serialize;
 
 use crate::agent_link::SessionInfoEnvelope;

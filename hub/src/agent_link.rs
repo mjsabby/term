@@ -22,23 +22,23 @@
 //! once a new agent link is installed.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use term_common::frame::{Body, Frame, FrameType, HelloPayload, HELLO_VERSION, KILL_STATUS_OK};
-use term_common::prio::{prio_channel, PrioTx};
+use term_common::frame::{Body, Frame, FrameType, HELLO_VERSION, HelloPayload, KILL_STATUS_OK};
+use term_common::prio::{PrioTx, prio_channel};
 use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 
-use crate::config::{is_valid_machine_id, HubConfig};
+use crate::config::{HubConfig, is_valid_machine_id};
 use crate::state::AppState;
 
 // --- writer queue budgets (bytes, per agent connection) -------------------
@@ -507,10 +507,10 @@ where
     // ---- teardown ---------------------------------------------------------
     {
         let mut map = state.agents.lock().await;
-        if let Some(cur) = map.get(&machine_id) {
-            if Arc::ptr_eq(cur, &link) {
-                map.remove(&machine_id);
-            }
+        if let Some(cur) = map.get(&machine_id)
+            && Arc::ptr_eq(cur, &link)
+        {
+            map.remove(&machine_id);
         }
     }
     // Drop per-stream senders so any WS handler reading from

@@ -48,7 +48,7 @@ pub async fn term_ws(
         let (token, sp) = match token_from_ws_protocol(&headers) {
             Some(p) => p,
             None => {
-                return (StatusCode::UNAUTHORIZED, "missing bearer subprotocol").into_response()
+                return (StatusCode::UNAUTHORIZED, "missing bearer subprotocol").into_response();
             }
         };
         if !validate_token(&state, &token).await {

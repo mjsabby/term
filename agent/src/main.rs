@@ -17,17 +17,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use rustls::pki_types::ServerName;
 use serde::Deserialize;
 use term_common::frame::{
-    Body, Frame, FrameType, HelloPayload, CONTROLLER_STATUS_NONE, CONTROLLER_STATUS_OTHER,
-    CONTROLLER_STATUS_SELF, HELLO_VERSION, MAX_DATA_LEN, MAX_PASTE_TOTAL_BYTES,
+    Body, CONTROLLER_STATUS_NONE, CONTROLLER_STATUS_OTHER, CONTROLLER_STATUS_SELF, Frame,
+    FrameType, HELLO_VERSION, HelloPayload, MAX_DATA_LEN, MAX_PASTE_TOTAL_BYTES,
     PASTE_REJECT_DUPLICATE_PASTE, PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_NOT_CONTROLLER,
     PASTE_REJECT_OPEN_FAILED, PASTE_REJECT_REGISTRY_FULL, PASTE_REJECT_SIZE_MISMATCH,
     PASTE_REJECT_WRITE_FAILED, PASTE_STATUS_CANCEL,
 };
-use term_common::prio::{item_prio_channel, prio_channel, ItemPrioRx, ItemPrioTx, PrioTx};
+use term_common::prio::{ItemPrioRx, ItemPrioTx, PrioTx, item_prio_channel, prio_channel};
 use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;

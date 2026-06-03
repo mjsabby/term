@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 /// A byte-bounded multi-producer, single-consumer sender. Each `send`
 /// acquires `bytes.len()` permits from a shared `Semaphore`; the permit

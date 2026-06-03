@@ -29,6 +29,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             runner: windows-2022
             artifact_ext: .exe
+            debug_ext: .pdb
             run_tests: true
           - target: aarch64-pc-windows-msvc
             # `windows-11-arm` is GitHub's hosted ARM64 Windows runner
@@ -38,14 +39,17 @@ jobs:
             # the host arch.
             runner: windows-11-arm
             artifact_ext: .exe
+            debug_ext: .pdb
             run_tests: true
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             artifact_ext: ''
+            debug_ext: .dwp
             run_tests: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             artifact_ext: ''
+            debug_ext: .dwp
             run_tests: true
 
     steps:
@@ -90,6 +94,30 @@ jobs:
         # in a follow-up). `--workspace` still runs all of them.
         run: cargo test --workspace --target ${{ matrix.target }}
 
+      - name: Configure SourceLink (Windows only)
+        # Generate a Source Link mapping (https://aka.ms/sourcelink) so
+        # PDBs ship with URLs that point WinDbg / Visual Studio at the
+        # exact GitHub blob each .rs file was compiled from. We pass the
+        # JSON to link.exe via `/SOURCELINK:` (an RUSTFLAG `-Clink-arg`).
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $repoRoot = $env:GITHUB_WORKSPACE
+          $jsonPath = Join-Path $repoRoot 'sourcelink.json'
+          # rustc embeds absolute source paths in the PDB; the wildcard
+          # key matches any file under the workspace root.
+          $docKey   = "${repoRoot}\*"
+          $docUrl   = "https://raw.githubusercontent.com/$($env:GITHUB_REPOSITORY)/$($env:GITHUB_SHA)/*"
+          $payload  = [pscustomobject]@{ documents = @{ $docKey = $docUrl } } |
+                      ConvertTo-Json -Depth 5 -Compress
+          Set-Content -Path $jsonPath -Value $payload -NoNewline -Encoding utf8
+          Write-Host "sourcelink.json -> $jsonPath"
+          Get-Content $jsonPath | Write-Host
+          # Apply only to the release link step that follows; clippy /
+          # test already ran without these flags.
+          "RUSTFLAGS=-Clink-arg=/SOURCELINK:$jsonPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: build release
         run: cargo build --workspace --release --target ${{ matrix.target }}
 
@@ -97,6 +125,7 @@ jobs:
         shell: bash
         env:
           EXT: ${{ matrix.artifact_ext }}
+          DBG_EXT: ${{ matrix.debug_ext }}
           TGT: ${{ matrix.target }}
         run: |
           set -euo pipefail
@@ -107,6 +136,15 @@ jobs:
               cp "$src" "artifacts/${b}${EXT}"
             else
               echo "MISSING: $src" >&2
+              exit 1
+            fi
+            # Detached debug info: .pdb on Windows MSVC, .dwp on Linux
+            # (produced by `split-debuginfo = "packed"` in [profile.release]).
+            dbg="target/${TGT}/release/${b}${DBG_EXT}"
+            if [[ -f "$dbg" ]]; then
+              cp "$dbg" "artifacts/${b}${DBG_EXT}"
+            else
+              echo "MISSING debug file: $dbg" >&2
               exit 1
             fi
           done
@@ -138,12 +176,11 @@ jobs:
           rustup default stable
           cargo --version
 
-      # The repo doesn't currently enforce rustfmt style; we still run
-      # `--check` so any drift shows up as a non-blocking warning. To
-      # promote to a hard error: change `continue-on-error: true` to
-      # `false` and commit a rustfmt.toml.
+      # rustfmt drift is a hard error: the repo ships a rustfmt.toml
+      # pinned to edition 2024 and we keep the tree formatted to that
+      # style. Re-format locally with `cargo fmt --all` before pushing.
       - name: rustfmt --check
-        continue-on-error: true
+        continue-on-error: false
         run: cargo fmt --all -- --check
 
       - name: cargo tree (no openssl)
@@ -217,7 +254,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           mkdir -p release
-          # Flatten dist/term-<target>/<bin>[.exe] -> release/<bin>-<target>[.exe]
+          # Flatten dist/term-<target>/<bin>[.exe|.pdb|.dwp]
+          #   -> release/<bin>-<target>[.exe|.pdb|.dwp]
           # so every asset has a unique, target-qualified name.
           for dir in dist/term-*/; do
             target="$(basename "$dir")"
@@ -226,6 +264,8 @@ jobs:
               base="$(basename "$f")"
               case "$base" in
                 *.exe) cp "$f" "release/${base%.exe}-${target}.exe" ;;
+                *.pdb) cp "$f" "release/${base%.pdb}-${target}.pdb" ;;
+                *.dwp) cp "$f" "release/${base%.dwp}-${target}.dwp" ;;
                 *)     cp "$f" "release/${base}-${target}" ;;
               esac
             done
@@ -260,6 +300,8 @@ jobs:
           - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
           - Binaries: \`term-hub\`, \`term-agent\`, \`hub-admin\`, \`term-dl\`
           - Targets: x86_64 / aarch64 × Linux (gnu) / Windows (msvc)
+          - Debug symbols ship alongside each binary: \`.pdb\` on Windows
+            (with Source Link to this commit), \`.dwp\` on Linux.
 
           Verify downloads against \`SHA256SUMS.txt\`.
           EOF

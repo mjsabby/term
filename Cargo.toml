@@ -3,7 +3,7 @@ resolver = "2"
 members = ["common", "agent", "hub", "hub-admin", "term-dl"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 license = "MIT"
 publish = false
@@ -28,4 +28,14 @@ p256             = { version = "0.13", default-features = false, features = ["ec
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Emit full debug info so we get rich PDBs on Windows MSVC and a
+# detached DWARF package on Linux.
+debug = "full"
+# Move debug info into a sibling file (.pdb on Windows MSVC, .dwp on
+# Linux). Keeps the shipped binary small without losing
+# stepable-source / symbolicated stack traces.
+split-debuginfo = "packed"
+# After split-debuginfo has hoisted DWARF into the .dwp, scrub any
+# leftover debug sections from the ELF binary itself. On Windows MSVC
+# debug data already lives in the PDB, so this is a no-op there.
 strip = "debuginfo"

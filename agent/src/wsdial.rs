@@ -14,22 +14,22 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async_with_config;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info};
 
 use term_common::frame::{Frame, FrameError};
-use term_common::transport::{frame_from_ws_payload, FrameRecv, FrameSend};
+use term_common::transport::{FrameRecv, FrameSend, frame_from_ws_payload};
 
 use crate::ResolvedConfig;
 
@@ -43,7 +43,7 @@ pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -
         other => {
             return Err(anyhow!(
                 "unsupported hub url scheme {other:?} (want ws/wss)"
-            ))
+            ));
         }
     };
     let host = url
@@ -138,10 +138,10 @@ fn tunnel_auth_header(cfg: &ResolvedConfig) -> Result<Option<(HeaderName, Header
 /// cached, so it's re-read on every reconnect — the safe fallback.
 fn current_token(cfg: &ResolvedConfig, path: &str) -> Result<String> {
     let now = SystemTime::now();
-    if let Some(c) = cfg.tunnel_token_cache.lock().unwrap().as_ref() {
-        if c.expires_at > now + TOKEN_REFRESH_MARGIN {
-            return Ok(c.raw.clone());
-        }
+    if let Some(c) = cfg.tunnel_token_cache.lock().unwrap().as_ref()
+        && c.expires_at > now + TOKEN_REFRESH_MARGIN
+    {
+        return Ok(c.raw.clone());
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("read tunnel_token_file {path}"))?

@@ -223,6 +223,11 @@ mod tests {
 
     /// Serialize tests that mutate the env var — Rust runs tests in
     /// parallel by default, and `std::env::set_var` is process-wide.
+    /// On edition 2024+ these mutators are `unsafe` because they're
+    /// not synchronized against other threads' `getenv`; we narrow the
+    /// race to *this crate's* tests via `env_lock()`, which is good
+    /// enough here because nothing else in this binary reads the env
+    /// outside `effective_no_auth()` (called only from these tests).
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -234,7 +239,7 @@ mod tests {
     #[test]
     fn no_auth_present_unset_env_returns_some() {
         let _g = env_lock();
-        std::env::remove_var("TERM_HUB_NO_AUTH");
+        unsafe { std::env::remove_var("TERM_HUB_NO_AUTH") };
         let c = cfg_with(Some(na()));
         assert!(c.effective_no_auth().unwrap().is_some());
     }
@@ -242,7 +247,7 @@ mod tests {
     #[test]
     fn no_auth_absent_unset_env_returns_none() {
         let _g = env_lock();
-        std::env::remove_var("TERM_HUB_NO_AUTH");
+        unsafe { std::env::remove_var("TERM_HUB_NO_AUTH") };
         let c = cfg_with(None);
         assert!(c.effective_no_auth().unwrap().is_none());
     }
@@ -251,39 +256,39 @@ mod tests {
     fn no_auth_env_off_disables_even_when_configured() {
         let _g = env_lock();
         for v in ["off", "0", "false", "no"] {
-            std::env::set_var("TERM_HUB_NO_AUTH", v);
+            unsafe { std::env::set_var("TERM_HUB_NO_AUTH", v) };
             let c = cfg_with(Some(na()));
             assert!(c.effective_no_auth().unwrap().is_none(), "v={v}");
         }
-        std::env::remove_var("TERM_HUB_NO_AUTH");
+        unsafe { std::env::remove_var("TERM_HUB_NO_AUTH") };
     }
 
     #[test]
     fn no_auth_env_on_requires_config_block() {
         let _g = env_lock();
-        std::env::set_var("TERM_HUB_NO_AUTH", "on");
+        unsafe { std::env::set_var("TERM_HUB_NO_AUTH", "on") };
         let c = cfg_with(None);
         assert!(c.effective_no_auth().is_err());
-        std::env::remove_var("TERM_HUB_NO_AUTH");
+        unsafe { std::env::remove_var("TERM_HUB_NO_AUTH") };
     }
 
     #[test]
     fn no_auth_env_on_passes_through_when_configured() {
         let _g = env_lock();
         for v in ["on", "1", "true", "yes"] {
-            std::env::set_var("TERM_HUB_NO_AUTH", v);
+            unsafe { std::env::set_var("TERM_HUB_NO_AUTH", v) };
             let c = cfg_with(Some(na()));
             assert!(c.effective_no_auth().unwrap().is_some(), "v={v}");
         }
-        std::env::remove_var("TERM_HUB_NO_AUTH");
+        unsafe { std::env::remove_var("TERM_HUB_NO_AUTH") };
     }
 
     #[test]
     fn no_auth_env_garbage_is_rejected() {
         let _g = env_lock();
-        std::env::set_var("TERM_HUB_NO_AUTH", "maybe");
+        unsafe { std::env::set_var("TERM_HUB_NO_AUTH", "maybe") };
         let c = cfg_with(Some(na()));
         assert!(c.effective_no_auth().is_err());
-        std::env::remove_var("TERM_HUB_NO_AUTH");
+        unsafe { std::env::remove_var("TERM_HUB_NO_AUTH") };
     }
 }

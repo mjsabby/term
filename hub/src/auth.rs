@@ -10,12 +10,12 @@
 use std::time::{Duration, SystemTime};
 
 use axum::extract::FromRequestParts;
-use axum::http::{request::Parts, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, request::Parts};
 use base64::Engine;
 use rand::Rng;
 
 use crate::listener_mode::ListenerMode;
-use crate::state::{gc, AppState, Session, SESSION_TTL};
+use crate::state::{AppState, SESSION_TTL, Session, gc};
 
 /// 32 random bytes encoded as URL-safe base64 (no padding) = 43 chars.
 pub fn mint_token() -> String {
@@ -64,10 +64,10 @@ impl FromRequestParts<AppState> for Bearer {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(mode) = parts.extensions.get::<ListenerMode>() {
-            if mode.no_auth {
-                return Ok(Bearer(String::new()));
-            }
+        if let Some(mode) = parts.extensions.get::<ListenerMode>()
+            && mode.no_auth
+        {
+            return Ok(Bearer(String::new()));
         }
 
         let token = parts

@@ -12,18 +12,18 @@
 use std::time::SystemTime;
 
 use anyhow::Context;
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::auth::{mint_token, store_token, ttl_secs};
-use crate::state::{gc, AppState, PendingLogin, PENDING_LOGIN_TTL};
+use crate::state::{AppState, PENDING_LOGIN_TTL, PendingLogin, gc};
 use term_common::creds::{self, CredentialStore};
-use term_common::envelope::{issued_at_now, EnvelopeInner, SignedEnvelope};
+use term_common::envelope::{EnvelopeInner, SignedEnvelope, issued_at_now};
 use term_common::flock::FileLock;
 use term_common::webauthn::{
     self, AuthenticationResponse, Challenge, PublicKeyCredentialCreationOptions,
@@ -216,14 +216,13 @@ pub async fn login_finish(
     .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
 
     // Persist updated credential counter if it advanced.
-    if auth.sign_count_advanced {
-        if let Err(e) =
+    if auth.sign_count_advanced
+        && let Err(e) =
             persist_counter_update(&state, &auth.credential_id, auth.new_sign_count).await
-        {
-            // Don't fail the login — counter persistence is best-effort
-            // and re-derivable on the next successful auth.
-            warn!(error = ?e, "failed to persist counter update");
-        }
+    {
+        // Don't fail the login — counter persistence is best-effort
+        // and re-derivable on the next successful auth.
+        warn!(error = ?e, "failed to persist counter update");
     }
 
     let token = mint_token();
@@ -245,11 +244,11 @@ async fn persist_counter_update(
         creds::ensure_lock_file(&data_dir).context("ensure lock file")?;
         let _g = FileLock::acquire_exclusive(&creds::lock_path(&data_dir)).context("flock")?;
         let mut store = CredentialStore::load(&data_dir).context("load store")?;
-        if let Some(c) = store.find_by_id_mut(&cred_id) {
-            if new_sign_count > c.sign_count {
-                c.sign_count = new_sign_count;
-                store.save_atomic(&data_dir).context("save store")?;
-            }
+        if let Some(c) = store.find_by_id_mut(&cred_id)
+            && new_sign_count > c.sign_count
+        {
+            c.sign_count = new_sign_count;
+            store.save_atomic(&data_dir).context("save store")?;
         }
         Ok(())
     })

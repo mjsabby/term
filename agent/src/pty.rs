@@ -42,9 +42,9 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::{mpsc, Mutex};
+use anyhow::{Context, Result, anyhow};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
 const READ_BUF_SIZE: usize = 16 * 1024;

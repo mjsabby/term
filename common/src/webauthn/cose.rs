@@ -68,10 +68,10 @@ pub fn decode_es256(bytes: &[u8]) -> Result<[u8; SEC1_UNCOMPRESSED_LEN], CoseErr
     if kty != EC2_KTY {
         return Err(CoseError::UnsupportedKty(kty));
     }
-    if let Some(a) = alg {
-        if a != ES256_ALG {
-            return Err(CoseError::UnsupportedAlg(a));
-        }
+    if let Some(a) = alg
+        && a != ES256_ALG
+    {
+        return Err(CoseError::UnsupportedAlg(a));
     }
     let crv = crv.ok_or(CoseError::MissingField("crv"))?;
     if crv != P256_CRV {
@@ -157,8 +157,8 @@ mod tests {
     fn rejects_wrong_alg() {
         let mut v = build_cose(&[3u8; 32], &[4u8; 32]);
         v[5] = 0x39; // 2-byte nint encoding starts at info=25, but
-                     // simpler: rewrite alg value 0x26 → some other.
-                     // Easier: build a custom map.
+        // simpler: rewrite alg value 0x26 → some other.
+        // Easier: build a custom map.
         let mut v = vec![
             0xa4, // map(4)
             0x01, 0x02, // kty=2

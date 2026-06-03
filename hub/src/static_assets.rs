@@ -10,7 +10,7 @@
 //! `rust-embed`'s `mime-guess` feature populates `data.mimetype()`
 //! from the file extension, which we forward as `Content-Type`.
 
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 

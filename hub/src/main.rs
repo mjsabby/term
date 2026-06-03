@@ -34,7 +34,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
-use rustls_acme::{caches::DirCache, AcmeConfig};
+use rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
@@ -423,8 +423,8 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use axum::body::{to_bytes, Body};
-    use axum::http::{header, Method, Request, StatusCode};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request, StatusCode, header};
     use tower::ServiceExt;
 
     use crate::config::{HubConfig, NoAuthConfig, TlsMode};

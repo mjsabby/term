@@ -156,10 +156,10 @@ impl CredentialStore {
         })?;
 
         // fsync the directory so the rename is durable across crashes.
-        if let Some(parent) = final_path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = final_path.parent()
+            && let Ok(dir) = File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     }
