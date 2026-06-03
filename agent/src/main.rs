@@ -57,17 +57,14 @@ struct AgentConfig {
     #[serde(default)]
     shell: Option<String>,
 
-    /// WebSocket transport only (i.e. `hub = "wss://…"`). Name of the
-    /// env var the agent reads the perimeter access token from on each
-    /// (re)connect, sent as `<tunnel_auth_header>: <tunnel_auth_scheme>
-    /// <token>` on the WS upgrade so a Dev Tunnel / SSO proxy lets the
-    /// dial through. Ignored for the raw `host:port` transport.
-    #[serde(default = "default_tunnel_token_env")]
-    tunnel_token_env: String,
-    /// Optional file to read the tunnel token from instead of the env
-    /// var. Re-read on every reconnect, so an external rotator can
-    /// refresh the token without restarting the agent (a process's env
-    /// vars can't be changed from the outside once it's running).
+    /// WebSocket transport only (i.e. `hub = "wss://…"`). File the agent
+    /// reads the perimeter (e.g. Dev Tunnel) access token from. The token
+    /// is cached in memory and only re-read when it's near expiry —
+    /// parsed from the token's JWT `exp` — so an external rotator can
+    /// refresh the file out-of-band (tunnel tokens typically lapse hourly)
+    /// without restarting the agent. Sent as `<tunnel_auth_header>:
+    /// <tunnel_auth_scheme> <token>` on the WS upgrade. Omit for an
+    /// anonymous tunnel. Ignored for the raw `host:port` transport.
     #[serde(default)]
     tunnel_token_file: Option<String>,
     /// Header carrying the tunnel token. Default "X-Tunnel-Authorization"
@@ -93,7 +90,6 @@ struct AgentConfig {
     _legacy_tmux: Option<String>,
 }
 fn default_tls() -> String { "on".into() }
-fn default_tunnel_token_env() -> String { "TERM_TUNNEL_TOKEN".into() }
 fn default_tunnel_auth_header() -> String { "X-Tunnel-Authorization".into() }
 fn default_tunnel_auth_scheme() -> String { "tunnel".into() }
 
@@ -249,10 +245,10 @@ async fn main() -> Result<()> {
         server_name,
         shell,
         limits: cfg.limits.resolve(),
-        tunnel_token_env: cfg.tunnel_token_env,
         tunnel_token_file: cfg.tunnel_token_file,
         tunnel_auth_header: cfg.tunnel_auth_header,
         tunnel_auth_scheme: cfg.tunnel_auth_scheme,
+        tunnel_token_cache: std::sync::Mutex::new(None),
     });
 
     info!(
@@ -308,10 +304,13 @@ struct ResolvedConfig {
     server_name: String,
     shell: String,
     limits: Limits,
-    tunnel_token_env: String,
     tunnel_token_file: Option<String>,
     tunnel_auth_header: String,
     tunnel_auth_scheme: String,
+    /// In-memory cache of the perimeter token + its parsed expiry, so the
+    /// WS dial path only re-reads `tunnel_token_file` when the token is
+    /// near expiry rather than on every reconnect.
+    tunnel_token_cache: std::sync::Mutex<Option<wsdial::CachedToken>>,
 }
 
 fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {

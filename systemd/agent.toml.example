@@ -47,13 +47,12 @@ shell       = "/bin/bash"
 ##
 ## When `hub` is a wss:// URL the agent attaches an access token to the
 ## WS upgrade so the perimeter (e.g. Dev Tunnel) lets the dial through.
-## These are ignored for the raw host:port transport.
+## Ignored for the raw host:port transport. Omit for an anonymous tunnel.
 ##
-## Token source, read fresh on every reconnect:
-##   - env var (default), kept up to date by some external tool, or
-##   - a file (uncomment tunnel_token_file) for restart-free rotation,
-##     since a running process's env can't be changed from outside.
-# tunnel_token_env   = "TERM_TUNNEL_TOKEN"
+## The token is read ONLY from a file (tunnel tokens expire hourly and a
+## running process's env can't be refreshed from outside). The agent
+## caches it and re-reads the file only when the token is within a minute
+## of its JWT `exp`, so point an out-of-band rotator at this path.
 # tunnel_token_file  = "/run/term-agent/tunnel.token"
 ##
 ## Header + scheme: default is Microsoft Dev Tunnel's

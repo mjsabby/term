@@ -12,8 +12,10 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use rustls::pki_types::ServerName;
@@ -91,21 +93,29 @@ where
     crate::run_session(cfg, WsRecv(stream), WsSend(sink)).await
 }
 
-/// Resolve the perimeter auth header from the configured token source.
-/// `tunnel_token_file` wins over `tunnel_token_env`. Returns `None` (no
-/// header) when neither yields a token — fine for an anonymous tunnel.
+/// Cached perimeter token + its parsed expiry.
+pub(crate) struct CachedToken {
+    raw: String,
+    expires_at: SystemTime,
+}
+
+/// Refresh the token this long before its `exp`, so we never hand the
+/// perimeter a token that lapses mid-handshake (and to absorb clock skew).
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+
+/// Resolve the perimeter auth header from `tunnel_token_file`. Returns
+/// `None` (no header) when no file is configured — fine for an anonymous
+/// tunnel.
 fn tunnel_auth_header(cfg: &ResolvedConfig) -> Result<Option<(HeaderName, HeaderValue)>> {
-    let token = match &cfg.tunnel_token_file {
-        Some(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("read tunnel_token_file {path}"))?,
-        None => std::env::var(&cfg.tunnel_token_env).unwrap_or_default(),
+    let Some(path) = cfg.tunnel_token_file.as_deref() else {
+        return Ok(None);
     };
-    let token = token.trim();
+    let token = current_token(cfg, path)?;
     if token.is_empty() {
         return Ok(None);
     }
     let value = if cfg.tunnel_auth_scheme.is_empty() {
-        token.to_string()
+        token
     } else {
         format!("{} {}", cfg.tunnel_auth_scheme, token)
     };
@@ -114,6 +124,47 @@ fn tunnel_auth_header(cfg: &ResolvedConfig) -> Result<Option<(HeaderName, Header
     let value =
         HeaderValue::from_str(&value).context("tunnel token produced an invalid header value")?;
     Ok(Some((name, value)))
+}
+
+/// Return the current perimeter token, reusing the in-memory cache while
+/// it's still valid and only re-reading `path` when the cached token is
+/// near expiry. A token whose `exp` we can't parse (not a JWT) is not
+/// cached, so it's re-read on every reconnect — the safe fallback.
+fn current_token(cfg: &ResolvedConfig, path: &str) -> Result<String> {
+    let now = SystemTime::now();
+    if let Some(c) = cfg.tunnel_token_cache.lock().unwrap().as_ref() {
+        if c.expires_at > now + TOKEN_REFRESH_MARGIN {
+            return Ok(c.raw.clone());
+        }
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read tunnel_token_file {path}"))?
+        .trim()
+        .to_string();
+    *cfg.tunnel_token_cache.lock().unwrap() = jwt_exp(&raw).map(|expires_at| CachedToken {
+        raw: raw.clone(),
+        expires_at,
+    });
+    Ok(raw)
+}
+
+/// Best-effort parse of a JWT's `exp` (unix seconds) from its payload
+/// segment. `None` for anything that isn't a 3-segment JWT with a numeric
+/// `exp` — callers treat that as "expiry unknown" and don't cache.
+fn jwt_exp(token: &str) -> Option<SystemTime> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?; // signature segment must exist (JWT shape)
+    if parts.next().is_some() {
+        return None; // more than 3 segments -> not a JWT
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = v.get("exp")?.as_u64()?;
+    Some(UNIX_EPOCH + Duration::from_secs(exp))
 }
 
 /// [`FrameRecv`] over the read half of a tungstenite WebSocket.
@@ -153,5 +204,93 @@ where
     async fn close(&mut self) {
         let _ = self.0.send(Message::Close(None)).await;
         let _ = self.0.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unix_now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// Build a structurally-valid JWT (`header.payload.sig`) whose payload
+    /// carries the given `exp`. The signature is bogus — we never verify
+    /// it, only read `exp`.
+    fn make_jwt(exp_secs: u64) -> String {
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let header = enc(br#"{"alg":"none"}"#);
+        let payload = enc(format!(r#"{{"exp":{exp_secs}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    fn test_cfg(token_file: Option<String>) -> ResolvedConfig {
+        ResolvedConfig {
+            hub: "wss://example.test/agent/connect".into(),
+            machine_id: "m".into(),
+            psk: "p".into(),
+            tls_on: true,
+            server_name: "example.test".into(),
+            shell: "/bin/sh".into(),
+            limits: crate::Limits::default(),
+            tunnel_token_file: token_file,
+            tunnel_auth_header: "X-Tunnel-Authorization".into(),
+            tunnel_auth_scheme: "tunnel".into(),
+            tunnel_token_cache: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn jwt_exp_parses_and_rejects() {
+        let exp = unix_now() + 3600;
+        let got = jwt_exp(&make_jwt(exp)).unwrap();
+        assert_eq!(got.duration_since(UNIX_EPOCH).unwrap().as_secs(), exp);
+        // Not a JWT / wrong segment count / no exp -> None.
+        assert!(jwt_exp("not-a-jwt").is_none());
+        assert!(jwt_exp("only.two").is_none());
+        assert!(jwt_exp("a.b.c.d").is_none());
+    }
+
+    #[test]
+    fn token_cache_reuses_until_expiry() {
+        let path = std::env::temp_dir().join(format!("term-tok-reuse-{}.jwt", std::process::id()));
+        std::fs::write(&path, make_jwt(unix_now() + 3600)).unwrap();
+        let cfg = test_cfg(Some(path.to_string_lossy().into_owned()));
+
+        let t1 = current_token(&cfg, path.to_str().unwrap()).unwrap();
+        // A still-valid cache must serve the token without touching disk:
+        // delete the file and confirm the next call still succeeds.
+        std::fs::remove_file(&path).unwrap();
+        let t2 = current_token(&cfg, path.to_str().unwrap()).unwrap();
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn token_cache_refreshes_when_expired() {
+        let now = unix_now();
+        let path = std::env::temp_dir().join(format!("term-tok-exp-{}.jwt", std::process::id()));
+        std::fs::write(&path, make_jwt(now.saturating_sub(10))).unwrap(); // already expired
+        let cfg = test_cfg(Some(path.to_string_lossy().into_owned()));
+        let _ = current_token(&cfg, path.to_str().unwrap()).unwrap();
+
+        // Rotator writes a fresh token; an expired cache must re-read it.
+        let fresh = make_jwt(now + 3600);
+        std::fs::write(&path, &fresh).unwrap();
+        let got = current_token(&cfg, path.to_str().unwrap()).unwrap();
+        assert_eq!(got, fresh);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn non_jwt_token_is_not_cached() {
+        let path = std::env::temp_dir().join(format!("term-tok-opaque-{}.jwt", std::process::id()));
+        std::fs::write(&path, "opaque-token-v1").unwrap();
+        let cfg = test_cfg(Some(path.to_string_lossy().into_owned()));
+        assert_eq!(current_token(&cfg, path.to_str().unwrap()).unwrap(), "opaque-token-v1");
+        // Expiry unknown -> nothing cached, so a rotated file is picked up.
+        std::fs::write(&path, "opaque-token-v2").unwrap();
+        assert_eq!(current_token(&cfg, path.to_str().unwrap()).unwrap(), "opaque-token-v2");
+        let _ = std::fs::remove_file(&path);
     }
 }

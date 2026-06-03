@@ -466,10 +466,12 @@ the tunnel and present its access token.
 hub               = "wss://abc-8080.usw2.devtunnels.ms/agent/connect"
 machine_id        = "remote-1"
 psk               = "<base64 psk>"
-## Perimeter (tunnel) token, read fresh on every reconnect and sent as
-## `X-Tunnel-Authorization: tunnel <token>` on the WS upgrade. Keep the
-## env var (or tunnel_token_file) refreshed out-of-band.
-tunnel_token_env  = "TERM_TUNNEL_TOKEN"
+## Perimeter (tunnel) token. Sent as `X-Tunnel-Authorization: tunnel
+## <token>` on the WS upgrade. Tunnel tokens lapse hourly, so the agent
+## caches it and only re-reads this file when it's near expiry (parsed
+## from the token's JWT `exp`) — keep an out-of-band rotator writing a
+## fresh token here.
+tunnel_token_file = "/run/term-agent/tunnel.token"
 ```
 
 Transport is chosen by the `hub` value's scheme: `ws://` / `wss://`
@@ -481,6 +483,13 @@ Because the WS route carries no browser `Origin` header, it isn't
 affected by the hub's origin check; and unlike the browser
 `WebSocket` API, the agent's native client *can* set the
 `X-Tunnel-Authorization` header, so no query-string token is needed.
+
+The token is read only from `tunnel_token_file` (an env var would be no
+use — tunnel tokens expire hourly and a process's environment can't be
+updated from outside once it's running). It's cached in memory and
+re-read only when within a minute of its `exp`; a token whose expiry
+can't be parsed (not a JWT) is re-read on every reconnect. Omit the file
+for an anonymous tunnel.
 
 Header name and scheme are configurable for non-Dev-Tunnel perimeters
 (`tunnel_auth_header`, `tunnel_auth_scheme`) — e.g. an SSO proxy
