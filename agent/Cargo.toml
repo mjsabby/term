@@ -22,6 +22,13 @@ serde_json         = { workspace = true }
 toml               = { workspace = true }
 base64             = { workspace = true }
 portable-pty       = "0.9"
+url                = { workspace = true }
+futures-util       = { version = "0.3", default-features = false }
+## WebSocket *client* for dialing the hub through an HTTP/WS perimeter
+## (Dev Tunnel). `handshake` only — we bring our own TLS via tokio-rustls
+## (ring), so no native-tls / rustls feature here (avoids a second crypto
+## provider in the binary).
+tokio-tungstenite  = { version = "0.29", default-features = false, features = ["handshake"] }
 term-common        = { path = "../common", default-features = false }
 
 [target.'cfg(unix)'.dependencies]

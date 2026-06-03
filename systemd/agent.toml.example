@@ -3,8 +3,12 @@
 ##
 ## The agent dials the hub. No inbound port is opened on this host.
 
-## "host:port" of the hub's agent_bind.
+## Where to reach the hub. Two transports, chosen by the value's form:
+##   - raw TCP/TLS mux (same network as the hub):  "host:port"
+##   - WebSocket through an HTTP/WS perimeter (Dev Tunnel, SSO proxy),
+##     so the agent can live anywhere:             "wss://<host>/agent/connect"
 hub         = "term.xyz.com:7700"
+# hub       = "wss://abc-8080.usw2.devtunnels.ms/agent/connect"
 
 ## Must match a [[machines]] entry on the hub.
 machine_id  = "alpha"
@@ -38,6 +42,24 @@ tls         = "on"
 ## Argv is split on ASCII whitespace; no quoting/escaping. If you need
 ## spaces in arguments, point this at a wrapper script.
 shell       = "/bin/bash"
+
+## --- Perimeter auth (WebSocket transport only) ----------------------
+##
+## When `hub` is a wss:// URL the agent attaches an access token to the
+## WS upgrade so the perimeter (e.g. Dev Tunnel) lets the dial through.
+## Ignored for the raw host:port transport. Omit for an anonymous tunnel.
+##
+## The token is read ONLY from a file (tunnel tokens expire hourly and a
+## running process's env can't be refreshed from outside). The agent
+## caches it and re-reads the file only when the token is within a minute
+## of its JWT `exp`, so point an out-of-band rotator at this path.
+# tunnel_token_file  = "/run/term-agent/tunnel.token"
+##
+## Header + scheme: default is Microsoft Dev Tunnel's
+## `X-Tunnel-Authorization: tunnel <token>`. For an SSO proxy wanting
+## `Authorization: Bearer <token>` set header="Authorization" scheme="Bearer".
+# tunnel_auth_header = "X-Tunnel-Authorization"
+# tunnel_auth_scheme = "tunnel"
 
 ## (Legacy, ignored as of Phase 4.2: the agent no longer wraps in tmux.)
 # tmux        = "/usr/bin/tmux"

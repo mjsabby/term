@@ -23,5 +23,6 @@ pub mod frame;
 pub mod osc;
 pub mod prio;
 pub mod random;
+pub mod transport;
 #[cfg(feature = "hub")]
 pub mod webauthn;

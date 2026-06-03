@@ -15,6 +15,7 @@
 //! `ListenerMode` extensions.
 
 mod agent_link;
+mod agent_ws;
 mod api_routes;
 mod auth;
 mod config;
@@ -134,6 +135,7 @@ fn build_authed_router(state: AppState, mode: ListenerMode) -> Router {
         .route("/api/logout",              post(api_routes::logout))
         .route("/metrics",                 get(metrics::handler))
         .route("/ws/term/{machine_id}",    get(proxy::term_ws))
+        .route("/agent/connect",           get(agent_ws::connect))
         .fallback(static_assets::handler)
         .layer(TraceLayer::new_for_http())
         .layer(Extension(mode))
@@ -160,6 +162,7 @@ fn build_no_auth_router(state: AppState, mode: ListenerMode) -> Router {
         .route("/api/me",                  get(api_routes::me))
         .route("/api/mode",                get(api_routes::mode))
         .route("/ws/term/{machine_id}",    get(proxy::term_ws))
+        .route("/agent/connect",           get(agent_ws::connect))
         .fallback(static_assets::handler)
         .layer(TraceLayer::new_for_http())
         .layer(Extension(mode))

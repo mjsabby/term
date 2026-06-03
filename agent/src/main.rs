@@ -8,6 +8,7 @@
 
 mod pty;
 mod session;
+mod wsdial;
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -20,13 +21,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustls::pki_types::ServerName;
 use serde::Deserialize;
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 use term_common::frame::{
-    Body, Frame, FrameError, FrameType, HelloPayload, HEADER_LEN, HELLO_VERSION,
+    Body, Frame, FrameType, HelloPayload, HELLO_VERSION,
     CONTROLLER_STATUS_NONE, CONTROLLER_STATUS_OTHER, CONTROLLER_STATUS_SELF,
     MAX_DATA_LEN, MAX_PASTE_TOTAL_BYTES, PASTE_REJECT_DUPLICATE_PASTE,
     PASTE_REJECT_GROUP_OVERSIZE, PASTE_REJECT_NOT_CONTROLLER, PASTE_REJECT_OPEN_FAILED,
@@ -34,6 +35,7 @@ use term_common::frame::{
     PASTE_STATUS_CANCEL,
 };
 use term_common::prio::{item_prio_channel, prio_channel, ItemPrioRx, ItemPrioTx, PrioTx};
+use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 
 #[derive(Debug, Deserialize)]
 struct AgentConfig {
@@ -55,6 +57,27 @@ struct AgentConfig {
     #[serde(default)]
     shell: Option<String>,
 
+    /// WebSocket transport only (i.e. `hub = "wss://…"`). File the agent
+    /// reads the perimeter (e.g. Dev Tunnel) access token from. The token
+    /// is cached in memory and only re-read when it's near expiry —
+    /// parsed from the token's JWT `exp` — so an external rotator can
+    /// refresh the file out-of-band (tunnel tokens typically lapse hourly)
+    /// without restarting the agent. Sent as `<tunnel_auth_header>:
+    /// <tunnel_auth_scheme> <token>` on the WS upgrade. Omit for an
+    /// anonymous tunnel. Ignored for the raw `host:port` transport.
+    #[serde(default)]
+    tunnel_token_file: Option<String>,
+    /// Header carrying the tunnel token. Default "X-Tunnel-Authorization"
+    /// (Microsoft Dev Tunnel). Change for a different perimeter.
+    #[serde(default = "default_tunnel_auth_header")]
+    tunnel_auth_header: String,
+    /// Scheme prefix for the token value: sent as `<scheme> <token>`.
+    /// Default "tunnel"; set empty to send the bare token (e.g. a proxy
+    /// expecting `Authorization: Bearer …` would use header
+    /// "Authorization" + scheme "Bearer").
+    #[serde(default = "default_tunnel_auth_scheme")]
+    tunnel_auth_scheme: String,
+
     /// Resource limits. All fields optional; defaults below match the
     /// values that were hardcoded before this knob existed.
     #[serde(default)]
@@ -67,6 +90,8 @@ struct AgentConfig {
     _legacy_tmux: Option<String>,
 }
 fn default_tls() -> String { "on".into() }
+fn default_tunnel_auth_header() -> String { "X-Tunnel-Authorization".into() }
+fn default_tunnel_auth_scheme() -> String { "tunnel".into() }
 
 /// Per-agent resource limits, all optional in `agent.toml`. Resolved
 /// into a `Limits` struct at startup with the defaults below.
@@ -193,7 +218,17 @@ async fn main() -> Result<()> {
         .unwrap_or_else(default_shell);
 
     let server_name = cfg.server_name.clone().unwrap_or_else(|| {
-        cfg.hub.split(':').next().unwrap_or("").to_string()
+        // For a `wss://host[:port]/path` hub the SNI / cert name is the
+        // URL host; for a raw `host:port` hub it's the part before the
+        // colon.
+        if cfg.hub.starts_with("ws://") || cfg.hub.starts_with("wss://") {
+            url::Url::parse(&cfg.hub)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_default()
+        } else {
+            cfg.hub.split(':').next().unwrap_or("").to_string()
+        }
     });
 
     let tls_on = match cfg.tls.as_str() {
@@ -210,6 +245,10 @@ async fn main() -> Result<()> {
         server_name,
         shell,
         limits: cfg.limits.resolve(),
+        tunnel_token_file: cfg.tunnel_token_file,
+        tunnel_auth_header: cfg.tunnel_auth_header,
+        tunnel_auth_scheme: cfg.tunnel_auth_scheme,
+        tunnel_token_cache: std::sync::Mutex::new(None),
     });
 
     info!(
@@ -224,7 +263,10 @@ async fn main() -> Result<()> {
         resolved.limits.max_sessions,
     );
 
-    let tls_connector = if resolved.tls_on { Some(build_tls_connector()?) } else { None };
+    // Built unconditionally — the raw transport uses it only when
+    // `tls_on`, and the WebSocket transport uses it only for `wss://`.
+    // Building it just assembles a rustls client config (no I/O).
+    let tls_connector = build_tls_connector()?;
 
     let mut backoff = RECONNECT_INITIAL;
     loop {
@@ -262,6 +304,13 @@ struct ResolvedConfig {
     server_name: String,
     shell: String,
     limits: Limits,
+    tunnel_token_file: Option<String>,
+    tunnel_auth_header: String,
+    tunnel_auth_scheme: String,
+    /// In-memory cache of the perimeter token + its parsed expiry, so the
+    /// WS dial path only re-reads `tunnel_token_file` when the token is
+    /// near expiry rather than on every reconnect.
+    tunnel_token_cache: std::sync::Mutex<Option<wsdial::CachedToken>>,
 }
 
 fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {
@@ -311,37 +360,47 @@ fn default_shell() -> String {
 
 async fn run_once(
     cfg: Arc<ResolvedConfig>,
-    tls: Option<tokio_rustls::TlsConnector>,
+    tls: tokio_rustls::TlsConnector,
 ) -> Result<()> {
+    // WebSocket transport (through an HTTP/WS perimeter such as a Dev
+    // Tunnel) when `hub` is a ws[s] URL; raw TCP/TLS to `host:port`
+    // otherwise.
+    if cfg.hub.starts_with("ws://") || cfg.hub.starts_with("wss://") {
+        return wsdial::run_ws(cfg, tls).await;
+    }
+
     debug!("dialing {}", cfg.hub);
     let tcp = TcpStream::connect(&cfg.hub)
         .await
         .with_context(|| format!("dial {}", cfg.hub))?;
     tcp.set_nodelay(true).ok();
 
-    if let Some(connector) = tls {
+    if cfg.tls_on {
         let sn = ServerName::try_from(cfg.server_name.clone())
             .context("server_name must be a valid DNS name")?;
-        let tls_stream = connector
+        let tls_stream = tls
             .connect(sn, tcp)
             .await
             .context("tls handshake")?;
         let (r, w) = tokio::io::split(tls_stream);
-        run_session(cfg, r, w).await
+        run_session(cfg, ByteStreamRecv(r), ByteStreamSend(w)).await
     } else {
         let (r, w) = tcp.into_split();
-        run_session(cfg, r, w).await
+        run_session(cfg, ByteStreamRecv(r), ByteStreamSend(w)).await
     }
 }
 
-async fn run_session<R, W>(
+/// Run the agent mux over any frame transport (raw byte stream or
+/// WebSocket). `reader`/`writer` come from whichever transport
+/// [`run_once`] / [`wsdial::run_ws`] selected.
+pub(crate) async fn run_session<FR, FW>(
     cfg: Arc<ResolvedConfig>,
-    mut reader: R,
-    mut writer: W,
+    mut reader: FR,
+    mut writer: FW,
 ) -> Result<()>
 where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    FR: FrameRecv + Send,
+    FW: FrameSend + Send + 'static,
 {
     // Build writer mpsc + spawn writer task.
     //
@@ -352,9 +411,9 @@ where
     let (write_tx, mut write_rx) = prio_channel(WRITE_HI_BYTES, WRITE_LO_BYTES);
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = write_rx.recv().await {
-            if writer.write_all(&bytes).await.is_err() { break; }
+            if writer.send(bytes).await.is_err() { break; }
         }
-        let _ = writer.shutdown().await;
+        writer.close().await;
     });
 
     // Send Hello.
@@ -403,8 +462,8 @@ where
     // Reader loop. Returns on any unrecoverable error.
     let read_result: Result<()> = async {
         loop {
-            let f = match timeout(IDLE_DEADLINE, read_frame(&mut reader)).await {
-                Ok(Ok(Some(f))) => f,
+            let f = match timeout(IDLE_DEADLINE, reader.recv()).await {
+                Ok(Ok(Some((f, _)))) => f,
                 Ok(Ok(None))    => return Ok(()),
                 Ok(Err(e))      => return Err(e.into()),
                 Err(_)          => bail!("idle timeout (>{IDLE_DEADLINE:?})"),
@@ -493,22 +552,6 @@ where
     let _ = writer_task.await;
 
     read_result
-}
-
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>, FrameError> {
-    let mut hdr = [0u8; HEADER_LEN];
-    match r.read_exact(&mut hdr).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(FrameError::Io(e)),
-    }
-    let stream_id = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-    let ty_byte   = hdr[4];
-    let len       = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]);
-    let (ty, len) = Frame::validate_header(stream_id, ty_byte, len)?;
-    let mut payload = vec![0u8; len as usize];
-    if len > 0 { r.read_exact(&mut payload).await?; }
-    Frame::from_payload(stream_id, ty, payload).map(Some)
 }
 
 /// One paste that is mid-transfer. Lives inside the per-stream task.

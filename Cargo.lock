@@ -2110,6 +2110,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "futures-util",
  "libc",
  "portable-pty",
  "rustls",
@@ -2118,9 +2119,11 @@ dependencies = [
  "term-common",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "webpki-roots 1.0.7",
 ]
 
@@ -2166,6 +2169,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-tungstenite",
  "toml",
  "tower",
  "tower-http",
