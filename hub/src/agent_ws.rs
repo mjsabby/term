@@ -70,7 +70,9 @@ impl FrameRecv for WsRecv {
                 }
                 // Control frames: axum answers Ping automatically; Pong /
                 // Text aren't part of our protocol — skip and keep reading.
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Text(_))) => {
+                Some(Ok(Message::Ping(_)))
+                | Some(Ok(Message::Pong(_)))
+                | Some(Ok(Message::Text(_))) => {
                     continue;
                 }
                 // Clean close, end of stream, or a transport error all
@@ -177,7 +179,9 @@ mod tests {
             psk_b64: psk.into(),
         };
         let frame = Frame::hello(serde_json::to_vec(&hello).unwrap());
-        ws.send(Message::Binary(frame.encode().into())).await.unwrap();
+        ws.send(Message::Binary(frame.encode().into()))
+            .await
+            .unwrap();
         // Keep the socket open briefly so the hub processes the Hello.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let _ = ws.close(None).await;

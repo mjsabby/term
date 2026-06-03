@@ -42,11 +42,7 @@ pub struct EdgeConfig {
     pub origin: String,
 }
 
-pub async fn middleware(
-    State(cfg): State<EdgeConfig>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn middleware(State(cfg): State<EdgeConfig>, req: Request, next: Next) -> Response {
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         let ok = origin.to_str().map(|o| o == cfg.origin).unwrap_or(false);
         if !ok {
@@ -56,9 +52,18 @@ pub async fn middleware(
 
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     resp
 }

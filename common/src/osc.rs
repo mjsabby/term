@@ -59,7 +59,10 @@ enum State {
 /// (otherwise we'd silently rewrite ST → BEL, which is fine for xterm
 /// but violates the "verbatim" promise in the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Term { Bel, St }
+enum Term {
+    Bel,
+    St,
+}
 
 pub struct OscScanner {
     state: State,
@@ -69,12 +72,17 @@ pub struct OscScanner {
 }
 
 impl Default for OscScanner {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OscScanner {
     pub fn new() -> Self {
-        OscScanner { state: State::Normal, buf: Vec::new() }
+        OscScanner {
+            state: State::Normal,
+            buf: Vec::new(),
+        }
     }
 
     /// Reset scanner state — useful on stream restart.
@@ -173,12 +181,7 @@ impl OscScanner {
         (out, captured)
     }
 
-    fn finish_osc(
-        &mut self,
-        term: Term,
-        out: &mut Vec<u8>,
-        captured: &mut Vec<Vec<u8>>,
-    ) {
+    fn finish_osc(&mut self, term: Term, out: &mut Vec<u8>, captured: &mut Vec<Vec<u8>>) {
         // Decide: is this our 5111 application OSC, or someone else's?
         // Look at the prefix up to the first ';'.
         let prefix = self.buf.split(|&b| b == b';').next().unwrap_or(&[]);
@@ -200,7 +203,10 @@ impl OscScanner {
             out.extend_from_slice(&self.buf);
             match term {
                 Term::Bel => out.push(BEL),
-                Term::St  => { out.push(ESC); out.push(b'\\'); }
+                Term::St => {
+                    out.push(ESC);
+                    out.push(b'\\');
+                }
             }
         }
         self.buf.clear();
@@ -274,14 +280,17 @@ mod tests {
         let mut input = Vec::from(&b"\x1b]5111;"[..]);
         input.extend(std::iter::repeat_n(b'a', MAX_OSC_LEN));
         input.push(b'\x1b'); // ESC at end of payload — would have been
-                              // remembered as "last was ESC" by the old impl
+                             // remembered as "last was ESC" by the old impl
         input.extend_from_slice(b"NEEDLE_THAT_SHOULD_NOT_LEAK");
         input.push(b'\x07'); // real BEL terminator
         input.extend_from_slice(b"after");
         let (fwd, caps) = run(&input);
         assert!(caps.is_empty(), "overflow should drop the payload");
-        assert!(!fwd.windows(6).any(|w| w == b"NEEDLE"),
-                "overflow tail leaked: fwd = {:?}", String::from_utf8_lossy(&fwd));
+        assert!(
+            !fwd.windows(6).any(|w| w == b"NEEDLE"),
+            "overflow tail leaked: fwd = {:?}",
+            String::from_utf8_lossy(&fwd)
+        );
         assert_eq!(fwd, b"after");
     }
 
@@ -329,18 +338,14 @@ mod tests {
 
     #[test]
     fn multiple_captures_in_one_feed() {
-        let (fwd, caps) = run(
-            b"a\x1b]5111;dl;/x\x07b\x1b]5111;dl;/y\x07c"
-        );
+        let (fwd, caps) = run(b"a\x1b]5111;dl;/x\x07b\x1b]5111;dl;/y\x07c");
         assert_eq!(fwd, b"abc");
         assert_eq!(caps, vec![b"dl;/x".to_vec(), b"dl;/y".to_vec()]);
     }
 
     #[test]
     fn mix_5111_with_other_oscs() {
-        let (fwd, caps) = run(
-            b"X\x1b]0;title\x07Y\x1b]5111;dl;/p\x07Z\x1b]52;c;Zm9v\x07W"
-        );
+        let (fwd, caps) = run(b"X\x1b]0;title\x07Y\x1b]5111;dl;/p\x07Z\x1b]52;c;Zm9v\x07W");
         assert_eq!(fwd, b"X\x1b]0;title\x07YZ\x1b]52;c;Zm9v\x07W");
         assert_eq!(caps, vec![b"dl;/p".to_vec()]);
     }

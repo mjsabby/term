@@ -29,7 +29,9 @@ impl DynamicResolver {
     /// Load an initial cert+key pair from disk and wrap it.
     pub fn load(cert_path: &Path, key_path: &Path) -> Result<Arc<Self>> {
         let ck = load_certified_key(cert_path, key_path)?;
-        Ok(Arc::new(Self { inner: RwLock::new(ck) }))
+        Ok(Arc::new(Self {
+            inner: RwLock::new(ck),
+        }))
     }
 
     pub fn replace(&self, ck: Arc<CertifiedKey>) {
@@ -49,16 +51,19 @@ impl ResolvesServerCert for DynamicResolver {
 
 /// Parse a PEM cert chain + PEM private key from disk into a CertifiedKey.
 pub fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
-    let cert_bytes = std::fs::read(cert_path)
-        .with_context(|| format!("read {}", cert_path.display()))?;
-    let key_bytes = std::fs::read(key_path)
-        .with_context(|| format!("read {}", key_path.display()))?;
+    let cert_bytes =
+        std::fs::read(cert_path).with_context(|| format!("read {}", cert_path.display()))?;
+    let key_bytes =
+        std::fs::read(key_path).with_context(|| format!("read {}", key_path.display()))?;
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("parse certs from {}", cert_path.display()))?;
     if certs.is_empty() {
-        return Err(anyhow!("no PEM certificates found in {}", cert_path.display()));
+        return Err(anyhow!(
+            "no PEM certificates found in {}",
+            cert_path.display()
+        ));
     }
 
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())

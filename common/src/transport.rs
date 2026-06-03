@@ -27,9 +27,7 @@ use crate::frame::{Frame, FrameError, HEADER_LEN};
 /// EOF / peer close. The `u64` is the number of wire bytes the frame
 /// occupied (header + payload), used for the hub's per-agent metrics.
 pub trait FrameRecv {
-    fn recv(
-        &mut self,
-    ) -> impl Future<Output = Result<Option<(Frame, u64)>, FrameError>> + Send;
+    fn recv(&mut self) -> impl Future<Output = Result<Option<(Frame, u64)>, FrameError>> + Send;
 }
 
 /// Writes already-encoded frame bytes to a transport.
@@ -58,7 +56,10 @@ impl<R: AsyncRead + Unpin + Send> FrameRecv for ByteStreamRecv<R> {
         let (ty, len) = Frame::validate_header(stream_id, ty_byte, len)?;
         let mut payload = vec![0u8; len as usize];
         if len > 0 {
-            self.0.read_exact(&mut payload).await.map_err(FrameError::Io)?;
+            self.0
+                .read_exact(&mut payload)
+                .await
+                .map_err(FrameError::Io)?;
         }
         let total = HEADER_LEN as u64 + len as u64;
         Frame::from_payload(stream_id, ty, payload).map(|f| Some((f, total)))

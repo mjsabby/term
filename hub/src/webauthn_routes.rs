@@ -90,7 +90,10 @@ pub async fn register_start(
         challenge_b64u: challenge.to_b64url(),
     };
     let envelope = SignedEnvelope::sign(inner, &state.secret).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("sign envelope: {e:?}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("sign envelope: {e:?}"),
+        )
     })?;
     Ok(Json(RegisterStartResp {
         ccr,
@@ -111,7 +114,10 @@ pub async fn login_start(
     State(state): State<AppState>,
 ) -> Result<Json<LoginStartResp>, (StatusCode, String)> {
     let store = CredentialStore::load(&state.cfg.data_dir).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("load credentials.json: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("load credentials.json: {e}"),
+        )
     })?;
     if store.credentials.is_empty() {
         return Err((
@@ -122,7 +128,10 @@ pub async fn login_start(
     let mut allowed_ids = Vec::with_capacity(store.credentials.len());
     for c in &store.credentials {
         allowed_ids.push(c.credential_id().map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("decode credential id: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("decode credential id: {e}"),
+            )
         })?);
     }
     let challenge = Challenge::random();
@@ -175,7 +184,10 @@ pub async fn login_finish(
     // Reading credentials.json on every login is fine — it's tiny and
     // sits in the page cache.
     let store = CredentialStore::load(&state.cfg.data_dir).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("load credentials.json: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("load credentials.json: {e}"),
+        )
     })?;
 
     // We need to keep the cred lookup simple: copy the 65-byte SEC1
@@ -200,15 +212,14 @@ pub async fn login_finish(
         &state.cfg.rp_id,
         &state.cfg.origin(),
         lookup,
-    ).map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
+    )
+    .map_err(|e| (StatusCode::UNAUTHORIZED, format!("auth failed: {e}")))?;
 
     // Persist updated credential counter if it advanced.
     if auth.sign_count_advanced {
-        if let Err(e) = persist_counter_update(
-            &state,
-            &auth.credential_id,
-            auth.new_sign_count,
-        ).await {
+        if let Err(e) =
+            persist_counter_update(&state, &auth.credential_id, auth.new_sign_count).await
+        {
             // Don't fail the login — counter persistence is best-effort
             // and re-derivable on the next successful auth.
             warn!(error = ?e, "failed to persist counter update");

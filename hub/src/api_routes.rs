@@ -49,7 +49,9 @@ pub struct ModeResp {
 /// listener). The SPA hits this once on load to learn whether it
 /// should display the login screen or jump straight to the app.
 pub async fn mode(Extension(mode): Extension<ListenerMode>) -> Json<ModeResp> {
-    Json(ModeResp { no_auth: mode.no_auth })
+    Json(ModeResp {
+        no_auth: mode.no_auth,
+    })
 }
 
 /// `GET /api/machines/:id/sessions` — ask `<id>`'s agent for its live
@@ -62,11 +64,11 @@ pub async fn list_sessions(
 ) -> axum::response::Response {
     let link = match state.agents.lock().await.get(&machine_id).cloned() {
         Some(l) => l,
-        None    => return (StatusCode::SERVICE_UNAVAILABLE, "agent not connected").into_response(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "agent not connected").into_response(),
     };
     match link.list_sessions().await {
         Ok(sessions) => Json(SessionInfoEnvelope { sessions }).into_response(),
-        Err(e)       => {
+        Err(e) => {
             tracing::warn!(machine = %machine_id, error = %e, "list_sessions RPC failed");
             (StatusCode::GATEWAY_TIMEOUT, format!("{e}")).into_response()
         }
@@ -88,11 +90,11 @@ pub async fn kill_session(
 ) -> axum::response::Response {
     let link = match state.agents.lock().await.get(&machine_id).cloned() {
         Some(l) => l,
-        None    => return (StatusCode::SERVICE_UNAVAILABLE, "agent not connected").into_response(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "agent not connected").into_response(),
     };
     match link.kill_session(&session_id).await {
         Ok(killed) => Json(KillResp { killed }).into_response(),
-        Err(e)     => {
+        Err(e) => {
             tracing::warn!(machine = %machine_id, session = %session_id,
                            error = %e, "kill_session RPC failed");
             (StatusCode::GATEWAY_TIMEOUT, format!("{e}")).into_response()

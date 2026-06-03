@@ -30,11 +30,7 @@ pub async fn handler(uri: Uri) -> Response {
 
     if let Some(file) = Assets::get(&candidate) {
         let mime = file.metadata.mimetype();
-        return (
-            [(header::CONTENT_TYPE, mime)],
-            file.data.into_owned(),
-        )
-            .into_response();
+        return ([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response();
     }
     StatusCode::NOT_FOUND.into_response()
 }

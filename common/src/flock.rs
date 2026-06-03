@@ -34,7 +34,8 @@ impl FileLock {
     pub fn acquire_exclusive(path: &Path) -> io::Result<Self> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)] opts.mode(0o600);
+        #[cfg(unix)]
+        opts.mode(0o600);
         let f = opts.open(path)?;
         Self::lock(&f)?;
         Ok(Self { f })
@@ -45,7 +46,9 @@ impl FileLock {
         let fd = f.as_raw_fd();
         // SAFETY: fd is borrowed from `f` and is valid for this call.
         let r = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if r != 0 { return Err(io::Error::last_os_error()); }
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 
@@ -62,7 +65,9 @@ impl FileLock {
                 &mut overlapped,
             )
         };
-        if r == 0 { return Err(io::Error::last_os_error()); }
+        if r == 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 }
@@ -72,7 +77,9 @@ impl Drop for FileLock {
         #[cfg(unix)]
         {
             // SAFETY: fd is owned by self.f.
-            unsafe { libc::flock(self.f.as_raw_fd(), libc::LOCK_UN); }
+            unsafe {
+                libc::flock(self.f.as_raw_fd(), libc::LOCK_UN);
+            }
         }
         #[cfg(windows)]
         {
@@ -95,11 +102,11 @@ impl Drop for FileLock {
 #[cfg(windows)]
 #[repr(C)]
 struct Overlapped {
-    internal:      usize,
+    internal: usize,
     internal_high: usize,
-    offset:        u32,
-    offset_high:   u32,
-    h_event:       *mut core::ffi::c_void,
+    offset: u32,
+    offset_high: u32,
+    h_event: *mut core::ffi::c_void,
 }
 
 #[cfg(windows)]

@@ -63,7 +63,9 @@ impl AppState {
 
 impl std::ops::Deref for AppState {
     type Target = AppStateInner;
-    fn deref(&self) -> &AppStateInner { &self.0 }
+    fn deref(&self) -> &AppStateInner {
+        &self.0
+    }
 }
 
 /// Remove expired entries from a `HashMap<K, V>` based on a closure that

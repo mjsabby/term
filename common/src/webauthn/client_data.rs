@@ -62,23 +62,36 @@ pub fn validate(
         .map_err(|e| ClientDataError::Json(e.to_string()))?;
     let obj = v.as_object().ok_or(ClientDataError::NotObject)?;
 
-    let ty = obj.get("type").ok_or(ClientDataError::MissingField("type"))?
-        .as_str().ok_or(ClientDataError::NotString("type"))?;
+    let ty = obj
+        .get("type")
+        .ok_or(ClientDataError::MissingField("type"))?
+        .as_str()
+        .ok_or(ClientDataError::NotString("type"))?;
     if ty != expected_type {
         return Err(ClientDataError::WrongType {
-            expected: if expected_type == TYPE_CREATE { "webauthn.create" } else { "webauthn.get" },
+            expected: if expected_type == TYPE_CREATE {
+                "webauthn.create"
+            } else {
+                "webauthn.get"
+            },
             got: ty.to_owned(),
         });
     }
 
-    let chal = obj.get("challenge").ok_or(ClientDataError::MissingField("challenge"))?
-        .as_str().ok_or(ClientDataError::NotString("challenge"))?;
+    let chal = obj
+        .get("challenge")
+        .ok_or(ClientDataError::MissingField("challenge"))?
+        .as_str()
+        .ok_or(ClientDataError::NotString("challenge"))?;
     if !constant_time_eq(chal.as_bytes(), expected_challenge_b64u.as_bytes()) {
         return Err(ClientDataError::ChallengeMismatch);
     }
 
-    let origin = obj.get("origin").ok_or(ClientDataError::MissingField("origin"))?
-        .as_str().ok_or(ClientDataError::NotString("origin"))?;
+    let origin = obj
+        .get("origin")
+        .ok_or(ClientDataError::MissingField("origin"))?
+        .as_str()
+        .ok_or(ClientDataError::NotString("origin"))?;
     if origin != expected_origin {
         return Err(ClientDataError::OriginMismatch {
             expected: expected_origin.to_owned(),
@@ -92,7 +105,9 @@ pub fn validate(
 /// derive bytes via timing. Bytes vs bytes only — we already restricted
 /// to base64url strings so length is itself well-known.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
+    if a.len() != b.len() {
+        return false;
+    }
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
@@ -106,7 +121,8 @@ mod tests {
 
     #[test]
     fn accepts_minimum_create() {
-        let body = br#"{"type":"webauthn.create","challenge":"abc123","origin":"https://example.com"}"#;
+        let body =
+            br#"{"type":"webauthn.create","challenge":"abc123","origin":"https://example.com"}"#;
         validate(body, TYPE_CREATE, "abc123", "https://example.com").unwrap();
     }
 

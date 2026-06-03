@@ -71,7 +71,10 @@ fn main() -> ExitCode {
     // agent generates it from URL_SAFE_NO_PAD); refuse to emit if a
     // user has tampered with their own env, since otherwise we'd
     // potentially write something that breaks OSC framing.
-    if !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+    if !token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         eprintln!("term-dl: TERM_DL_TOKEN contains unexpected characters; refusing");
         return ExitCode::from(78); // EX_CONFIG
     }

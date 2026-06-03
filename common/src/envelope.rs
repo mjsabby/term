@@ -44,7 +44,8 @@ pub struct EnvelopeInner {
 
 impl EnvelopeInner {
     pub fn challenge(&self) -> Result<Challenge, EnvelopeError> {
-        Challenge::from_b64url(&self.challenge_b64u).map_err(|e| EnvelopeError::Decode(e.to_string()))
+        Challenge::from_b64url(&self.challenge_b64u)
+            .map_err(|e| EnvelopeError::Decode(e.to_string()))
     }
 }
 

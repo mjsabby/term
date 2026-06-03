@@ -40,13 +40,19 @@ pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -
     let secure = match url.scheme() {
         "wss" => true,
         "ws" => false,
-        other => return Err(anyhow!("unsupported hub url scheme {other:?} (want ws/wss)")),
+        other => {
+            return Err(anyhow!(
+                "unsupported hub url scheme {other:?} (want ws/wss)"
+            ))
+        }
     };
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("hub url {} has no host", cfg.hub))?
         .to_string();
-    let port = url.port_or_known_default().unwrap_or(if secure { 443 } else { 80 });
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if secure { 443 } else { 80 });
 
     // Build the WS upgrade request (Host/Upgrade/Sec-WebSocket-* are
     // filled in by `into_client_request`) and attach the perimeter token
@@ -212,7 +218,10 @@ mod tests {
     use super::*;
 
     fn unix_now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     /// Build a structurally-valid JWT (`header.payload.sig`) whose payload
@@ -287,10 +296,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("term-tok-opaque-{}.jwt", std::process::id()));
         std::fs::write(&path, "opaque-token-v1").unwrap();
         let cfg = test_cfg(Some(path.to_string_lossy().into_owned()));
-        assert_eq!(current_token(&cfg, path.to_str().unwrap()).unwrap(), "opaque-token-v1");
+        assert_eq!(
+            current_token(&cfg, path.to_str().unwrap()).unwrap(),
+            "opaque-token-v1"
+        );
         // Expiry unknown -> nothing cached, so a rotated file is picked up.
         std::fs::write(&path, "opaque-token-v2").unwrap();
-        assert_eq!(current_token(&cfg, path.to_str().unwrap()).unwrap(), "opaque-token-v2");
+        assert_eq!(
+            current_token(&cfg, path.to_str().unwrap()).unwrap(),
+            "opaque-token-v2"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

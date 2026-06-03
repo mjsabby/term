@@ -34,8 +34,8 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -45,8 +45,8 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::{info, warn};
 
 use term_common::frame::{
-    DOWNLOAD_STATUS_CANCEL, DOWNLOAD_STATUS_OK, MAX_PASTE_CHUNK_BYTES,
-    MAX_PASTE_TOTAL_BYTES, CONTROLLER_NONE_STREAM_ID,
+    CONTROLLER_NONE_STREAM_ID, DOWNLOAD_STATUS_CANCEL, DOWNLOAD_STATUS_OK, MAX_PASTE_CHUNK_BYTES,
+    MAX_PASTE_TOTAL_BYTES,
 };
 use term_common::osc::OscScanner;
 
@@ -63,7 +63,7 @@ pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const BROADCAST_CAP: usize = 1024;
 
 pub type SessionId = String;
-pub type StreamId  = u32;
+pub type StreamId = u32;
 
 /// One event broadcast from a Session to every attached stream.
 #[derive(Clone)]
@@ -75,7 +75,11 @@ pub enum SessionEvent {
     /// currently controls.
     ControllerChanged { controller: StreamId },
     /// Begin a download (agent → browser). Same on all attached streams.
-    DownloadBegin { id: u32, total_size: u64, name: String },
+    DownloadBegin {
+        id: u32,
+        total_size: u64,
+        name: String,
+    },
     /// One chunk of a download. `bytes` is Arc'd so the broadcast
     /// doesn't deep-copy the payload per subscriber.
     DownloadChunk { id: u32, bytes: Arc<Vec<u8>> },
@@ -97,7 +101,10 @@ impl ByteRing {
         // Pre-allocate a sane lower bound (1 MiB if cap >= 1 MiB) so
         // we don't realloc on every push during steady-state.
         let prealloc = cap.min(1024 * 1024);
-        ByteRing { buf: VecDeque::with_capacity(prealloc), cap }
+        ByteRing {
+            buf: VecDeque::with_capacity(prealloc),
+            cap,
+        }
     }
 
     pub fn extend(&mut self, bytes: &[u8]) {
@@ -115,25 +122,27 @@ impl ByteRing {
     }
 
     #[allow(dead_code)]
-    pub fn len(&self) -> usize { self.buf.len() }
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
 }
 
 pub struct Session {
-    pub id:           SessionId,
+    pub id: SessionId,
     #[allow(dead_code)]
-    pub created_at:   Instant,
+    pub created_at: Instant,
     /// Per-session unguessable token. Set as `TERM_DL_TOKEN` in the
     /// spawned shell's env; `term-dl` echoes it in every download OSC.
     /// Without this, any PTY output containing
     /// `ESC ] 5111 ; dl ; <path> BEL` would trigger a download —
     /// `cat /etc/motd` on a hostile host could exfiltrate files.
-    pub dl_token:     String,
+    pub dl_token: String,
     /// How to inject pasted file paths into the shell when a paste
     /// completes. Derived from the configured `shell` at spawn time.
-    pub paste_style:  PasteStyle,
-    broadcast_tx:     broadcast::Sender<SessionEvent>,
-    pty:              crate::pty::AsyncPty,
-    inner:            Mutex<SessionInner>,
+    pub paste_style: PasteStyle,
+    broadcast_tx: broadcast::Sender<SessionEvent>,
+    pty: crate::pty::AsyncPty,
+    inner: Mutex<SessionInner>,
     next_download_id: AtomicU32,
 }
 
@@ -155,12 +164,10 @@ impl PasteStyle {
     /// Derive a paste style from the configured `shell` knob (raw
     /// argv string from `agent.toml`).
     pub fn from_shell(shell: &str) -> Self {
-        let prog = std::path::Path::new(
-            shell.split_whitespace().next().unwrap_or(""),
-        )
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+        let prog = std::path::Path::new(shell.split_whitespace().next().unwrap_or(""))
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         // cmd.exe (with or without .exe suffix, case-insensitive
         // because Windows file system is mostly case-insensitive).
         if prog.eq_ignore_ascii_case("cmd.exe") || prog.eq_ignore_ascii_case("cmd") {
@@ -172,15 +179,15 @@ impl PasteStyle {
 }
 
 struct SessionInner {
-    controller:       Option<StreamId>,
+    controller: Option<StreamId>,
     /// Current PTY geometry (== controller's last-reported size).
-    last_size:        (u16, u16),
+    last_size: (u16, u16),
     /// Stream_id → last-reported geometry. Honored only when this
     /// stream is the controller.
-    attached:         HashMap<StreamId, (u16, u16)>,
-    scrollback:       ByteRing,
+    attached: HashMap<StreamId, (u16, u16)>,
+    scrollback: ByteRing,
     last_attached_at: Instant,
-    exited:           bool,
+    exited: bool,
 }
 
 /// Result of an attach: the broadcast subscription, the scrollback to
@@ -188,8 +195,8 @@ struct SessionInner {
 /// the controller (so the per-stream task can immediately forward a
 /// `ControllerChanged(self_sid)` to its browser).
 pub struct AttachResult {
-    pub event_rx:        broadcast::Receiver<SessionEvent>,
-    pub scrollback:      Vec<u8>,
+    pub event_rx: broadcast::Receiver<SessionEvent>,
+    pub scrollback: Vec<u8>,
     pub became_controller: bool,
     pub current_controller: Option<StreamId>,
 }
@@ -223,11 +230,11 @@ impl Session {
         // locale. Same env we used to pass to tmux. Plus the
         // per-session download token (see Session::dl_token).
         let env: Vec<(&str, &str)> = vec![
-            ("TERM",           "xterm-256color"),
-            ("COLORTERM",      "truecolor"),
-            ("LANG",           "C.UTF-8"),
-            ("LC_ALL",         "C.UTF-8"),
-            ("TERM_DL_TOKEN",  dl_token.as_str()),
+            ("TERM", "xterm-256color"),
+            ("COLORTERM", "truecolor"),
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("TERM_DL_TOKEN", dl_token.as_str()),
         ];
         let pty = crate::pty::AsyncPty::spawn(&program, &args, &env, rows, cols)
             .with_context(|| format!("spawn {program}"))?;
@@ -235,20 +242,20 @@ impl Session {
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAP);
 
         let session = Arc::new(Session {
-            id:               id.clone(),
-            created_at:       Instant::now(),
+            id: id.clone(),
+            created_at: Instant::now(),
             dl_token,
-            paste_style:      PasteStyle::from_shell(shell),
-            broadcast_tx:     tx.clone(),
+            paste_style: PasteStyle::from_shell(shell),
+            broadcast_tx: tx.clone(),
             pty,
             next_download_id: AtomicU32::new(1),
-            inner:            Mutex::new(SessionInner {
-                controller:       None,
-                last_size:        initial_size,
-                attached:         HashMap::new(),
-                scrollback:       ByteRing::new(scrollback_cap),
+            inner: Mutex::new(SessionInner {
+                controller: None,
+                last_size: initial_size,
+                attached: HashMap::new(),
+                scrollback: ByteRing::new(scrollback_cap),
                 last_attached_at: Instant::now(),
-                exited:           false,
+                exited: false,
             }),
         });
 
@@ -266,13 +273,20 @@ impl Session {
                 };
                 let buf = match chunk {
                     Some(b) => b,
-                    None    => break, // shell exited / bridge closed
+                    None => break, // shell exited / bridge closed
                 };
                 let (fwd, captured) = osc.feed(&buf);
                 if !fwd.is_empty() {
                     let chunk = Arc::new(fwd);
-                    session_for_reader.inner.lock().await.scrollback.extend(&chunk);
-                    let _ = session_for_reader.broadcast_tx.send(SessionEvent::Data(chunk));
+                    session_for_reader
+                        .inner
+                        .lock()
+                        .await
+                        .scrollback
+                        .extend(&chunk);
+                    let _ = session_for_reader
+                        .broadcast_tx
+                        .send(SessionEvent::Data(chunk));
                 }
                 for payload in captured {
                     match parse_dl_osc(&payload) {
@@ -302,12 +316,10 @@ impl Session {
                                         "download failed",
                                     );
                                     let _ = s.broadcast_tx.send(SessionEvent::DownloadEnd {
-                                        id, status: DOWNLOAD_STATUS_CANCEL,
+                                        id,
+                                        status: DOWNLOAD_STATUS_CANCEL,
                                     });
-                                    let line = format!(
-                                        "\rterm-dl: {}: {e}\r\n",
-                                        path.display(),
-                                    );
+                                    let line = format!("\rterm-dl: {}: {e}\r\n", path.display(),);
                                     let _ = s.write_internal(line.as_bytes()).await;
                                 }
                             });
@@ -349,11 +361,17 @@ impl Session {
 
         if became_controller {
             let _ = self.pty.resize(size.0, size.1).await;
-            let _ = self.broadcast_tx.send(
-                SessionEvent::ControllerChanged { controller: sid });
+            let _ = self
+                .broadcast_tx
+                .send(SessionEvent::ControllerChanged { controller: sid });
         }
 
-        AttachResult { event_rx, scrollback, became_controller, current_controller }
+        AttachResult {
+            event_rx,
+            scrollback,
+            became_controller,
+            current_controller,
+        }
     }
 
     pub async fn detach(self: &Arc<Self>, sid: StreamId) {
@@ -362,12 +380,15 @@ impl Session {
             inner.attached.remove(&sid);
             inner.last_attached_at = Instant::now();
             let was = inner.controller == Some(sid);
-            if was { inner.controller = None; }
+            if was {
+                inner.controller = None;
+            }
             was
         };
         if was_controller {
-            let _ = self.broadcast_tx.send(
-                SessionEvent::ControllerChanged { controller: CONTROLLER_NONE_STREAM_ID });
+            let _ = self.broadcast_tx.send(SessionEvent::ControllerChanged {
+                controller: CONTROLLER_NONE_STREAM_ID,
+            });
         }
     }
 
@@ -375,7 +396,9 @@ impl Session {
     /// input is silently dropped (the browser UI gates it too, this is
     /// belt-and-braces).
     pub async fn write_input_from(&self, sid: StreamId, bytes: &[u8]) {
-        if self.inner.lock().await.controller != Some(sid) { return; }
+        if self.inner.lock().await.controller != Some(sid) {
+            return;
+        }
         let _ = self.pty.in_tx.send(bytes.to_vec()).await;
     }
 
@@ -386,19 +409,21 @@ impl Session {
         // The bridge channel only fails when the writer thread has
         // exited, which only happens after the shell process dies.
         // Map that to a BrokenPipe so callers can log gracefully.
-        self.pty.in_tx.send(bytes.to_vec())
-            .await
-            .map_err(|_| std::io::Error::new(
+        self.pty.in_tx.send(bytes.to_vec()).await.map_err(|_| {
+            std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "pty writer thread has exited",
-            ))
+            )
+        })
     }
 
     pub async fn resize_for(&self, sid: StreamId, rows: u16, cols: u16) {
         let do_resize = {
             let mut inner = self.inner.lock().await;
             inner.attached.insert(sid, (rows, cols));
-            if inner.controller != Some(sid) { false } else {
+            if inner.controller != Some(sid) {
+                false
+            } else {
                 inner.last_size = (rows, cols);
                 true
             }
@@ -413,15 +438,21 @@ impl Session {
     pub async fn acquire_control(self: &Arc<Self>, sid: StreamId) -> bool {
         let (success, new_size) = {
             let mut inner = self.inner.lock().await;
-            if !inner.attached.contains_key(&sid) { return false; }
-            if inner.controller.is_some() { return false; }
+            if !inner.attached.contains_key(&sid) {
+                return false;
+            }
+            if inner.controller.is_some() {
+                return false;
+            }
             inner.controller = Some(sid);
             let size = *inner.attached.get(&sid).unwrap();
             inner.last_size = size;
             (true, size)
         };
         let _ = self.pty.resize(new_size.0, new_size.1).await;
-        let _ = self.broadcast_tx.send(SessionEvent::ControllerChanged { controller: sid });
+        let _ = self
+            .broadcast_tx
+            .send(SessionEvent::ControllerChanged { controller: sid });
         success
     }
 
@@ -429,12 +460,15 @@ impl Session {
     pub async fn release_control(self: &Arc<Self>, sid: StreamId) -> bool {
         let success = {
             let mut inner = self.inner.lock().await;
-            if inner.controller != Some(sid) { return false; }
+            if inner.controller != Some(sid) {
+                return false;
+            }
             inner.controller = None;
             true
         };
-        let _ = self.broadcast_tx.send(
-            SessionEvent::ControllerChanged { controller: CONTROLLER_NONE_STREAM_ID });
+        let _ = self.broadcast_tx.send(SessionEvent::ControllerChanged {
+            controller: CONTROLLER_NONE_STREAM_ID,
+        });
         success
     }
 
@@ -443,14 +477,18 @@ impl Session {
     pub async fn take_control(self: &Arc<Self>, sid: StreamId) -> bool {
         let new_size = {
             let mut inner = self.inner.lock().await;
-            if !inner.attached.contains_key(&sid) { return false; }
+            if !inner.attached.contains_key(&sid) {
+                return false;
+            }
             inner.controller = Some(sid);
             let size = *inner.attached.get(&sid).unwrap();
             inner.last_size = size;
             size
         };
         let _ = self.pty.resize(new_size.0, new_size.1).await;
-        let _ = self.broadcast_tx.send(SessionEvent::ControllerChanged { controller: sid });
+        let _ = self
+            .broadcast_tx
+            .send(SessionEvent::ControllerChanged { controller: sid });
         true
     }
 
@@ -515,11 +553,13 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
 fn parse_dl_osc(payload: &[u8]) -> Option<(String, PathBuf)> {
     let semi1 = payload.iter().position(|&b| b == b';')?;
     let cmd = &payload[..semi1];
-    if cmd != b"dl" { return None; }
+    if cmd != b"dl" {
+        return None;
+    }
     let rest = &payload[semi1 + 1..];
     let semi2 = rest.iter().position(|&b| b == b';')?;
     let token = std::str::from_utf8(&rest[..semi2]).ok()?.to_owned();
-    let path  = std::str::from_utf8(&rest[semi2 + 1..]).ok()?;
+    let path = std::str::from_utf8(&rest[semi2 + 1..]).ok()?;
     Some((token, PathBuf::from(path)))
 }
 
@@ -572,7 +612,10 @@ impl SessionManager {
             );
         }
         let s = Session::spawn(
-            id.clone(), &self.shell, initial_size, self.limits.scrollback_cap_bytes,
+            id.clone(),
+            &self.shell,
+            initial_size,
+            self.limits.scrollback_cap_bytes,
         )?;
         map.insert(id.clone(), s.clone());
         info!(session = %id, shell = %self.shell, "session spawned");
@@ -598,7 +641,7 @@ impl SessionManager {
             let mut drops = Vec::new();
             for (id, s) in map.iter() {
                 let inner = s.inner.lock().await;
-                let idle  = now.saturating_duration_since(inner.last_attached_at);
+                let idle = now.saturating_duration_since(inner.last_attached_at);
                 let detached = inner.attached.is_empty();
                 let exited = inner.exited;
                 if exited || (detached && idle > self.limits.idle_ttl) {
@@ -607,7 +650,9 @@ impl SessionManager {
             }
             drops
         };
-        if to_drop.is_empty() { return; }
+        if to_drop.is_empty() {
+            return;
+        }
         let mut map = self.map.lock().await;
         for (id, s) in to_drop {
             map.remove(&id);
@@ -623,9 +668,12 @@ impl SessionManager {
 /// All attached browser streams receive the events; each forwards to
 /// its own writer with its own sid. Bails on file errors.
 async fn stream_download(session: &Arc<Session>, id: u32, path: &Path) -> Result<()> {
-    let mut file = fs::File::open(path).await
+    let mut file = fs::File::open(path)
+        .await
         .with_context(|| format!("opening {}", path.display()))?;
-    let meta = file.metadata().await
+    let meta = file
+        .metadata()
+        .await
         .with_context(|| format!("stat {}", path.display()))?;
     if !meta.is_file() {
         bail!("{} is not a regular file", path.display());
@@ -634,7 +682,8 @@ async fn stream_download(session: &Arc<Session>, id: u32, path: &Path) -> Result
     if total_size > MAX_PASTE_TOTAL_BYTES {
         bail!("{} is {} bytes; over 4 GiB cap", path.display(), total_size);
     }
-    let name = path.file_name()
+    let name = path
+        .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("download")
         .to_owned();
@@ -643,30 +692,43 @@ async fn stream_download(session: &Arc<Session>, id: u32, path: &Path) -> Result
           "download begin");
 
     let _ = session.broadcast_tx.send(SessionEvent::DownloadBegin {
-        id, total_size, name: name.clone(),
+        id,
+        total_size,
+        name: name.clone(),
     });
 
     let mut buf = vec![0u8; MAX_PASTE_CHUNK_BYTES as usize];
     let mut sent: u64 = 0;
     loop {
-        let n = file.read(&mut buf).await
+        let n = file
+            .read(&mut buf)
+            .await
             .with_context(|| format!("reading {}", path.display()))?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         if sent.saturating_add(n as u64) > total_size {
-            bail!("{} grew during read: declared {total_size}, would send {}",
-                path.display(), sent + n as u64);
+            bail!(
+                "{} grew during read: declared {total_size}, would send {}",
+                path.display(),
+                sent + n as u64
+            );
         }
         sent = sent.saturating_add(n as u64);
         let _ = session.broadcast_tx.send(SessionEvent::DownloadChunk {
-            id, bytes: Arc::new(buf[..n].to_vec()),
+            id,
+            bytes: Arc::new(buf[..n].to_vec()),
         });
     }
     if sent != total_size {
-        bail!("{} shrank during read: declared {total_size}, sent {sent}",
-            path.display());
+        bail!(
+            "{} shrank during read: declared {total_size}, sent {sent}",
+            path.display()
+        );
     }
     let _ = session.broadcast_tx.send(SessionEvent::DownloadEnd {
-        id, status: DOWNLOAD_STATUS_OK,
+        id,
+        status: DOWNLOAD_STATUS_OK,
     });
     info!(session = %session.id, download_id = id, "download committed");
     Ok(())
@@ -720,7 +782,10 @@ mod tests {
         assert_eq!(PasteStyle::from_shell("cmd.exe"), PasteStyle::Plain);
         assert_eq!(PasteStyle::from_shell("CMD.EXE"), PasteStyle::Plain);
         // Plain `cmd` (no .exe) — rare but accept it.
-        assert_eq!(PasteStyle::from_shell("cmd /K prompt $G"), PasteStyle::Plain);
+        assert_eq!(
+            PasteStyle::from_shell("cmd /K prompt $G"),
+            PasteStyle::Plain
+        );
         // Full Windows path. `Path::file_name` only treats `\` as a
         // separator on Windows, so the basename-extraction assertion
         // only makes sense there.
@@ -741,7 +806,7 @@ mod tests {
             "powershell.exe -NoLogo",
             "pwsh.exe",
             r"C:\Program Files\PowerShell\7\pwsh.exe",
-            "",  // empty falls through to bracketed too
+            "", // empty falls through to bracketed too
         ] {
             assert_eq!(
                 PasteStyle::from_shell(s),
@@ -765,17 +830,22 @@ mod tests {
         dur: Duration,
         is_done: F,
     ) -> Vec<SessionEvent>
-    where F: Fn(&[SessionEvent]) -> bool
+    where
+        F: Fn(&[SessionEvent]) -> bool,
     {
         let deadline = Instant::now() + dur;
         let mut out = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() { break; }
+            if remaining.is_zero() {
+                break;
+            }
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(ev)) => {
                     out.push(ev);
-                    if is_done(&out) { break; }
+                    if is_done(&out) {
+                        break;
+                    }
                 }
                 Ok(Err(_)) | Err(_) => break,
             }
@@ -788,7 +858,9 @@ mod tests {
     fn collect_data(evs: &[SessionEvent]) -> Vec<u8> {
         let mut out = Vec::new();
         for ev in evs {
-            if let SessionEvent::Data(b) = ev { out.extend_from_slice(b); }
+            if let SessionEvent::Data(b) = ev {
+                out.extend_from_slice(b);
+            }
         }
         out
     }
@@ -797,13 +869,16 @@ mod tests {
     #[tokio::test]
     async fn session_attach_writes_and_reads() {
         // Spawn a real shell, write a command, read echo back.
-        if !std::path::Path::new("/bin/sh").exists() { return; }
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
         let session = Session::spawn(
             "test-attach".into(),
             "/bin/sh",
             (24, 80),
             crate::session::DEFAULT_SCROLLBACK_CAP_BYTES,
-        ).expect("spawn");
+        )
+        .expect("spawn");
 
         let mut attach = session.attach(1, (24, 80)).await;
         assert!(attach.became_controller);
@@ -814,7 +889,8 @@ mod tests {
         let evs = drain_events_until(&mut attach.event_rx, Duration::from_secs(3), |evs| {
             let data = collect_data(evs);
             data.windows(11).any(|w| w == b"TEST_NEEDLE")
-        }).await;
+        })
+        .await;
         let data = collect_data(&evs);
         assert!(
             data.windows(11).any(|w| w == b"TEST_NEEDLE"),
@@ -831,13 +907,13 @@ mod tests {
     async fn session_dl_token_mismatch_silently_drops() {
         // Spawn a real shell. Inject an OSC with the wrong dl token
         // and confirm no DownloadBegin event fires.
-        if !std::path::Path::new("/bin/sh").exists() { return; }
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
 
         // Create a real file the download could read if it weren't
         // gated by the token.
-        let tmp = std::env::temp_dir().join(format!(
-            "term-agent-dl-test-{}", std::process::id(),
-        ));
+        let tmp = std::env::temp_dir().join(format!("term-agent-dl-test-{}", std::process::id(),));
         std::fs::write(&tmp, b"file-contents-for-test").expect("write tmp");
 
         let session = Session::spawn(
@@ -845,7 +921,8 @@ mod tests {
             "/bin/sh",
             (24, 80),
             crate::session::DEFAULT_SCROLLBACK_CAP_BYTES,
-        ).expect("spawn");
+        )
+        .expect("spawn");
         let mut attach = session.attach(1, (24, 80)).await;
 
         // Print the OSC with a WRONG token via printf inside the shell.
@@ -858,9 +935,13 @@ mod tests {
         session.write_input_from(1, osc_wrong.as_bytes()).await;
 
         let evs = drain_events_until(&mut attach.event_rx, Duration::from_secs(2), |evs| {
-            evs.iter().any(|e| matches!(e, SessionEvent::DownloadBegin { .. }))
-        }).await;
-        let saw_dl = evs.iter().any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
+            evs.iter()
+                .any(|e| matches!(e, SessionEvent::DownloadBegin { .. }))
+        })
+        .await;
+        let saw_dl = evs
+            .iter()
+            .any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
         assert!(!saw_dl, "wrong-token OSC must NOT trigger a DownloadBegin");
 
         // Now do it with the CORRECT token: capture the session's
@@ -874,14 +955,23 @@ mod tests {
         session.write_input_from(1, osc_ok.as_bytes()).await;
 
         let evs2 = drain_events_until(&mut attach.event_rx, Duration::from_secs(2), |evs| {
-            evs.iter().any(|e| matches!(e, SessionEvent::DownloadEnd { .. }))
-        }).await;
-        let saw_begin = evs2.iter().any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
-        let saw_end   = evs2.iter().any(|e| matches!(
-            e, SessionEvent::DownloadEnd { status, .. } if *status == DOWNLOAD_STATUS_OK
-        ));
+            evs.iter()
+                .any(|e| matches!(e, SessionEvent::DownloadEnd { .. }))
+        })
+        .await;
+        let saw_begin = evs2
+            .iter()
+            .any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
+        let saw_end = evs2.iter().any(|e| {
+            matches!(
+                e, SessionEvent::DownloadEnd { status, .. } if *status == DOWNLOAD_STATUS_OK
+            )
+        });
         assert!(saw_begin, "correct-token OSC must trigger DownloadBegin");
-        assert!(saw_end,   "correct-token OSC must finish with DownloadEnd(OK)");
+        assert!(
+            saw_end,
+            "correct-token OSC must finish with DownloadEnd(OK)"
+        );
 
         let _ = std::fs::remove_file(&tmp);
         session.write_input_from(1, b"exit\n").await;
@@ -890,27 +980,34 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn session_reattach_replays_scrollback() {
-        if !std::path::Path::new("/bin/sh").exists() { return; }
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
         let session = Session::spawn(
             "test-replay".into(),
             "/bin/sh",
             (24, 80),
             crate::session::DEFAULT_SCROLLBACK_CAP_BYTES,
-        ).expect("spawn");
+        )
+        .expect("spawn");
 
         // First attach + write something the shell echoes.
         let mut attach1 = session.attach(1, (24, 80)).await;
         session.write_input_from(1, b"echo REPLAY_NEEDLE\n").await;
         let _ = drain_events_until(&mut attach1.event_rx, Duration::from_secs(2), |evs| {
             collect_data(evs).windows(13).any(|w| w == b"REPLAY_NEEDLE")
-        }).await;
+        })
+        .await;
         // Detach the first stream.
         session.detach(1).await;
 
         // Second attach: scrollback should contain REPLAY_NEEDLE.
         let attach2 = session.attach(2, (24, 80)).await;
         assert!(
-            attach2.scrollback.windows(13).any(|w| w == b"REPLAY_NEEDLE"),
+            attach2
+                .scrollback
+                .windows(13)
+                .any(|w| w == b"REPLAY_NEEDLE"),
             "expected scrollback to replay the prior echo; got {:?}",
             String::from_utf8_lossy(&attach2.scrollback),
         );
@@ -941,7 +1038,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn session_manager_enforces_max_sessions() {
-        if !std::path::Path::new("/bin/sh").exists() { return; }
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
         let limits = crate::Limits {
             scrollback_cap_bytes: 64 * 1024,
             idle_ttl: Duration::from_secs(3600),
@@ -952,23 +1051,35 @@ mod tests {
         let mgr = SessionManager::new("/bin/sh".into(), limits);
 
         // Two distinct sessions spawn fine.
-        let s1 = mgr.lookup_or_spawn(&"cap-a".into(), (24, 80)).await.expect("first spawn");
-        let _s2 = mgr.lookup_or_spawn(&"cap-b".into(), (24, 80)).await.expect("second spawn");
+        let s1 = mgr
+            .lookup_or_spawn(&"cap-a".into(), (24, 80))
+            .await
+            .expect("first spawn");
+        let _s2 = mgr
+            .lookup_or_spawn(&"cap-b".into(), (24, 80))
+            .await
+            .expect("second spawn");
 
         // A third *new* session id is refused at the cap.
         assert!(
-            mgr.lookup_or_spawn(&"cap-c".into(), (24, 80)).await.is_err(),
+            mgr.lookup_or_spawn(&"cap-c".into(), (24, 80))
+                .await
+                .is_err(),
             "third distinct session must be rejected at the cap",
         );
 
         // Re-attaching to an existing session is still allowed at the cap.
-        let s1_again = mgr.lookup_or_spawn(&"cap-a".into(), (24, 80)).await
+        let s1_again = mgr
+            .lookup_or_spawn(&"cap-a".into(), (24, 80))
+            .await
             .expect("reattach to existing session must succeed at the cap");
         assert!(Arc::ptr_eq(&s1, &s1_again));
 
         // Cleanup.
         for id in ["cap-a", "cap-b"] {
-            if let Some(s) = mgr.remove(&id.into()).await { s.kill().await; }
+            if let Some(s) = mgr.remove(&id.into()).await {
+                s.kill().await;
+            }
         }
     }
 }

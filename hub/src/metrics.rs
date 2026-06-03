@@ -18,10 +18,7 @@ use crate::state::AppState;
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-pub async fn handler(
-    State(state): State<AppState>,
-    _auth: Bearer,
-) -> Response {
+pub async fn handler(State(state): State<AppState>, _auth: Bearer) -> Response {
     let mut s = String::with_capacity(2048);
 
     // ---- uptime ----
@@ -34,7 +31,9 @@ pub async fn handler(
     let active_sessions = state.sessions.lock().await.len();
     s.push_str("# HELP term_hub_active_bearer_tokens Currently-valid bearer tokens (= logged-in browser sessions).\n");
     s.push_str("# TYPE term_hub_active_bearer_tokens gauge\n");
-    s.push_str(&format!("term_hub_active_bearer_tokens {active_sessions}\n\n"));
+    s.push_str(&format!(
+        "term_hub_active_bearer_tokens {active_sessions}\n\n"
+    ));
 
     let pending_logins = state.pending_logins.lock().await.len();
     s.push_str("# HELP term_hub_pending_logins WebAuthn login ceremonies in flight.\n");
@@ -42,8 +41,7 @@ pub async fn handler(
     s.push_str(&format!("term_hub_pending_logins {pending_logins}\n\n"));
 
     // ---- per-agent gauges + counters ----
-    let agents: Vec<_> = state.agents.lock().await
-        .values().cloned().collect();
+    let agents: Vec<_> = state.agents.lock().await.values().cloned().collect();
     let n_agents = agents.len();
 
     s.push_str("# HELP term_hub_active_agents Currently-connected agents.\n");
@@ -57,7 +55,9 @@ pub async fn handler(
         for link in &agents {
             let n = link.stream_count().await;
             let mid = escape_label(&link.machine_id);
-            s.push_str(&format!("term_hub_active_streams{{machine_id=\"{mid}\"}} {n}\n"));
+            s.push_str(&format!(
+                "term_hub_active_streams{{machine_id=\"{mid}\"}} {n}\n"
+            ));
         }
         s.push('\n');
 
@@ -67,7 +67,9 @@ pub async fn handler(
         for link in &agents {
             let v = link.bytes_in.load(Ordering::Relaxed);
             let mid = escape_label(&link.machine_id);
-            s.push_str(&format!("term_hub_agent_bytes_in_total{{machine_id=\"{mid}\"}} {v}\n"));
+            s.push_str(&format!(
+                "term_hub_agent_bytes_in_total{{machine_id=\"{mid}\"}} {v}\n"
+            ));
         }
         s.push('\n');
 
@@ -76,26 +78,36 @@ pub async fn handler(
         for link in &agents {
             let v = link.bytes_out.load(Ordering::Relaxed);
             let mid = escape_label(&link.machine_id);
-            s.push_str(&format!("term_hub_agent_bytes_out_total{{machine_id=\"{mid}\"}} {v}\n"));
+            s.push_str(&format!(
+                "term_hub_agent_bytes_out_total{{machine_id=\"{mid}\"}} {v}\n"
+            ));
         }
         s.push('\n');
 
         // Frame counts.
-        s.push_str("# HELP term_hub_agent_frames_in_total Total wire frames received from each agent.\n");
+        s.push_str(
+            "# HELP term_hub_agent_frames_in_total Total wire frames received from each agent.\n",
+        );
         s.push_str("# TYPE term_hub_agent_frames_in_total counter\n");
         for link in &agents {
             let v = link.frames_in.load(Ordering::Relaxed);
             let mid = escape_label(&link.machine_id);
-            s.push_str(&format!("term_hub_agent_frames_in_total{{machine_id=\"{mid}\"}} {v}\n"));
+            s.push_str(&format!(
+                "term_hub_agent_frames_in_total{{machine_id=\"{mid}\"}} {v}\n"
+            ));
         }
         s.push('\n');
 
-        s.push_str("# HELP term_hub_agent_frames_out_total Total wire frames queued toward each agent.\n");
+        s.push_str(
+            "# HELP term_hub_agent_frames_out_total Total wire frames queued toward each agent.\n",
+        );
         s.push_str("# TYPE term_hub_agent_frames_out_total counter\n");
         for link in &agents {
             let v = link.frames_out.load(Ordering::Relaxed);
             let mid = escape_label(&link.machine_id);
-            s.push_str(&format!("term_hub_agent_frames_out_total{{machine_id=\"{mid}\"}} {v}\n"));
+            s.push_str(&format!(
+                "term_hub_agent_frames_out_total{{machine_id=\"{mid}\"}} {v}\n"
+            ));
         }
         s.push('\n');
     }
@@ -116,9 +128,9 @@ fn escape_label(s: &str) -> String {
     for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
-            _    => out.push(c),
+            _ => out.push(c),
         }
     }
     out
