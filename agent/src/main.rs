@@ -839,14 +839,17 @@ async fn run_session_stream(
 }
 
 /// Send a frame to the hub via the priority writer, routing by frame
-/// type: bulk DownloadChunks go through `lo` so they never queue ahead
-/// of interactive PTY Data or control frames. Everything else (Data,
-/// Resize, Open, Close, Ping, Pong, Hello, PasteReject, DownloadBegin,
-/// DownloadEnd) takes the `hi` channel. Mirrors the hub-side dispatch
-/// in `hub/src/agent_link.rs::AgentLink::send_frame`.
+/// type: bulk Paste and Download frames go through `lo` so they never
+/// queue ahead of interactive PTY Data or control frames. All three of
+/// {DownloadBegin, DownloadChunk, DownloadEnd} **must** ride the same
+/// half — otherwise a small DownloadEnd in `hi` could overtake a
+/// 1 MiB DownloadChunk waiting in `lo` and arrive at the browser
+/// before the chunk it terminates, which the browser then drops as a
+/// truncated transfer. Same reasoning for PasteBegin/Chunk/End on the
+/// hub→agent side. Mirrors `hub/src/agent_link.rs::AgentLink::send_frame`.
 async fn send_frame_to_hub(w: &PrioTx, f: Frame) -> Result<(), Vec<u8>> {
     let half = match f.ty() {
-        FrameType::DownloadChunk => &w.lo,
+        FrameType::DownloadBegin | FrameType::DownloadChunk | FrameType::DownloadEnd => &w.lo,
         _ => &w.hi,
     };
     half.send(f.encode()).await
@@ -1440,4 +1443,57 @@ async fn open_paste_file(name: &str) -> Result<(fs::File, PathBuf)> {
         .await
         .with_context(|| format!("creating fallback paste file {}", path.display()))?;
     Ok((f, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use term_common::frame::{Body, Frame};
+    use term_common::prio::prio_channel;
+
+    /// Regression: DownloadBegin / DownloadChunk / DownloadEnd for one
+    /// download must arrive at the hub in send order. Routing them
+    /// through different priority halves (Begin/End → hi, Chunk → lo)
+    /// causes the writer's biased select to drain End from hi before
+    /// the still-queued Chunk in lo, so the browser sees Begin → End
+    /// (with zero bytes received) and drops the entire download as
+    /// truncated, then receives the Chunk for an already-finalized
+    /// download_id and silently discards it. See agent/src/main.rs::
+    /// send_frame_to_hub for the routing dispatch this test guards.
+    #[tokio::test]
+    async fn download_frames_preserve_order() {
+        let (tx, mut rx) = prio_channel(1024 * 1024, 16 * 1024 * 1024);
+
+        // A realistic large download: one ~200 KiB chunk in between a
+        // small Begin and a 5-byte End. Without the same-half routing
+        // fix this orders as Begin → End → Chunk.
+        send_frame_to_hub(&tx, Frame::download_begin(1, 42, 200_000, "x.bin".into()))
+            .await
+            .unwrap();
+        send_frame_to_hub(&tx, Frame::download_chunk(1, 42, vec![0u8; 200_000]))
+            .await
+            .unwrap();
+        send_frame_to_hub(&tx, Frame::download_end(1, 42, 0))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut types = Vec::new();
+        while let Some(bytes) = rx.recv().await {
+            // Re-parse so we don't depend on encode internals.
+            let stream_id = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let ty_byte = bytes[4];
+            let len = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+            let (ty, _) = Frame::validate_header(stream_id, ty_byte, len).unwrap();
+            let payload = bytes[term_common::frame::HEADER_LEN..].to_vec();
+            let f = Frame::from_payload(stream_id, ty, payload).unwrap();
+            types.push(match f.body {
+                Body::DownloadBegin { .. } => "Begin",
+                Body::DownloadChunk { .. } => "Chunk",
+                Body::DownloadEnd { .. } => "End",
+                _ => "Other",
+            });
+        }
+        assert_eq!(types, vec!["Begin", "Chunk", "End"]);
+    }
 }
