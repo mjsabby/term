@@ -140,11 +140,28 @@ jobs:
             fi
             # Detached debug info: .pdb on Windows MSVC, .dwp on Linux
             # (produced by `split-debuginfo = "packed"` in [profile.release]).
-            dbg="target/${TGT}/release/${b}${DBG_EXT}"
+            #
+            # Cargo names the uplifted MSVC .pdb after the *crate name*
+            # (hyphens replaced with underscores), because the .pdb path
+            # is recorded inside the .exe at link time and rustc passes
+            # the underscored crate name there. .dwp files instead match
+            # the binary name verbatim. See `should_replace_hyphens` in
+            # cargo's core/compiler/build_context/target_info.rs.
+            case "${DBG_EXT}" in
+              .pdb) dbg_base="${b//-/_}" ;;
+              *)    dbg_base="${b}" ;;
+            esac
+            dbg="target/${TGT}/release/${dbg_base}${DBG_EXT}"
             if [[ -f "$dbg" ]]; then
-              cp "$dbg" "artifacts/${b}${DBG_EXT}"
+              # Preserve the original basename so the .exe/.pdb pair
+              # still auto-locates the symbols when extracted side by
+              # side (rustc embeds /PDBALTPATH:%_PDB%, which is just
+              # the basename of the linker's PDB output).
+              cp "$dbg" "artifacts/${dbg_base}${DBG_EXT}"
             else
               echo "MISSING debug file: $dbg" >&2
+              echo "Available ${DBG_EXT} files in release dir:" >&2
+              ls -la "target/${TGT}/release/"*"${DBG_EXT}" >&2 || true
               exit 1
             fi
           done
