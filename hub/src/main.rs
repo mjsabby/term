@@ -18,6 +18,7 @@ mod agent_link;
 mod agent_ws;
 mod api_routes;
 mod auth;
+mod client_verifier;
 mod config;
 mod edge;
 mod listener_mode;
@@ -30,6 +31,7 @@ mod webauthn_routes;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::routing::{get, post};
@@ -37,12 +39,14 @@ use axum::{Extension, Router};
 use rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use config::{HubConfig, NoAuthConfig, TlsMode};
 use listener_mode::ListenerMode;
 use state::AppState;
+use term_common::agent_pki::ca as agent_ca;
 use term_common::creds;
+use term_common::issued_certs::IssuedCertStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,6 +67,7 @@ async fn main() -> Result<()> {
     // Default rustls crypto provider (rustls 0.23+ requires installation).
     let _ = rustls_acme::futures_rustls::rustls::crypto::aws_lc_rs::default_provider()
         .install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // Sanity-check the origin URL while we're here — it must be a valid
     // URL that the browser will use as its `Origin:` header. We don't
@@ -92,8 +97,27 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Load the agent CA cert (never the key — the hub service user
+    // doesn't need it). Refuse to start without one so an operator
+    // who skipped `hub-admin init-ca` notices immediately rather
+    // than discovering it via failing agent handshakes.
+    let agent_ca_cert = agent_ca::load_ca_cert(&cfg.data_dir).context("load agent CA cert")?;
+    let issued_certs = IssuedCertStore::load(&cfg.data_dir).context("load issued-certs.json")?;
+    info!(
+        ca_cert = %agent_ca::agent_ca_cert_path(&cfg.data_dir).display(),
+        issued_certs = issued_certs.certs.len(),
+        "agent mTLS material loaded"
+    );
+
     let cfg = Arc::new(cfg);
-    let app_state = AppState::new(cfg.clone(), secret);
+    let app_state = AppState::new(cfg.clone(), secret, agent_ca_cert, issued_certs);
+
+    // Background: re-read issued-certs.json every 30s so hub-admin
+    // revoke-cert / issue-cert take effect without a hub restart.
+    spawn_issued_certs_reloader(app_state.clone());
+    // Background: evict stale entries from the WS-perimeter replay
+    // cache every 60s.
+    spawn_ws_replay_gc(app_state.clone());
 
     let authed_mode = ListenerMode {
         no_auth: false,
@@ -261,11 +285,97 @@ fn load_config() -> Result<HubConfig> {
         if !config::is_valid_machine_id(&m.id) {
             anyhow::bail!("invalid machine id {:?} ([A-Za-z0-9_-]{{1,32}})", m.id);
         }
-        if m.psk.trim().is_empty() {
-            anyhow::bail!("machine {} missing psk", m.id);
-        }
     }
     Ok(cfg)
+}
+
+/// Background task: every 30s, re-read `issued-certs.json` from disk
+/// and atomically swap it into `app_state`. `hub-admin issue-cert` /
+/// `revoke-cert` mutations land in the hub within at most one reload
+/// cycle, without needing a hub restart.
+fn spawn_issued_certs_reloader(state: AppState) {
+    let path = term_common::issued_certs::issued_certs_path(&state.cfg.data_dir);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            match IssuedCertStore::load(&state.cfg.data_dir) {
+                Ok(new_store) => {
+                    let new_len = new_store.certs.len();
+                    let old_len = {
+                        let mut w = state.issued_certs.write().unwrap();
+                        let old = w.certs.len();
+                        *w = new_store;
+                        old
+                    };
+                    if new_len != old_len {
+                        info!(
+                            path = %path.display(),
+                            old_count = old_len,
+                            new_count = new_len,
+                            "issued-certs.json reloaded"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    error = ?e,
+                    path = %path.display(),
+                    "failed to reload issued-certs.json; keeping previous snapshot"
+                ),
+            }
+        }
+    });
+}
+
+/// Background task: every 60s, evict stale entries from the WS-
+/// perimeter replay cache so it doesn't grow without bound. The cache
+/// is small (bounded by handshake rate × WS_REPLAY_TTL) so this is
+/// cheap.
+fn spawn_ws_replay_gc(state: AppState) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            state.gc_ws_replay().await;
+        }
+    });
+}
+
+/// Build a `rustls::ServerConfig` for the agent listener, layering the
+/// custom client-cert verifier on top of the server's cert resolver.
+/// Used by all three TLS modes so the verifier wiring is identical.
+fn build_agent_server_config(
+    state: &AppState,
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let verifier = client_verifier::AgentClientVerifier::new(
+        state.agent_ca.as_ref().clone(),
+        state.issued_certs.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("build AgentClientVerifier: {e:?}"))?;
+    Ok(Arc::new(
+        rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(resolver),
+    ))
+}
+
+/// Spawn the agent listener using `server_config` (which MUST already
+/// have the AgentClientVerifier installed). Logs and exits the task on
+/// error.
+fn spawn_agent_listener(
+    state: AppState,
+    cfg: Arc<HubConfig>,
+    server_config: Arc<rustls::ServerConfig>,
+) {
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    tokio::spawn(async move {
+        if let Err(e) = agent_link::run_acceptor(state, cfg, tls_acceptor).await {
+            error!("agent acceptor exited: {e:?}");
+        }
+    });
 }
 
 async fn serve_acme(
@@ -298,18 +408,20 @@ async fn serve_acme(
         }
     });
 
-    // Agent listener over TLS using the same rustls config.
-    let tls_acceptor = tokio_rustls::TlsAcceptor::from(rustls_config);
-    let agent_state = state.clone();
-    let agent_cfg = cfg.clone();
-    tokio::spawn(async move {
-        if let Err(e) = agent_link::run_acceptor(agent_state, agent_cfg, Some(tls_acceptor)).await {
-            error!("agent acceptor exited: {e:?}");
-        }
-    });
+    // Agent listener: separate `ServerConfig` wrapping our custom
+    // ClientCertVerifier, but reusing the ACME resolver from the
+    // browser config so cert renewals propagate to both endpoints.
+    // The rustls-acme `default_rustls_config()` ServerConfig wraps a
+    // `ResolvesServerCertAcme`; we plug it into a fresh ServerConfig
+    // so we can call `with_client_cert_verifier`. (The original
+    // ServerConfig is `with_no_client_auth()` and can't be mutated.)
+    let acme_resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        rustls_config.cert_resolver.clone();
+    let agent_server_config = build_agent_server_config(&state, acme_resolver)?;
+    spawn_agent_listener(state.clone(), cfg.clone(), agent_server_config);
 
     info!(
-        "term-hub listening on https://{} (acme {} for {}); agent_bind={}",
+        "term-hub listening on https://{} (acme {} for {}); agent_bind={} (mTLS)",
         browser_bind,
         if cfg.acme_production {
             "PROD"
@@ -333,18 +445,17 @@ async fn serve_plain(
     app: Router,
 ) -> Result<()> {
     info!(
-        "term-hub listening on http://{} (TLS OFF; assume reverse proxy at https://{}); agent_bind={}",
+        "term-hub listening on http://{} (TLS OFF; assume reverse proxy at https://{}); \
+         agent_bind={} NOT spawned — agents must use wss://…/agent/connect through a perimeter",
         browser_bind, cfg.domain, cfg.agent_bind,
     );
 
-    // Agent listener over plain TCP.
-    let agent_state = state.clone();
-    let agent_cfg = cfg.clone();
-    tokio::spawn(async move {
-        if let Err(e) = agent_link::run_acceptor(agent_state, agent_cfg, None).await {
-            error!("agent acceptor exited: {e:?}");
-        }
-    });
+    // Intentionally NO raw agent listener: the cert-based auth scheme
+    // requires TLS, and `tls = "off"` is reserved for deployments
+    // where TLS is terminated by an upstream reverse proxy. Such
+    // deployments accept agents on `/agent/connect` via the WSS-
+    // perimeter path (auth via X-Agent-Cert + X-Agent-Auth headers).
+    let _ = (&state, &cfg);
 
     let listener = tokio::net::TcpListener::bind(browser_bind)
         .await
@@ -360,8 +471,6 @@ async fn serve_files(
     browser_bind: SocketAddr,
     app: Router,
 ) -> Result<()> {
-    use std::time::Duration;
-
     let cert_path = cfg
         .cert_path
         .clone()
@@ -387,25 +496,23 @@ async fn serve_files(
         period.as_secs()
     );
 
-    let server_config = Arc::new(
+    // Browser server config: no client auth (browsers don't have
+    // client certs). Agent server config: same resolver, but with
+    // our AgentClientVerifier.
+    let browser_server_config = Arc::new(
         rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_cert_resolver(resolver),
+            .with_cert_resolver(resolver.clone()),
     );
+    let agent_server_config: Arc<rustls::ServerConfig> = build_agent_server_config(
+        &state,
+        resolver.clone() as Arc<dyn rustls::server::ResolvesServerCert>,
+    )?;
+    spawn_agent_listener(state.clone(), cfg.clone(), agent_server_config);
 
-    // Agent listener over TLS using the same dynamic-cert config.
-    let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config.clone());
-    let agent_state = state.clone();
-    let agent_cfg = cfg.clone();
-    tokio::spawn(async move {
-        if let Err(e) = agent_link::run_acceptor(agent_state, agent_cfg, Some(tls_acceptor)).await {
-            error!("agent acceptor exited: {e:?}");
-        }
-    });
-
-    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(server_config);
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(browser_server_config);
     info!(
-        "term-hub listening on https://{} (tls=files); agent_bind={}",
+        "term-hub listening on https://{} (tls=files); agent_bind={} (mTLS)",
         browser_bind, cfg.agent_bind
     );
     axum_server::bind_rustls(browser_bind, rustls_config)
@@ -455,7 +562,26 @@ mod tests {
     }
 
     fn state() -> AppState {
-        AppState::new(std::sync::Arc::new(test_cfg()), [0u8; 32])
+        // Manufacture a fresh CA + empty issued-certs store on-the-fly
+        // for the test fixture so we don't need filesystem state.
+        use term_common::issued_certs::IssuedCertStore;
+        let dir = std::env::temp_dir().join(format!(
+            "term-router-tests-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let signer = term_common::agent_pki::ca::init_ca(&dir, 365).unwrap();
+        AppState::new(
+            std::sync::Arc::new(test_cfg()),
+            [0u8; 32],
+            signer.cert_der.clone(),
+            IssuedCertStore::default(),
+        )
     }
 
     fn authed_router() -> axum::Router {

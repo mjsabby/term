@@ -11,7 +11,7 @@
 //!
 //! Both ends (`hub::agent_link::handle_connection` and
 //! `agent::run_session`) are generic over [`FrameRecv`] + [`FrameSend`]
-//! so the mux / PSK / session / RPC logic is identical regardless of
+//! so the mux / session / RPC logic is identical regardless of
 //! transport. This module provides the trait definitions plus the
 //! byte-stream implementations; the WebSocket implementations live in
 //! the hub and agent crates (each over its own `Message` type).

@@ -70,18 +70,22 @@ agent_bind     = "[::]:7700"
 ## # reach the perimeter open a terminal.
 ## public_origin = "https://abc-8080.usw2.devtunnels.ms"
 
-## One block per machine. The hub *waits* for an agent presenting this
-## machine id + matching PSK to connect; until then the machine's tabs
-## get a "service unavailable" response.
+## One block per machine. The hub *waits* for an agent presenting a
+## client cert (raw mTLS path) or X-Agent-Cert/X-Agent-Auth headers
+## (WSS-perimeter path) that matches this `id`; until then the
+## machine's tabs get a "service unavailable" response.
 ##
-## Generate a fresh 32-byte PSK with:
-##   head -c 32 /dev/urandom | base64
+## Provisioning (Phase 4.6, cert-based auth):
+##   1. One-time:    sudo hub-admin init-ca
+##   2. Per machine: sudo hub-admin issue-cert --id alpha --label alpha.lan
+##                   then scp <id>.crt + <id>.key to the agent host.
+##
+## No secret material lives in hub.toml — only the public id + label.
+## Revoke a cert with: sudo hub-admin revoke-cert --serial <hex>
 [[machines]]
 id    = "alpha"
 label = "alpha.lan"
-psk   = "REPLACE_WITH_BASE64_32_RANDOM"
 
 [[machines]]
 id    = "wsl-laptop"
 label = "WSL laptop"
-psk   = "REPLACE_WITH_ANOTHER_BASE64_32_RANDOM"

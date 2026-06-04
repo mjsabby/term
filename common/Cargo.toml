@@ -7,22 +7,33 @@ publish.workspace = true
 
 [features]
 ## `hub` pulls in p256 (ECDSA verify) + serde_json for our hand-rolled
-## webauthn + credential-store + envelope code. Enabled by default so
-## hub + hub-admin keep working unchanged. The agent disables it with
-## `default-features = false` so it doesn't drag p256 into the
-## tiny Windows binary it doesn't need.
+## webauthn + credential-store + envelope code AND the agent-mTLS
+## helpers (CA load/issue, peer-cert SAN extraction, WS auth verify).
+## Enabled by default so hub + hub-admin keep working unchanged. The
+## agent disables it with `default-features = false` so it doesn't drag
+## p256 / rcgen / x509-parser into the tiny Windows binary it doesn't
+## need.
 default = ["hub"]
-hub = ["dep:p256"]
+hub = ["dep:p256", "dep:rcgen", "dep:x509-parser", "dep:anyhow", "dep:time"]
 
 [dependencies]
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
+anyhow      = { workspace = true, optional = true }
 base64      = { workspace = true }
 hmac        = { workspace = true }
 sha2        = { workspace = true }
 p256        = { workspace = true, optional = true }
 tokio       = { workspace = true }
+rustls-pemfile   = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen       = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true }
+time        = { version = "0.3", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+ring        = "0.17"
 
 ## `libc` is only used by the Unix-only `flock` module. Keeping it
 ## target-gated avoids a useless Windows dependency.

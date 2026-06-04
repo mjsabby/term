@@ -54,8 +54,9 @@ param(
   [string] $NoAuthOrigin = "",
 
   ## Comma-separated list of "id:label" pairs to seed [[machines]].
-  ## PSKs are auto-generated (32 random bytes, base64) and printed at
-  ## the end so you can paste them into install-agent on each agent.
+  ## Each entry produces a [[machines]] row in hub.toml with id +
+  ## label only (no secret material). Per-machine certs are issued
+  ## out-of-band via `hub-admin issue-cert --id <id>`.
   [string[]] $Machines = @(),
 
   ## Run the hub task as this account. Default SYSTEM (no logon needed,
@@ -70,7 +71,12 @@ param(
   [string] $TaskName  = "term-hub",
 
   [switch] $NoEnable,
-  [switch] $Force
+  [switch] $Force,
+  ## Tear down any previous term-hub install first. Preserves
+  ## $DataDir (CA + credentials + issued-certs + ACME cache) unless
+  ## -PurgeData is also passed. The scheduled task is always removed.
+  [switch] $Clean,
+  [switch] $PurgeData
 )
 
 $ErrorActionPreference = "Stop"
@@ -106,6 +112,24 @@ if (-not (Test-Path $AdminExe)) { Die "missing $AdminExe (run: scripts\build.ps1
 # Determine the SYSTEM SID once for ACL setup.
 $systemSid = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-18"
 $adminsSid = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-32-544"
+
+# ------- optional clean install -------------------------------------
+
+if ($Clean) {
+  $uninstall = Join-Path $PSScriptRoot "uninstall-hub.ps1"
+  if (-not (Test-Path $uninstall)) {
+    Die "-Clean requested but $uninstall not found"
+  }
+  Note "-Clean: invoking $uninstall first"
+  $unArgs = @{
+    BinDir     = $BinDir
+    DataDir    = $DataDir
+    TaskName   = $TaskName
+    KeepBinary = $true
+  }
+  if ($PurgeData) { $unArgs.PurgeData = $true }
+  & $uninstall @unArgs
+}
 
 # ------- binaries ---------------------------------------------------
 
@@ -143,7 +167,8 @@ if ((Test-Path $ConfigPath) -and -not $Force) {
   Note "$ConfigPath exists; not overwriting (use -Force to replace)"
 } else {
   Note "writing $ConfigPath"
-  # Generate PSKs and build [[machines]] entries.
+  # Build [[machines]] entries (id + label only — Phase 4.6 mTLS
+  # auth means no secret material lives in hub.toml).
   $machineToml = ""
   foreach ($entry in $Machines) {
     if (-not $entry) { continue }
@@ -153,12 +178,8 @@ if ((Test-Path $ConfigPath) -and -not $Force) {
     if ($id -notmatch '^[A-Za-z0-9_-]{1,32}$') {
       Die "machine id $id must match [A-Za-z0-9_-]{1,32}"
     }
-    # 32 random bytes via RNGCryptoServiceProvider -> base64.
-    $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    $psk = [Convert]::ToBase64String($bytes)
-    $generatedMachines += [pscustomobject]@{ Id = $id; Label = $label; Psk = $psk }
-    $machineToml += "`r`n[[machines]]`r`nid = `"$id`"`r`nlabel = `"$label`"`r`npsk = `"$psk`"`r`n"
+    $generatedMachines += [pscustomobject]@{ Id = $id; Label = $label }
+    $machineToml += "`r`n[[machines]]`r`nid = `"$id`"`r`nlabel = `"$label`"`r`n"
   }
 
   $acmeLines = ""
@@ -265,14 +286,15 @@ Write-Host "  - config at:        $ConfigPath"
 Write-Host ""
 
 if ($generatedMachines.Count -gt 0) {
-  Write-Host "generated PSKs (one per --Machines entry). Save these now —"
-  Write-Host "they're only printed here, not stored anywhere readable."
+  Write-Host "machine entries written to hub.toml. To finish provisioning:"
+  Write-Host "  1. sudo hub-admin init-ca   (one-shot, creates the agent CA)"
+  Write-Host "  2. For each machine, issue a per-machine cert:"
   Write-Host ""
   foreach ($m in $generatedMachines) {
     Write-Host "  machine_id=$($m.Id)  label=$($m.Label)"
-    Write-Host "    psk=$($m.Psk)"
-    Write-Host "    install on the agent host:"
-    Write-Host "      .\scripts\install-agent.ps1 -Hub $Domain`:$(($AgentBind -split ':')[-1]) -MachineId $($m.Id) -Psk '$($m.Psk)'"
+    Write-Host "    hub-admin issue-cert --id $($m.Id) --label '$($m.Label)'"
+    Write-Host "    # copy $($m.Id).crt + $($m.Id).key to the agent host, then run:"
+    Write-Host "      .\scripts\install-agent.ps1 -Hub $Domain`:$(($AgentBind -split ':')[-1]) -Cert $($m.Id).crt -Key $($m.Id).key"
     Write-Host ""
   }
 }

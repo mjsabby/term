@@ -89,8 +89,13 @@ pub struct HubConfig {
     #[serde(default)]
     pub no_auth: Option<NoAuthConfig>,
 
-    /// Machines the hub knows about. Each entry produces a row in the UI.
-    /// Agents identify themselves by `id` + `psk` in the Hello frame.
+    /// Machines the hub knows about. Each entry produces a row in
+    /// the UI. Agents identify themselves by their TLS client cert
+    /// (raw transport) or by `X-Agent-Cert` + `X-Agent-Auth`
+    /// upgrade headers (WSS-perimeter transport); the cert's SAN URN
+    /// (`urn:term-agent:<machine_id>`) is matched against this `id`.
+    /// hub.toml carries no secret material — see
+    /// `hub-admin init-ca` + `hub-admin issue-cert`.
     #[serde(default)]
     pub machines: Vec<MachineConfig>,
 }
@@ -164,19 +169,13 @@ impl HubConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineConfig {
-    /// Short id used in URLs, in the URL fragment, and in the agent's
-    /// Hello frame. `[A-Za-z0-9_-]{1,32}`.
+    /// Short id used in URLs, in the URL fragment, and matched against
+    /// the agent cert's SAN URN. `[A-Za-z0-9_-]{1,32}`.
     pub id: String,
     /// Human-readable label shown in the sidebar.
     pub label: String,
-    /// Pre-shared key the agent must present in its Hello frame.
-    /// 32 random bytes, base64-encoded (44 chars with padding, 43
-    /// without). Generate per agent with:
-    ///   `head -c 32 /dev/urandom | base64`
-    /// Not serialised back out via the /api/machines response.
-    #[serde(skip_serializing)]
-    pub psk: String,
 }
 
 /// Validate that machine id matches `[A-Za-z0-9_-]{1,32}` so we can

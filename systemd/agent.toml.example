@@ -10,17 +10,24 @@
 hub         = "term.xyz.com:7700"
 # hub       = "wss://abc-8080.usw2.devtunnels.ms/agent/connect"
 
-## Must match a [[machines]] entry on the hub.
-machine_id  = "alpha"
+## Agent client cert + key. Issue with `sudo hub-admin issue-cert
+## --id <machine_id>` on the HUB host, then scp the produced
+## `<machine_id>.crt` + `<machine_id>.key` here. The machine_id is
+## bound by the cert's SAN URN — there's no `machine_id =` knob
+## anymore. Re-issue with --days N to control validity (default 365).
+cert_path   = "/etc/term-agent/agent.crt"
+key_path    = "/etc/term-agent/agent.key"
 
-## Pre-shared key, base64-encoded 32 random bytes. Must match the hub's
-## [[machines]] entry for `machine_id`. Generate on the hub host with:
-##   head -c 32 /dev/urandom | base64
-psk         = "MATCHING_BASE64_FROM_HUB"
+## Optional: PEM file containing the CA that signed the HUB's *server*
+## cert. Only needed when the hub uses `tls = "files"` with a private
+## / self-signed cert chain; for `tls = "acme"` (Let's Encrypt) the
+## default webpki-roots trust store is correct and this field can be
+## left commented.
+# hub_ca_path = "/etc/term-agent/hub-server-ca.pem"
 
-## TLS mode. Must match the hub's `tls` setting.
-##   "on"  — verify hub's cert against `server_name` (default: host of `hub`)
-##   "off" — plain TCP (dev only)
+## TLS mode. The cert-based scheme REQUIRES TLS to the hub (or wss://
+## to a TLS-terminating perimeter). "off" is accepted with a warning
+## but no raw transport will work.
 tls         = "on"
 
 ## Cert-verification target. Defaults to the host portion of `hub`.

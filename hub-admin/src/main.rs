@@ -1,21 +1,29 @@
 //! hub-admin
 //!
-//! Out-of-band passkey registration CLI. The operator pastes the base64
-//! blob produced by the registration page on the hub host:
+//! Out-of-band passkey registration CLI:
 //!
 //!     hub-admin add-passkey '<blob>'
 //!     hub-admin add-passkey -      # read blob from stdin
 //!
-//! Other subcommands:
+//! Agent mTLS provisioning (Phase 4.6):
 //!
-//!     hub-admin list
-//!     hub-admin remove <label-or-credential-id>
-//!     hub-admin secret-info
+//!     hub-admin init-ca                          # one-shot, creates the agent CA
+//!     hub-admin issue-cert --id alpha            # mint a per-machine cert
+//!     hub-admin list-certs
+//!     hub-admin revoke-cert --serial <hex>
+//!     hub-admin revoke-cert --id <machine_id>
+//!     hub-admin show-ca                          # print agent-ca.crt to stdout
+//!
+//! Misc:
+//!
+//!     hub-admin list                # list registered passkeys
+//!     hub-admin remove <label|id>   # remove a passkey
+//!     hub-admin secret-info         # show HMAC secret fingerprint
 //!
 //! Configuration: reads `TERM_HUB_CONFIG` (default `/etc/term-hub/hub.toml`)
 //! for `data_dir`, or `TERM_HUB_DATA_DIR` directly (overrides).
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,9 +32,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use serde::Deserialize;
 
+use term_common::agent_pki::ca::{self, DEFAULT_CA_DAYS, DEFAULT_LEAF_DAYS, agent_ca_cert_path};
 use term_common::creds::{self, CredentialStore, StoredCredential};
 use term_common::envelope::{self, PasteBlob};
 use term_common::flock::FileLock;
+use term_common::issued_certs::{IssuedCertEntry, IssuedCertStore, issued_certs_lock_path};
 use term_common::webauthn;
 
 const DEFAULT_HUB_CONFIG: &str = "/etc/term-hub/hub.toml";
@@ -75,6 +85,11 @@ fn run() -> Result<()> {
         "list" => cmd_list(),
         "remove" => cmd_remove(&args[1..]),
         "secret-info" => cmd_secret_info(),
+        "init-ca" => cmd_init_ca(&args[1..]),
+        "issue-cert" => cmd_issue_cert(&args[1..]),
+        "list-certs" => cmd_list_certs(),
+        "revoke-cert" => cmd_revoke_cert(&args[1..]),
+        "show-ca" => cmd_show_ca(),
         "help" | "-h" | "--help" => {
             usage();
             Ok(())
@@ -89,10 +104,19 @@ fn run() -> Result<()> {
 fn usage() {
     eprintln!(
         "usage:
-  hub-admin add-passkey <BLOB | ->        register a new credential
-  hub-admin list                          list registered credentials
-  hub-admin remove <LABEL_OR_CRED_ID>     remove a credential
+  hub-admin add-passkey <BLOB | ->        register a new passkey
+  hub-admin list                          list registered passkeys
+  hub-admin remove <LABEL_OR_CRED_ID>     remove a passkey
   hub-admin secret-info                   show HMAC secret fingerprint
+
+  hub-admin init-ca [--days N]            create the agent CA (one-shot)
+  hub-admin issue-cert --id ID [--label L] [--days N] [--out-dir DIR]
+                                          mint a per-machine cert
+  hub-admin list-certs                    list issued certs
+  hub-admin revoke-cert (--serial HEX | --id MACHINE_ID)
+                                          revoke matching certs
+  hub-admin show-ca                       print agent-ca.crt to stdout
+
   hub-admin help
 
 env:
@@ -203,6 +227,236 @@ fn cmd_secret_info() -> Result<()> {
     let fp = base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &h[..8]);
     println!("data_dir: {}", dir.display());
     println!("secret_fingerprint: {fp}");
+    Ok(())
+}
+
+fn cmd_init_ca(args: &[String]) -> Result<()> {
+    let mut days = DEFAULT_CA_DAYS;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--days" => {
+                days = next_arg(args, &mut i, "--days")?
+                    .parse()
+                    .context("--days")?;
+            }
+            other => bail!("unknown flag: {other}"),
+        }
+        i += 1;
+    }
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("create data_dir {}", dir.display()))?;
+    let ca = ca::init_ca(&dir, days).context("init CA")?;
+    println!(
+        "ok: created agent CA at {} ({} days, ECDSA-P256, {} bytes DER)",
+        agent_ca_cert_path(&dir).display(),
+        days,
+        ca.cert_der.as_ref().len(),
+    );
+    println!("  cert: {}", agent_ca_cert_path(&dir).display());
+    println!(
+        "  key:  {} (KEEP PRIVATE — only hub-admin needs read access)",
+        ca::agent_ca_key_path(&dir).display(),
+    );
+    Ok(())
+}
+
+fn cmd_issue_cert(args: &[String]) -> Result<()> {
+    let mut id: Option<String> = None;
+    let mut label: Option<String> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut days = DEFAULT_LEAF_DAYS;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--id" => id = Some(next_arg(args, &mut i, "--id")?.into()),
+            "--label" => label = Some(next_arg(args, &mut i, "--label")?.into()),
+            "--out-dir" => out_dir = Some(PathBuf::from(next_arg(args, &mut i, "--out-dir")?)),
+            "--days" => {
+                days = next_arg(args, &mut i, "--days")?
+                    .parse()
+                    .context("--days")?
+            }
+            other => bail!("unknown flag: {other}"),
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| anyhow!("--id is required"))?;
+    let dir = data_dir();
+    let out_dir = out_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or(PathBuf::from(".")));
+
+    let signer = ca::load_ca_signer(&dir).context("load CA (run `hub-admin init-ca` first?)")?;
+    let issued = ca::issue_machine_cert(&signer, &id, days).context("issue cert")?;
+
+    let cert_path = out_dir.join(format!("{id}.crt"));
+    let key_path = out_dir.join(format!("{id}.key"));
+    if cert_path.exists() {
+        bail!(
+            "{} already exists; refusing to overwrite",
+            cert_path.display()
+        );
+    }
+    if key_path.exists() {
+        bail!(
+            "{} already exists; refusing to overwrite",
+            key_path.display()
+        );
+    }
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("create out-dir {}", out_dir.display()))?;
+    write_with_mode(&cert_path, issued.cert_pem.as_bytes(), 0o644)?;
+    write_with_mode(&key_path, issued.key_pem.as_bytes(), 0o600)?;
+
+    // Track the issuance in issued-certs.json so the hub will allow
+    // this fingerprint at TLS-handshake time.
+    IssuedCertStore::ensure_lock_file(&dir).context("ensure issued-certs lock")?;
+    let _guard =
+        FileLock::acquire_exclusive(&issued_certs_lock_path(&dir)).context("flock issued-certs")?;
+    let mut store = IssuedCertStore::load(&dir).context("load issued-certs.json")?;
+    if store
+        .certs
+        .iter()
+        .any(|c| c.fingerprint == issued.fingerprint)
+    {
+        bail!(
+            "fingerprint {} already present in issued-certs.json",
+            issued.fingerprint
+        );
+    }
+    store.certs.push(IssuedCertEntry {
+        machine_id: id.clone(),
+        fingerprint: issued.fingerprint.clone(),
+        serial_hex: issued.serial_hex.clone(),
+        issued_at: iso8601_now(),
+        not_after_unix: issued.not_after_unix,
+        label,
+    });
+    store.save_atomic(&dir).context("save issued-certs.json")?;
+
+    println!("ok: issued cert for machine_id={id}");
+    println!("  cert:        {}", cert_path.display());
+    println!(
+        "  key:         {} (0600 — copy to the agent host)",
+        key_path.display()
+    );
+    println!("  fingerprint: {}", issued.fingerprint);
+    println!("  serial:      {}", issued.serial_hex);
+    println!(
+        "  not_after:   unix {} ({} days)",
+        issued.not_after_unix, days
+    );
+    println!();
+    println!("agent.toml snippet:");
+    println!();
+    println!("  hub        = \"<hub-host>:7700\"");
+    println!("  cert_path  = \"/etc/term-agent/agent.crt\"");
+    println!("  key_path   = \"/etc/term-agent/agent.key\"");
+    println!("  tls        = \"on\"");
+    Ok(())
+}
+
+fn cmd_list_certs() -> Result<()> {
+    let dir = data_dir();
+    let store = IssuedCertStore::load(&dir)?;
+    if store.certs.is_empty() {
+        println!("(no agent certs issued)");
+        return Ok(());
+    }
+    println!(
+        "{:<32}{:<24}{:<14}{:<64}",
+        "machine_id", "issued_at", "serial(8)", "fingerprint"
+    );
+    for c in &store.certs {
+        let serial_short: String = c.serial_hex.chars().take(12).collect();
+        println!(
+            "{:<32}{:<24}{:<14}{:<64}",
+            c.machine_id, c.issued_at, serial_short, c.fingerprint
+        );
+    }
+    Ok(())
+}
+
+fn cmd_revoke_cert(args: &[String]) -> Result<()> {
+    let mut serial: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--serial" => serial = Some(next_arg(args, &mut i, "--serial")?.into()),
+            "--id" => id = Some(next_arg(args, &mut i, "--id")?.into()),
+            other => bail!("unknown flag: {other}"),
+        }
+        i += 1;
+    }
+    if serial.is_none() && id.is_none() {
+        bail!("specify --serial <hex> or --id <machine_id>");
+    }
+
+    let dir = data_dir();
+    IssuedCertStore::ensure_lock_file(&dir).context("ensure issued-certs lock")?;
+    let _guard =
+        FileLock::acquire_exclusive(&issued_certs_lock_path(&dir)).context("flock issued-certs")?;
+    let mut store = IssuedCertStore::load(&dir).context("load issued-certs.json")?;
+
+    let removed = store.remove_where(|c| {
+        serial.as_deref().is_some_and(|s| c.serial_hex == s)
+            || id.as_deref().is_some_and(|m| c.machine_id == m)
+    });
+    if removed == 0 {
+        bail!("no matching cert in issued-certs.json");
+    }
+    store.save_atomic(&dir).context("save issued-certs.json")?;
+    println!(
+        "ok: removed {removed} cert entry(ies); hub will pick up the revocation on its next reload"
+    );
+    Ok(())
+}
+
+fn cmd_show_ca() -> Result<()> {
+    let dir = data_dir();
+    let path = agent_ca_cert_path(&dir);
+    let pem = std::fs::read_to_string(&path)
+        .with_context(|| format!("read {} (run `hub-admin init-ca` first?)", path.display()))?;
+    print!("{pem}");
+    Ok(())
+}
+
+fn next_arg<'a>(args: &'a [String], i: &mut usize, name: &str) -> Result<&'a str> {
+    *i += 1;
+    args.get(*i)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("{name} expects a value"))
+}
+
+fn write_with_mode(path: &std::path::Path, contents: &[u8], _mode: u32) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp")
+    ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(_mode)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

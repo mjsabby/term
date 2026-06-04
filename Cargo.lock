@@ -1645,6 +1645,7 @@ dependencies = [
  "pem",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -2113,7 +2114,9 @@ dependencies = [
  "futures-util",
  "libc",
  "portable-pty",
+ "ring",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "term-common",
@@ -2131,15 +2134,22 @@ dependencies = [
 name = "term-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "hmac 0.13.0",
  "libc",
  "p256",
+ "rcgen",
+ "ring",
+ "rustls-pemfile",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
+ "time",
  "tokio",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2158,10 +2168,13 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "rand 0.10.1",
+ "ring",
  "rust-embed",
  "rustls",
  "rustls-acme",
  "rustls-pemfile",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3020,6 +3033,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",
@@ -3036,9 +3050,9 @@ dependencies = [
 
 [[package]]
 name = "yoke"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",
