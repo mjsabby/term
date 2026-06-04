@@ -8,12 +8,14 @@ multiple browsers can attach to the same session, with one *controller*
 holding the input/resize lease and the rest as read-only viewers.
 
 ```
-Browser  --HTTPS/WSS-->  Hub  <==TLS+mux+PSK==  Agent  --PTY-->  tmux -- $SHELL
-       (WebAuthn, tabs)        ^                   ^
-                          accepts on          dials hub on
-                          agent_bind          agent_bind
-                          (reuses ACME        (verifies hub
-                           cert)               hostname)
+Browser  --HTTPS/WSS-->  Hub  <==mTLS+mux==  Agent  --PTY-->  $SHELL
+       (WebAuthn, tabs)        ^                ^
+                          accepts on       dials hub on
+                          agent_bind       agent_bind
+                          (reuses ACME     (verifies hub
+                           cert + agent     hostname,
+                           CA verifier)     presents
+                                            client cert)
 ```
 
 ## Crates
@@ -151,8 +153,14 @@ path(s) back into the PTY on completion.
 Hello payload (JSON):
 
 ```json
-{ "version": 1, "machine_id": "alpha", "psk_b64": "<base64-32>" }
+{ "version": 2 }
 ```
+
+The Hello frame is version-only as of `HELLO_VERSION = 2`. The agent's
+identity (`machine_id`) is bound at the transport layer — by the
+client cert's `urn:term-agent:<machine_id>` SAN URN on the raw mTLS
+path, or by the `X-Agent-Cert` + `X-Agent-Auth` upgrade headers on
+the WSS-perimeter path. v1 (PSK auth) is wire-incompatible.
 
 ## Authentication & trust
 
@@ -170,12 +178,39 @@ refresh discards it and forces re-auth. Sent via:
 
 **No cookies, no localStorage.** Tab layout lives in the URL fragment.
 
-**Agent ↔ Hub.** Per-machine PSK (32 random bytes, base64). The agent
-sends it in the Hello frame; the hub constant-time compares it against
-the `[[machines]]` config. Anyone with the PSK *and* network access to
-`agent_bind` can register as that machine, so treat PSKs as service
-credentials. The TLS layer encrypts the PSK in transit and verifies
-the agent is talking to the right hub.
+**Agent ↔ Hub.** Mutual TLS with a private per-deployment CA. The
+hub creates the CA explicitly via `hub-admin init-ca`; per-machine
+certs are minted with `hub-admin issue-cert --id <machine_id>` and
+signed by that CA. The agent presents its leaf cert during the TLS
+handshake; the hub verifies (a) the chain to its CA, (b) the
+fingerprint against an allow-list in `<data_dir>/issued-certs.json`,
+and (c) the SAN URN `urn:term-agent:<machine_id>` — all three live
+inside a custom `rustls::ClientCertVerifier`, so a mismatch tears
+down the TCP connection at the TLS-handshake layer before any
+application bytes flow.
+
+The hub never holds the CA's private key — `agent-ca.key` is owned
+0600 by whoever ran `init-ca` (typically root), so a hub-process
+compromise cannot mint new agent certs.
+
+Revoke a stolen cert with `hub-admin revoke-cert --serial <hex>`
+(or `--id <machine_id>` to revoke all certs for a machine). The hub
+reloads `issued-certs.json` every 30 seconds, so revocations take
+effect without a hub restart.
+
+When the agent dials the hub through a TLS-terminating perimeter
+(`wss://…/agent/connect` via a Microsoft Dev Tunnel, SSO reverse
+proxy, …) the hub can't see the client cert, so the agent attaches
+two HTTP upgrade headers carrying the equivalent assertion:
+
+- `X-Agent-Cert: <base64-no-pad of leaf cert DER>`
+- `X-Agent-Auth: <unix_secs>.<nonce_b64u>.<ECDSA-P256 sig>`
+
+The signature covers a domain-separated payload that includes the
+`Host:` header, so a tunnel-eavesdropper can't replay the assertion
+against a different hub. A `(fingerprint, nonce)` replay cache
+defeats replay against the same hub within the timestamp skew window
+(±5 minutes).
 
 ### Registration (out-of-band paste)
 
@@ -281,13 +316,20 @@ sudo ./scripts/install-hub.sh \
     --email  ops@xyz.com
 # (defaults to ACME staging; pass --prod once it works)
 
+# 2b. One-shot: create the agent CA. The hub refuses to start without
+#     this. The CA private key is owned 0600 by the running user; the
+#     hub service user does NOT get read access, so a hub compromise
+#     can't mint new agent certs.
+sudo hub-admin init-ca
+
 # 3. For every machine you want to reach, on the hub host:
 sudo ./scripts/add-machine.sh --id alpha --label alpha.lan --reload
-# -> prints an install-agent.sh command containing the fresh PSK.
+# -> writes alpha.crt + alpha.key in $PWD and prints the install-agent
+#    command. Copy the two files to the agent host.
 
 # 4. On each agent host, paste the printed command:
 sudo ./scripts/install-agent.sh --hub term.xyz.com:7700 \
-    --machine-id alpha --psk '<the printed psk>'
+    --cert alpha.crt --key alpha.key
 # Optional: --user youruser to run the agent unprivileged.
 ```
 
@@ -307,15 +349,19 @@ sudo install -m 640 systemd/hub.toml.example   /etc/term-hub/hub.toml
 sudo install -m 640 systemd/agent.toml.example /etc/term-agent/agent.toml
 sudo chown -R term-hub:term-hub /etc/term-hub
 
-# Generate a PSK per agent on the hub host and copy it to both configs.
-head -c 32 /dev/urandom | base64
+# Create the agent CA (one-shot; writes to /var/lib/term-hub/agent-ca.*).
+sudo hub-admin init-ca
+
+# Per agent: issue a cert, copy the .crt + .key to the agent host.
+sudo hub-admin issue-cert --id alpha --label alpha.lan
+# -> writes alpha.crt + alpha.key in $PWD
 
 # The SPA is embedded into the term-hub binary; nothing to copy.
 sudo install -m 644 systemd/term-hub.service   /etc/systemd/system/
 sudo install -m 644 systemd/term-agent.service /etc/systemd/system/
 
-# Edit /etc/term-hub/hub.toml (domain, rp_id, acme_email, machines + psks).
-# Edit /etc/term-agent/agent.toml (hub address, machine_id, psk).
+# Edit /etc/term-hub/hub.toml (domain, rp_id, acme_email, machines).
+# Edit /etc/term-agent/agent.toml (hub address, cert_path, key_path).
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now term-hub.service       # on the hub host
@@ -336,12 +382,13 @@ is hand-rolled (no `openssl-sys`).
 # 1. Build (release, MSVC toolchain — install Rust via https://rustup.rs).
 .\scripts\build.ps1
 
-# 2. From an elevated PowerShell on the agent host. The PSK comes from
-#    add-machine.sh on your hub host. Substitute your hub address.
+# 2. From an elevated PowerShell on the agent host. The .crt + .key
+#    files come from `hub-admin issue-cert --id win-laptop` on your
+#    hub host; scp them over first.
 .\scripts\install-agent.ps1 `
     -Hub        term.xyz.com:7700 `
-    -MachineId  win-laptop `
-    -Psk        '<base64 psk>' `
+    -Cert       'win-laptop.crt' `
+    -Key        'win-laptop.key' `
     -Shell      'C:\Windows\System32\cmd.exe'
 ```
 
@@ -349,6 +396,8 @@ The script:
 
 - Installs `term-agent.exe` (and `term-dl.exe` if built) to
   `%ProgramFiles%\term-agent\`.
+- Copies the cert + key into `%ProgramData%\term-agent\agent.{crt,key}`
+  (key 0600 / Administrators + run-as-user read).
 - Writes `%ProgramData%\term-agent\agent.toml` with a tight ACL
   (SYSTEM + Administrators full control, the run-as user read-only).
 - Registers a Scheduled Task `term-agent` that runs at the run-as
@@ -359,11 +408,13 @@ Single-user model: one agent per Windows user account. `-RunAsUser`
 defaults to the user invoking the installer (which is almost always
 what you want); pass it explicitly only if you're installing for a
 different account. If you want multiple users on the same machine to
-expose shells, give each its own `machine_id` + PSK and run the
-installer once per user with `-TaskName` overridden.
+expose shells, issue a separate cert per user (`hub-admin issue-cert
+--id win-alice` / `--id win-bob`) and run the installer once per
+user with `-TaskName` overridden.
 
-To uninstall: `Unregister-ScheduledTask -TaskName term-agent
--Confirm:$false` and remove the install dirs.
+To uninstall: `.\scripts\uninstall-agent.ps1` (stops + unregisters
+the scheduled task, removes the binary dir, preserves the cert + key
+unless `-PurgeConfig` is also passed).
 
 ### Windows hub
 
@@ -423,7 +474,6 @@ public_origin = "https://abc-8080.usw2.devtunnels.ms"   # your tunnel URL
 [[machines]]
 id    = "alpha"
 label = "alpha.lan"
-psk   = "<base64 psk>"
 ```
 
 Then create the tunnel and forward port 8080:
@@ -464,8 +514,8 @@ the tunnel and present its access token.
 ```toml
 ## agent.toml on a remote machine
 hub               = "wss://abc-8080.usw2.devtunnels.ms/agent/connect"
-machine_id        = "remote-1"
-psk               = "<base64 psk>"
+cert_path         = "/etc/term-agent/agent.crt"
+key_path          = "/etc/term-agent/agent.key"
 ## Perimeter (tunnel) token. Sent as `X-Tunnel-Authorization: tunnel
 ## <token>` on the WS upgrade. Tunnel tokens lapse hourly, so the agent
 ## caches it and only re-reads this file when it's near expiry (parsed
@@ -475,14 +525,16 @@ tunnel_token_file = "/run/term-agent/tunnel.token"
 ```
 
 Transport is chosen by the `hub` value's scheme: `ws://` / `wss://`
-⇒ WebSocket; a bare `host:port` ⇒ the original raw TCP/TLS path
-(unchanged). Auth is layered: the **tunnel's** access policy gates who
-can reach `/agent/connect`, and the agent's **PSK** (in the Hello frame,
-constant-time compared) gates which `machine_id` it may register as.
-Because the WS route carries no browser `Origin` header, it isn't
-affected by the hub's origin check; and unlike the browser
-`WebSocket` API, the agent's native client *can* set the
-`X-Tunnel-Authorization` header, so no query-string token is needed.
+⇒ WebSocket; a bare `host:port` ⇒ the original raw mTLS path. Auth
+is layered: the **tunnel's** access policy gates who can reach
+`/agent/connect`, and the agent's **client cert + signed assertion**
+(in the `X-Agent-Cert` + `X-Agent-Auth` headers) gates which
+`machine_id` it may register as — exactly the same allowlist /
+revocation logic as the raw mTLS path, just bridged across the
+TLS-terminating perimeter. Because the WS route carries no browser
+`Origin` header, it isn't affected by the hub's origin check; and
+unlike the browser `WebSocket` API, the agent's native client *can*
+set custom headers, so no query-string token is needed.
 
 The token is read only from `tunnel_token_file` (an env var would be no
 use — tunnel tokens expire hourly and a process's environment can't be
@@ -496,18 +548,70 @@ Header name and scheme are configurable for non-Dev-Tunnel perimeters
 expecting `Authorization: Bearer <token>` would set
 `tunnel_auth_header = "Authorization"` and `tunnel_auth_scheme = "Bearer"`.
 
+## Uninstall / clean reinstall
+
+Each installer has a matching uninstall script; both default to
+**preserving** state (cert + key on the agent; CA + credentials +
+issued-certs + ACME cache on the hub) so re-installs reuse it.
+Opt-in flags wipe state when you really want a fresh slate.
+
+```sh
+# Linux
+sudo ./scripts/uninstall-agent.sh                        # keeps /etc/term-agent
+sudo ./scripts/uninstall-agent.sh --purge-config         # also nukes cert+key+agent.toml
+
+sudo ./scripts/uninstall-hub.sh                          # keeps /etc/term-hub + /var/lib/term-hub + user
+sudo ./scripts/uninstall-hub.sh --purge-data             # DESTROYS the CA + passkeys + issued-certs
+sudo ./scripts/uninstall-hub.sh --purge-config --purge-data --remove-user
+```
+
+```powershell
+# Windows (elevated)
+.\scripts\uninstall-agent.ps1                            # keeps %ProgramData%\term-agent
+.\scripts\uninstall-agent.ps1 -PurgeConfig
+
+.\scripts\uninstall-hub.ps1                              # keeps the data dir
+.\scripts\uninstall-hub.ps1 -PurgeData                   # DESTROYS the CA + passkeys + issued-certs
+```
+
+For a true clean reinstall, the install scripts accept `--clean` /
+`-Clean`, which invokes the matching uninstall script first (with
+the same data-preservation defaults; pass `--purge-data` /
+`-PurgeData` to also wipe state):
+
+```sh
+sudo ./scripts/install-agent.sh --hub … --cert alpha.crt --key alpha.key --clean
+sudo ./scripts/install-hub.sh   --domain … --email …                    --clean
+sudo ./scripts/install-hub.sh   --domain … --email …  --clean --purge-data  # full reset
+```
+
 ## Security notes
 
-- **Trust model.** The hub trusts whoever presents the right PSK. The
-  agent trusts whoever serves a valid cert for the hub's domain. The
-  WebAuthn flow protects the browser ↔ hub side. Anyone with a PSK
-  *and* TCP reachability to the hub's `agent_bind` can register as
-  that machine and serve any tab the operator opens for it.
+- **Trust model.** The hub trusts agents that present a leaf cert
+  signed by its agent CA AND whose SHA-256 fingerprint is in
+  `<data_dir>/issued-certs.json` AND whose SAN URN matches the entry.
+  All three checks run inside a custom `rustls::ClientCertVerifier`,
+  so any mismatch tears down the TCP connection at the TLS-handshake
+  layer. The agent trusts whoever serves a valid cert for the hub's
+  domain. The WebAuthn flow protects the browser ↔ hub side.
+- **CA key isolation.** `<data_dir>/agent-ca.key` is created by
+  `hub-admin init-ca` running as root, mode 0600. The hub service
+  user (`term-hub`) reads only `agent-ca.crt`, never the key — so
+  a hub-process compromise cannot mint new agent certs.
+- **Cert revocation.** `hub-admin revoke-cert --serial <hex>` (or
+  `--id <machine_id>`) removes entries from `issued-certs.json`. The
+  hub polls that file every 30s and the new policy applies to all
+  subsequent TLS handshakes without a restart. Active connections
+  using the now-revoked cert keep running until the agent
+  reconnects — restart `term-hub.service` (or kill the agent) to
+  force immediate cutoff.
 - **No-auth listener.** When `[no_auth]` is configured, anyone who
   reaches the listener has full hub access. *Always* front it with a
   perimeter (Dev Tunnel access policy, SSO reverse proxy, private
   network). The hub itself does not authenticate callers on this
-  socket. The `Origin:` check is still enforced.
+  socket. The `Origin:` check is still enforced. (The agent-side
+  `/agent/connect` route on this listener is still authenticated by
+  client cert via the `X-Agent-Cert` + `X-Agent-Auth` headers.)
 - **rp_id scope.** `rp_id = xyz.com` shares credentials across sibling
   subdomains. Set `rp_id = term.xyz.com` for stricter scoping.
 - **SecurityKey vs Passkey.** We use `SecurityKey` so login is touch
@@ -516,8 +620,11 @@ expecting `Authorization: Bearer <token>` would set
   manually — delete the file and the hub regenerates it on next start.
   Existing credentials keep working (the secret only protects
   registration envelopes).
-- **PSK strength.** 32 random bytes from `/dev/urandom`. The hub warns
-  if a configured PSK decodes to fewer than 16 bytes.
+- **WS-perimeter replay window.** ±5 minutes of clock skew, defeated
+  by a `(fingerprint, nonce)` cache held for 10 minutes. Within that
+  window, a captured `X-Agent-Auth` can't be replayed against the
+  same hub (cached nonce) or against a different hub (signed payload
+  binds the `Host:` header).
 
 ## Layout
 

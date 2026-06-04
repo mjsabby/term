@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 # Install term-agent on this host. Idempotent; refuses to overwrite an
 # existing agent.toml unless --force.
+#
+# As of Phase 4.6 the agent authenticates by client cert (issued via
+# `hub-admin issue-cert` on the hub host) rather than by PSK; the
+# machine_id is bound by the cert's SAN URN, so there's no
+# --machine-id flag anymore.
 set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 --hub HOST:PORT --machine-id ID --psk PSK [options]
+Usage: $0 --hub HOST:PORT --cert PATH --key PATH [options]
 
 Required:
   --hub HOST:PORT          hub's agent_bind, e.g. term.xyz.com:7700
-  --machine-id ID          must match a [[machines]] entry on the hub
-  --psk PSK                base64 PSK matching the hub config
-                           (use --psk-stdin to read from stdin instead)
+  --cert PATH              PEM cert from \`hub-admin issue-cert --id <id>\`
+                           (file named <id>.crt; SAN URN encodes the machine_id)
+  --key PATH               matching PEM key (file named <id>.key)
 
 Optional:
-  --psk-stdin              read PSK from stdin instead of --psk
-  --tls on|off             default: on   (must match hub)
+  --hub-ca PATH            PEM CA(s) for the hub's server cert; needed only
+                           when the hub uses tls=files with a private CA
+  --tls on|off             default: on (must match hub)
   --server-name HOST       cert verify target (default: host part of --hub)
   --shell PATH             default: /bin/bash
-  --tmux PATH              default: /usr/bin/tmux
 
   --user UNIX_USER         run agent as this user; sets a systemd drop-in
                            (default: keep User= from the unit, i.e. root)
@@ -31,18 +36,20 @@ Optional:
 
   --no-enable              don't enable/start the unit
   --force                  overwrite an existing agent.toml
+  --clean                  uninstall any previous agent first (preserves
+                           cert+key+agent.toml unless --purge-config too)
+  --purge-config           passed through to --clean: wipe --config-dir
   -h, --help
 EOF
 }
 
 HUB=""
-MACHINE_ID=""
-PSK=""
-PSK_STDIN=false
+CERT_SRC=""
+KEY_SRC=""
+HUB_CA_SRC=""
 TLS="on"
 SERVER_NAME=""
 SHELL_BIN="/bin/bash"
-TMUX_BIN="/usr/bin/tmux"
 RUN_USER=""
 
 BUILD_DIR="./target/release"
@@ -53,25 +60,28 @@ CONFIG_DIR="/etc/term-agent"
 
 NO_ENABLE=false
 FORCE=false
+CLEAN=false
+PURGE_CONFIG=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --hub)         HUB="$2";          shift 2 ;;
-    --machine-id)  MACHINE_ID="$2";   shift 2 ;;
-    --psk)         PSK="$2";          shift 2 ;;
-    --psk-stdin)   PSK_STDIN=true;    shift   ;;
-    --tls)         TLS="$2";          shift 2 ;;
-    --server-name) SERVER_NAME="$2";  shift 2 ;;
-    --shell)       SHELL_BIN="$2";    shift 2 ;;
-    --tmux)        TMUX_BIN="$2";     shift 2 ;;
-    --user)        RUN_USER="$2";     shift 2 ;;
-    --build-dir)   BUILD_DIR="$2";    shift 2 ;;
-    --unit-src)    UNIT_SRC="$2";     shift 2 ;;
-    --bin-dir)     BIN_DIR="$2";      shift 2 ;;
-    --config-dir)  CONFIG_DIR="$2";   shift 2 ;;
-    --no-enable)   NO_ENABLE=true;    shift   ;;
-    --force)       FORCE=true;        shift   ;;
-    -h|--help)     usage; exit 0 ;;
+    --hub)           HUB="$2";          shift 2 ;;
+    --cert)          CERT_SRC="$2";     shift 2 ;;
+    --key)           KEY_SRC="$2";      shift 2 ;;
+    --hub-ca)        HUB_CA_SRC="$2";   shift 2 ;;
+    --tls)           TLS="$2";          shift 2 ;;
+    --server-name)   SERVER_NAME="$2";  shift 2 ;;
+    --shell)         SHELL_BIN="$2";    shift 2 ;;
+    --user)          RUN_USER="$2";     shift 2 ;;
+    --build-dir)     BUILD_DIR="$2";    shift 2 ;;
+    --unit-src)      UNIT_SRC="$2";     shift 2 ;;
+    --bin-dir)       BIN_DIR="$2";      shift 2 ;;
+    --config-dir)    CONFIG_DIR="$2";   shift 2 ;;
+    --no-enable)     NO_ENABLE=true;    shift   ;;
+    --force)         FORCE=true;        shift   ;;
+    --clean)         CLEAN=true;        shift   ;;
+    --purge-config)  PURGE_CONFIG=true; shift   ;;
+    -h|--help)       usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
@@ -79,16 +89,13 @@ done
 die()  { echo "install-agent: error: $*" >&2; exit 1; }
 note() { echo "install-agent: $*"; }
 
-if $PSK_STDIN; then
-  PSK="$(cat)"
-  PSK="${PSK//$'\n'/}"
-fi
-
-[[ -n "$HUB"        ]] || die "--hub is required"
-[[ -n "$MACHINE_ID" ]] || die "--machine-id is required"
-[[ -n "$PSK"        ]] || die "--psk (or --psk-stdin) is required"
+[[ -n "$HUB"      ]] || die "--hub is required"
+[[ -n "$CERT_SRC" ]] || die "--cert is required"
+[[ -n "$KEY_SRC"  ]] || die "--key is required"
 [[ "$TLS" == "on" || "$TLS" == "off" ]] || die "--tls must be on or off"
-[[ "$MACHINE_ID" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "machine-id must match [A-Za-z0-9_-]{1,32}"
+[[ -f "$CERT_SRC" ]] || die "cert file not readable: $CERT_SRC"
+[[ -f "$KEY_SRC"  ]] || die "key file not readable: $KEY_SRC"
+[[ -z "$HUB_CA_SRC" || -f "$HUB_CA_SRC" ]] || die "hub-ca file not readable: $HUB_CA_SRC"
 
 [[ "$(id -u)" -eq 0 ]] || die "must run as root (try: sudo $0 ...)"
 [[ -x "$BUILD_DIR/term-agent" ]] || die "missing $BUILD_DIR/term-agent (run: cargo build --release)"
@@ -98,14 +105,16 @@ if [[ -n "$RUN_USER" ]] && ! id "$RUN_USER" >/dev/null 2>&1; then
   die "user $RUN_USER does not exist; create it first"
 fi
 
-# tmux sanity
-if [[ ! -x "$TMUX_BIN" ]]; then
-  if command -v tmux >/dev/null 2>&1; then
-    TMUX_BIN="$(command -v tmux)"
-    note "using tmux at $TMUX_BIN"
-  else
-    die "tmux not found at $TMUX_BIN; install it (apt install tmux / dnf install tmux)"
+# --- optional clean-install: tear down any previous install first
+if $CLEAN; then
+  uninstall_script="$(dirname "$0")/uninstall-agent.sh"
+  if [[ ! -x "$uninstall_script" ]]; then
+    die "--clean requested but $uninstall_script not found / not executable"
   fi
+  note "--clean: invoking $uninstall_script first"
+  uninstall_args=( --bin-dir "$BIN_DIR" --config-dir "$CONFIG_DIR" --keep-binary )
+  $PURGE_CONFIG && uninstall_args+=( --purge-config )
+  "$uninstall_script" "${uninstall_args[@]}"
 fi
 
 # --- binary
@@ -116,9 +125,25 @@ install -m 755 "$BUILD_DIR/term-agent" "$BIN_DIR/"
 mkdir -p "$CONFIG_DIR"
 chmod 0750 "$CONFIG_DIR"
 if [[ -n "$RUN_USER" ]]; then
-  # The agent (running as RUN_USER) needs to be able to enter the dir
-  # and read agent.toml; nobody else needs to.
   chown -R "$RUN_USER:$RUN_USER" "$CONFIG_DIR"
+fi
+
+# --- cert + key (always overwrite — issued certs rotate)
+CERT_DST="$CONFIG_DIR/agent.crt"
+KEY_DST="$CONFIG_DIR/agent.key"
+HUB_CA_DST=""
+note "installing cert -> $CERT_DST"
+install -m 0644 "$CERT_SRC" "$CERT_DST"
+note "installing key  -> $KEY_DST (0600)"
+install -m 0600 "$KEY_SRC" "$KEY_DST"
+if [[ -n "$HUB_CA_SRC" ]]; then
+  HUB_CA_DST="$CONFIG_DIR/hub-server-ca.pem"
+  note "installing hub server CA -> $HUB_CA_DST"
+  install -m 0644 "$HUB_CA_SRC" "$HUB_CA_DST"
+fi
+if [[ -n "$RUN_USER" ]]; then
+  chown "$RUN_USER:$RUN_USER" "$CERT_DST" "$KEY_DST"
+  [[ -n "$HUB_CA_DST" ]] && chown "$RUN_USER:$RUN_USER" "$HUB_CA_DST"
 fi
 
 # --- agent.toml
@@ -129,15 +154,17 @@ else
   note "writing $CONFIG_PATH"
   server_name_line=""
   [[ -n "$SERVER_NAME" ]] && server_name_line="server_name = \"$SERVER_NAME\""
+  hub_ca_line=""
+  [[ -n "$HUB_CA_DST"  ]] && hub_ca_line="hub_ca_path = \"$HUB_CA_DST\""
   cat > "$CONFIG_PATH" <<EOF
 ## generated by scripts/install-agent.sh on $(date -Is)
 hub         = "$HUB"
-machine_id  = "$MACHINE_ID"
-psk         = "$PSK"
+cert_path   = "$CERT_DST"
+key_path    = "$KEY_DST"
 tls         = "$TLS"
+$hub_ca_line
 $server_name_line
 shell       = "$SHELL_BIN"
-tmux        = "$TMUX_BIN"
 EOF
   sed -i '/^$/N;/^\n$/D' "$CONFIG_PATH"
   if [[ -n "$RUN_USER" ]]; then
@@ -178,5 +205,5 @@ cat <<EOF
 next:
   - tail logs:  sudo journalctl -fu term-agent.service
   - on the hub, you should see:
-      agent registered machine=$MACHINE_ID peer=...
+      agent registered machine=<id from cert SAN> peer=...
 EOF

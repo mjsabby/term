@@ -1,10 +1,12 @@
 //! term-agent (push mode)
 //!
-//! Dials the hub on `hub` (host:port), authenticates with PSK in a
-//! `Hello` frame, then runs the multiplex demuxer. Each `Open` frame on
-//! a new stream attaches to (or spawns) a [`session::Session`] whose
-//! stdout flows back as `Data` frames on the same stream. Reconnects
-//! with exponential backoff on any failure.
+//! Dials the hub on `hub` (host:port), authenticates via client cert
+//! during the TLS handshake (raw transport) or via `X-Agent-Cert` +
+//! `X-Agent-Auth` upgrade headers (WSS-perimeter transport), then
+//! runs the multiplex demuxer. Each `Open` frame on a new stream
+//! attaches to (or spawns) a [`session::Session`] whose stdout flows
+//! back as `Data` frames on the same stream. Reconnects with
+//! exponential backoff on any failure.
 
 mod pty;
 mod session;
@@ -38,14 +40,25 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct AgentConfig {
-    /// "host:port" of the hub's agent_bind.
+    /// "host:port" of the hub's agent_bind (raw mTLS path), OR
+    /// `wss://<host>/agent/connect` (perimeter path).
     hub: String,
-    /// Machine id presented in the Hello frame; must match a `[[machines]]`
-    /// entry on the hub.
-    machine_id: String,
-    /// Pre-shared key (base64-encoded 32 random bytes) matching hub config.
-    psk: String,
-    /// "on" (default) or "off". Must match hub's tls mode.
+    /// Path to the agent's PEM cert chain. Issue with
+    /// `hub-admin issue-cert --id <machine_id>`. The cert's
+    /// `urn:term-agent:<machine_id>` SAN URN authoritatively names
+    /// the agent.
+    cert_path: PathBuf,
+    /// Path to the agent's PEM private key (PKCS#8 from rcgen, 0600).
+    key_path: PathBuf,
+    /// Optional path to a PEM file containing the CA(s) that signed
+    /// the HUB's server cert. Use for `tls = "files"` deployments
+    /// with a self-signed or private-CA-signed hub cert. Default:
+    /// trust webpki-roots (correct for ACME / Let's Encrypt
+    /// deployments).
+    #[serde(default)]
+    hub_ca_path: Option<PathBuf>,
+    /// "on" (default). The cert-based auth scheme requires TLS;
+    /// "off" is accepted but produces a warning at startup.
     #[serde(default = "default_tls")]
     tls: String,
     /// SNI / cert-verification target. Defaults to the host part of `hub`.
@@ -245,14 +258,39 @@ async fn main() -> Result<()> {
 
     let tls_on = match cfg.tls.as_str() {
         "on" | "true" => true,
-        "off" | "false" => false,
+        "off" | "false" => {
+            warn!(
+                "tls = \"off\" is ignored on the agent side — the cert-based auth scheme \
+                 requires TLS to the hub (or wss:// to a TLS-terminating perimeter)"
+            );
+            false
+        }
         other => bail!("invalid tls = {other:?}; use \"on\" or \"off\""),
+    };
+
+    // Load the agent's cert + key. The hub names us via the cert's
+    // SAN URN, so we don't need to parse the cert ourselves; we just
+    // hand it to rustls for the TLS handshake and to ring for the
+    // WS-perimeter signature.
+    let (cert_chain, key_der) =
+        term_common::agent_pki::load_cert_files(&cfg.cert_path, &cfg.key_path).with_context(
+            || {
+                format!(
+                    "load agent cert {:?} + key {:?}",
+                    cfg.cert_path, cfg.key_path
+                )
+            },
+        )?;
+    let key_pkcs8 = match &key_der {
+        rustls::pki_types::PrivateKeyDer::Pkcs8(k) => k.secret_pkcs8_der().to_vec(),
+        _ => bail!(
+            "agent key {:?} is not PKCS#8 — re-issue with `hub-admin issue-cert`",
+            cfg.key_path
+        ),
     };
 
     let resolved = Arc::new(ResolvedConfig {
         hub: cfg.hub,
-        machine_id: cfg.machine_id,
-        psk: cfg.psk,
         tls_on,
         server_name,
         shell,
@@ -261,16 +299,19 @@ async fn main() -> Result<()> {
         tunnel_auth_header: cfg.tunnel_auth_header,
         tunnel_auth_scheme: cfg.tunnel_auth_scheme,
         tunnel_token_cache: std::sync::Mutex::new(None),
+        cert_chain,
+        key_pkcs8,
+        hub_ca_path: cfg.hub_ca_path,
     });
 
     info!(
-        "term-agent: hub={} machine_id={} tls={} server_name={} shell={} \
+        "term-agent: hub={} tls={} server_name={} shell={} cert={} \
          scrollback_cap={} idle_ttl={:?} max_pastes={} max_groups={} max_sessions={}",
         resolved.hub,
-        resolved.machine_id,
         if resolved.tls_on { "on" } else { "off" },
         resolved.server_name,
         resolved.shell,
+        cfg.cert_path.display(),
         resolved.limits.scrollback_cap_bytes,
         resolved.limits.idle_ttl,
         resolved.limits.max_pending_pastes_per_stream,
@@ -278,15 +319,14 @@ async fn main() -> Result<()> {
         resolved.limits.max_sessions,
     );
 
-    // Built unconditionally — the raw transport uses it only when
-    // `tls_on`, and the WebSocket transport uses it only for `wss://`.
-    // Building it just assembles a rustls client config (no I/O).
-    let tls_connector = build_tls_connector()?;
-
+    // The raw and wss paths both build their TLS connector lazily —
+    // they need to read `hub_ca_path` (which we want re-read on each
+    // reconnect so the operator can rotate the hub CA without a
+    // restart) and they pass in the client cert + key.
     let mut backoff = RECONNECT_INITIAL;
     loop {
         let started = std::time::Instant::now();
-        let result = run_once(resolved.clone(), tls_connector.clone()).await;
+        let result = run_once(resolved.clone()).await;
         let lasted = started.elapsed();
         match result {
             Ok(()) if lasted >= HEALTHY_SESSION => {
@@ -314,30 +354,60 @@ async fn main() -> Result<()> {
     }
 }
 
-struct ResolvedConfig {
-    hub: String,
-    machine_id: String,
-    psk: String,
-    tls_on: bool,
-    server_name: String,
-    shell: String,
-    limits: Limits,
-    tunnel_token_file: Option<String>,
-    tunnel_auth_header: String,
-    tunnel_auth_scheme: String,
+pub(crate) struct ResolvedConfig {
+    pub hub: String,
+    pub tls_on: bool,
+    pub server_name: String,
+    pub shell: String,
+    pub limits: Limits,
+    pub tunnel_token_file: Option<String>,
+    pub tunnel_auth_header: String,
+    pub tunnel_auth_scheme: String,
     /// In-memory cache of the perimeter token + its parsed expiry, so the
     /// WS dial path only re-reads `tunnel_token_file` when the token is
     /// near expiry rather than on every reconnect.
-    tunnel_token_cache: std::sync::Mutex<Option<wsdial::CachedToken>>,
+    pub tunnel_token_cache: std::sync::Mutex<Option<wsdial::CachedToken>>,
+    /// Agent client cert chain (leaf first) loaded from `cert_path`.
+    /// Presented during the raw mTLS handshake and base64-encoded into
+    /// the `X-Agent-Cert` header on the WSS-perimeter path.
+    pub cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// PKCS#8 private key bytes for the leaf cert. Held in PKCS#8
+    /// form because ring's `EcdsaKeyPair::from_pkcs8` requires it.
+    pub key_pkcs8: Vec<u8>,
+    /// Optional PEM file of CA(s) that signed the hub's server cert.
+    /// Default: trust webpki-roots.
+    pub hub_ca_path: Option<PathBuf>,
 }
 
-fn build_tls_connector() -> Result<tokio_rustls::TlsConnector> {
+/// Build the rustls ClientConfig for dialing the hub: trusts either
+/// webpki-roots (default, for ACME deployments) or the explicit
+/// `hub_ca_path` (for tls=files / self-signed deployments), and
+/// presents the agent's mTLS client cert. Called fresh on every
+/// reconnect so a rotated `hub_ca_path` is picked up without
+/// restarting the agent.
+fn build_tls_connector(cfg: &ResolvedConfig) -> Result<tokio_rustls::TlsConnector> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = rustls::ClientConfig::builder()
+    if let Some(path) = &cfg.hub_ca_path {
+        let pem =
+            std::fs::read(path).with_context(|| format!("read hub_ca_path {}", path.display()))?;
+        let added = term_common::agent_pki::load_pem_cert_chain(&pem)
+            .with_context(|| format!("parse hub_ca_path {}", path.display()))?;
+        for c in added {
+            roots
+                .add(c)
+                .with_context(|| format!("install root from {}", path.display()))?;
+        }
+    } else {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    let client_cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
+        .with_client_auth_cert(
+            cfg.cert_chain.clone(),
+            rustls::pki_types::PrivateKeyDer::Pkcs8(cfg.key_pkcs8.clone().into()),
+        )
+        .context("install agent client cert")?;
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(client_cfg)))
 }
 
 /// Default path for `agent.toml` when `TERM_AGENT_CONFIG` isn't set.
@@ -376,7 +446,8 @@ fn default_shell() -> String {
     }
 }
 
-async fn run_once(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -> Result<()> {
+async fn run_once(cfg: Arc<ResolvedConfig>) -> Result<()> {
+    let tls = build_tls_connector(&cfg)?;
     // WebSocket transport (through an HTTP/WS perimeter such as a Dev
     // Tunnel) when `hub` is a ws[s] URL; raw TCP/TLS to `host:port`
     // otherwise.
@@ -430,11 +501,9 @@ where
         writer.close().await;
     });
 
-    // Send Hello.
+    // Send Hello (version-only payload; auth is at the transport layer).
     let hello = HelloPayload {
         version: HELLO_VERSION,
-        machine_id: cfg.machine_id.clone(),
-        psk_b64: cfg.psk.clone(),
     };
     let hello_bytes = serde_json::to_vec(&hello).context("serialize hello")?;
     send_frame_to_hub(&write_tx, Frame::hello(hello_bytes))

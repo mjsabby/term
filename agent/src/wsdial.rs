@@ -3,12 +3,22 @@
 //! TCP/TLS connection to `agent_bind`. Selected when `hub` is a `ws://`
 //! or `wss://` URL.
 //!
-//! The agent's PSK auth is unchanged (it rides in the Hello frame). On
-//! top of that, the WS upgrade request carries a perimeter access token
-//! header (`X-Tunnel-Authorization: tunnel <token>` by default) so the
-//! tunnel lets the dial through. TLS for `wss` reuses the agent's
-//! existing rustls (ring) connector, so tungstenite needs no TLS feature
-//! of its own — avoiding a second crypto provider in the binary.
+//! Authentication: the agent attaches two HTTP headers on every WS
+//! upgrade so the hub can verify it without an mTLS handshake (which
+//! is impossible end-to-end through a TLS-terminating perimeter):
+//!
+//! - `X-Agent-Cert: <base64-no-pad of leaf cert DER>`
+//! - `X-Agent-Auth: <unix_secs>.<nonce>.<ECDSA-P256 sig>` over a
+//!   domain-separated payload that includes the Host header. The hub
+//!   verifies signature freshness against a small replay cache so a
+//!   tunnel-eavesdropper can't replay the assertion.
+//!
+//! On top of that, the WS upgrade request also carries the legacy
+//! perimeter token header (`X-Tunnel-Authorization: tunnel <token>` by
+//! default) so the tunnel lets the dial through. TLS for `wss` reuses
+//! the agent's existing rustls (ring) connector, so tungstenite needs
+//! no TLS feature of its own — avoiding a second crypto provider in
+//! the binary.
 
 use std::io;
 use std::sync::Arc;
@@ -28,7 +38,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tracing::{debug, info};
 
+use term_common::agent_pki::{
+    HEADER_AGENT_AUTH, HEADER_AGENT_CERT, WS_AUTH_NONCE_LEN, ws_auth_payload,
+};
 use term_common::frame::{Frame, FrameError};
+use term_common::random;
 use term_common::transport::{FrameRecv, FrameSend, frame_from_ws_payload};
 
 use crate::ResolvedConfig;
@@ -46,7 +60,7 @@ pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -
             ));
         }
     };
-    let host = url
+    let host_for_tcp = url
         .host_str()
         .ok_or_else(|| anyhow!("hub url {} has no host", cfg.hub))?
         .to_string();
@@ -55,8 +69,11 @@ pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -
         .unwrap_or(if secure { 443 } else { 80 });
 
     // Build the WS upgrade request (Host/Upgrade/Sec-WebSocket-* are
-    // filled in by `into_client_request`) and attach the perimeter token
-    // header, read fresh on every reconnect so a rotated token is used.
+    // filled in by `into_client_request`) and attach (a) the perimeter
+    // token header, read fresh on every reconnect so a rotated token
+    // is used; and (b) the agent's mTLS-equivalent assertion
+    // (X-Agent-Cert + X-Agent-Auth) so the hub can authenticate us
+    // through the TLS-terminating perimeter.
     let mut request = cfg
         .hub
         .as_str()
@@ -66,9 +83,21 @@ pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -
         request.headers_mut().insert(name, value);
         debug!("attached perimeter auth header to ws upgrade");
     }
+    let host = request
+        .uri()
+        .host()
+        .ok_or_else(|| anyhow!("ws upgrade uri has no host"))?
+        .to_string();
+    let (cert_header, auth_header) = agent_auth_headers(&cfg, &host)?;
+    request
+        .headers_mut()
+        .insert(HeaderName::from_static(HEADER_AGENT_CERT), cert_header);
+    request
+        .headers_mut()
+        .insert(HeaderName::from_static(HEADER_AGENT_AUTH), auth_header);
 
     debug!("dialing {} (websocket, tls={})", cfg.hub, secure);
-    let tcp = TcpStream::connect((host.as_str(), port))
+    let tcp = TcpStream::connect((host_for_tcp.as_str(), port))
         .await
         .with_context(|| format!("tcp connect {host}:{port}"))?;
     tcp.set_nodelay(true).ok();
@@ -80,13 +109,13 @@ pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -
         let (ws, _resp) = client_async_with_config(request, tls_stream, None)
             .await
             .context("websocket handshake")?;
-        info!(machine = %cfg.machine_id, "agent connected over wss");
+        info!(host = %cfg.server_name, "agent connected over wss");
         drive(cfg, ws).await
     } else {
         let (ws, _resp) = client_async_with_config(request, tcp, None)
             .await
             .context("websocket handshake")?;
-        info!(machine = %cfg.machine_id, "agent connected over ws");
+        info!(host = %cfg.server_name, "agent connected over ws");
         drive(cfg, ws).await
     }
 }
@@ -97,6 +126,46 @@ where
 {
     let (sink, stream) = ws.split();
     crate::run_session(cfg, WsRecv(stream), WsSend(sink)).await
+}
+
+/// Build the X-Agent-Cert and X-Agent-Auth header values for the WS
+/// upgrade to `host`. Generates a fresh 16-byte nonce per upgrade and
+/// signs the canonical `ws_auth_payload(host, now, nonce)` bytes with
+/// the agent's PKCS#8 ECDSA-P256 key using ring.
+fn agent_auth_headers(cfg: &ResolvedConfig, host: &str) -> Result<(HeaderValue, HeaderValue)> {
+    use ring::rand::SystemRandom;
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+
+    let leaf = cfg
+        .cert_chain
+        .first()
+        .ok_or_else(|| anyhow!("cert_chain is empty"))?;
+    let cert_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(leaf.as_ref());
+
+    let mut nonce = [0u8; WS_AUTH_NONCE_LEN];
+    random::fill(&mut nonce);
+    let nonce_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs();
+    let payload = ws_auth_payload(host, now, &nonce);
+
+    let rng = SystemRandom::new();
+    let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &cfg.key_pkcs8, &rng)
+        .map_err(|e| anyhow!("load PKCS#8 ECDSA key: {e:?}"))?;
+    let sig = kp
+        .sign(&rng, &payload)
+        .map_err(|_| anyhow!("ring ECDSA sign failed"))?;
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.as_ref());
+
+    let auth_value = format!("{now}.{nonce_b64}.{sig_b64}");
+    let cert_header =
+        HeaderValue::from_str(&cert_b64).context("encode X-Agent-Cert header value")?;
+    let auth_header =
+        HeaderValue::from_str(&auth_value).context("encode X-Agent-Auth header value")?;
+    Ok((cert_header, auth_header))
 }
 
 /// Cached perimeter token + its parsed expiry.
@@ -237,8 +306,6 @@ mod tests {
     fn test_cfg(token_file: Option<String>) -> ResolvedConfig {
         ResolvedConfig {
             hub: "wss://example.test/agent/connect".into(),
-            machine_id: "m".into(),
-            psk: "p".into(),
             tls_on: true,
             server_name: "example.test".into(),
             shell: "/bin/sh".into(),
@@ -247,6 +314,9 @@ mod tests {
             tunnel_auth_header: "X-Tunnel-Authorization".into(),
             tunnel_auth_scheme: "tunnel".into(),
             tunnel_token_cache: std::sync::Mutex::new(None),
+            cert_chain: vec![],
+            key_pkcs8: vec![],
+            hub_ca_path: None,
         }
     }
 

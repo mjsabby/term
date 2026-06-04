@@ -7,15 +7,21 @@
 //!
 //! ## Lifecycle
 //!
-//! 1. Acceptor accepts TCP; in ACME mode it wraps with rustls and
-//!    presents the same cert as the browser-facing listener.
-//! 2. [`handle_connection`] reads the agent's `Hello` frame, validates
-//!    the PSK against the configured machine, registers an [`AgentLink`]
-//!    in `AppState.agents`, then runs the read/write pump until either
+//! 1. Acceptor accepts TCP and wraps with rustls. The rustls config
+//!    plugs in [`crate::client_verifier::AgentClientVerifier`], so
+//!    any handshake without a valid + allowed client cert tears down
+//!    the TCP connection BEFORE we ever reach this module.
+//! 2. After a successful handshake, the acceptor extracts the leaf
+//!    cert's SAN URN and calls [`handle_connection`] with the
+//!    already-authenticated `machine_id`.
+//! 3. [`handle_connection`] reads the agent's `Hello` frame for
+//!    version negotiation, registers an [`AgentLink`] in
+//!    `AppState.agents`, then runs the read/write pump until either
 //!    side closes.
-//! 3. [`AgentLink::open_stream`] returns a [`StreamHandle`] that the WS
-//!    proxy uses to send/receive frames for one tab. Dropping the handle
-//!    sends a `Close` frame and removes the stream from the registry.
+//! 4. [`AgentLink::open_stream`] returns a [`StreamHandle`] that the
+//!    WS proxy uses to send/receive frames for one tab. Dropping the
+//!    handle sends a `Close` frame and removes the stream from the
+//!    registry.
 //!
 //! On agent disconnect, every `StreamHandle.recv()` returns `None` so
 //! every browser WS handler cleanly tears down. The browser auto-reconnects
@@ -26,19 +32,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
-use base64::Engine;
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use term_common::agent_pki::ca::extract_machine_id_from_san;
 use term_common::frame::{Body, Frame, FrameType, HELLO_VERSION, HelloPayload, KILL_STATUS_OK};
 use term_common::prio::{PrioTx, prio_channel};
 use term_common::transport::{ByteStreamRecv, ByteStreamSend, FrameRecv, FrameSend};
 
-use crate::config::{HubConfig, is_valid_machine_id};
+use crate::config::HubConfig;
 use crate::state::AppState;
 
 // --- writer queue budgets (bytes, per agent connection) -------------------
@@ -304,39 +310,27 @@ impl Drop for StreamGuard {
     }
 }
 
-/// Constant-time byte comparison.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-fn decode_psk(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    let s = s.trim();
-    if let Ok(v) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
-        return Ok(v);
-    }
-    base64::engine::general_purpose::STANDARD_NO_PAD.decode(s.as_bytes())
-}
-
 /// Run the hello/auth/pump loop for one agent connection. Returns when
 /// the agent disconnects or any protocol error occurs.
+///
+/// `machine_id` is the already-authenticated identity (cert SAN URN
+/// on the raw mTLS path, X-Agent-Cert SAN on the WSS-perimeter path).
+/// This function does NOT do any cert validation of its own — it
+/// trusts the caller to have already torn down any unauthenticated
+/// connection at the TLS layer (raw path) or at the HTTP-upgrade
+/// layer (WSS path).
 pub async fn handle_connection<FR, FW>(
     state: AppState,
     mut reader: FR,
     mut writer: FW,
+    machine_id: String,
     peer: String,
 ) -> anyhow::Result<()>
 where
     FR: FrameRecv + Send,
     FW: FrameSend + Send + 'static,
 {
-    // ---- hello + auth -----------------------------------------------------
+    // ---- hello (version handshake only) -----------------------------------
     let (hello_frame, hello_bytes_in) = timeout(HELLO_DEADLINE, reader.recv())
         .await
         .map_err(|_| anyhow!("hello timeout from {peer}"))?
@@ -349,38 +343,30 @@ where
     };
     if hello.version != HELLO_VERSION {
         bail!(
-            "hello version mismatch: agent={} hub={}",
+            "hello version mismatch: agent={} hub={} (this hub requires mTLS-era agents; \
+             re-issue the agent cert with `hub-admin issue-cert` and reinstall)",
             hello.version,
             HELLO_VERSION
         );
     }
-    if !is_valid_machine_id(&hello.machine_id) {
-        bail!("invalid machine_id in hello");
+    // Sanity-check that the cert-derived id resembles a configured
+    // machine. If `[[machines]]` omits this id the agent still runs
+    // (the cert was issued by us so it's trusted), but the browser
+    // sidebar won't list it — warn so the operator notices the gap.
+    if !state.cfg.machines.iter().any(|m| m.id == machine_id) {
+        warn!(
+            machine = %machine_id,
+            "agent presented a valid cert but no matching [[machines]] entry in hub.toml; \
+             add one to surface this machine in the SPA"
+        );
     }
 
-    let machine = state
-        .cfg
-        .machines
-        .iter()
-        .find(|m| m.id == hello.machine_id)
-        .ok_or_else(|| anyhow!("unknown machine_id: {}", hello.machine_id))?
-        .clone();
-
-    let claimed = decode_psk(&hello.psk_b64).context("decode claimed psk")?;
-    let expected = decode_psk(&machine.psk).context("decode configured psk")?;
-    if !ct_eq(&claimed, &expected) {
-        bail!("psk mismatch for machine {}", hello.machine_id);
-    }
-    if expected.len() < 16 {
-        warn!(machine = %hello.machine_id, "configured PSK is shorter than 16 bytes");
-    }
-
-    info!(machine = %hello.machine_id, peer = %peer, "agent registered");
+    info!(machine = %machine_id, peer = %peer, "agent registered");
 
     // ---- link + writer ----------------------------------------------------
     let (write_tx, mut write_rx) = prio_channel(HUB_WRITER_HI_BYTES, HUB_WRITER_LO_BYTES);
     let link = Arc::new(AgentLink {
-        machine_id: hello.machine_id.clone(),
+        machine_id: machine_id.clone(),
         writer: write_tx.clone(),
         next_stream_id: AtomicU32::new(1),
         streams: Mutex::new(HashMap::new()),
@@ -402,16 +388,14 @@ where
     // and the (probably still-alive) old agent reconnects fresh.
     {
         let mut map = state.agents.lock().await;
-        if let Some(old) = map.insert(hello.machine_id.clone(), link.clone()) {
-            warn!(machine = %hello.machine_id, "replacing existing agent link");
+        if let Some(old) = map.insert(machine_id.clone(), link.clone()) {
+            warn!(machine = %machine_id, "replacing existing agent link");
             // notify_waiters wakes both the old reader's select! and its
             // writer task's select! simultaneously.
             old.notify_close.notify_waiters();
             drop(old);
         }
     }
-
-    let machine_id = hello.machine_id.clone();
 
     // Writer task. Exits on either:
     //   (a) write_rx returns None (all senders dropped), or
@@ -533,22 +517,20 @@ where
     Ok(())
 }
 
-/// Acceptor task for the agent listener. Loops accepting TCP; if a
-/// `TlsAcceptor` is provided, wraps each accepted socket and spawns
-/// `handle_connection` over the TLS stream, else over the raw TCP.
+/// Acceptor task for the agent listener. Always TLS (mTLS, with a
+/// custom client-cert verifier passed in); never accepts plain TCP
+/// because the auth scheme requires a client cert. After a successful
+/// handshake we pull the leaf cert's SAN URN as the agent's
+/// authenticated identity and pass it into `handle_connection`.
 pub async fn run_acceptor(
     state: AppState,
     cfg: Arc<HubConfig>,
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    tls: tokio_rustls::TlsAcceptor,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&cfg.agent_bind)
         .await
         .with_context(|| format!("bind agent_bind {}", cfg.agent_bind))?;
-    info!(
-        "agent listener up on {} ({})",
-        cfg.agent_bind,
-        if tls.is_some() { "TLS" } else { "plain TCP" },
-    );
+    info!("agent listener up on {} (mTLS)", cfg.agent_bind);
 
     loop {
         let (sock, peer) = match listener.accept().await {
@@ -560,18 +542,25 @@ pub async fn run_acceptor(
         };
         let _ = sock.set_nodelay(true);
         let state = state.clone();
-        let tls = tls.clone();
+        let acceptor = tls.clone();
         let peer = peer.to_string();
         tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
-                if let Some(acceptor) = tls {
-                    let tls = acceptor.accept(sock).await.context("tls accept")?;
-                    let (r, w) = tokio::io::split(tls);
-                    handle_connection(state, ByteStreamRecv(r), ByteStreamSend(w), peer).await
-                } else {
-                    let (r, w) = sock.into_split();
-                    handle_connection(state, ByteStreamRecv(r), ByteStreamSend(w), peer).await
-                }
+                // The TLS handshake itself runs our AgentClientVerifier,
+                // so we get here only if chain + fingerprint + SAN are
+                // valid. We still need the SAN URN for `handle_connection`.
+                let tls = acceptor.accept(sock).await.context("tls accept")?;
+                let machine_id = peer_machine_id(&tls)
+                    .context("extract machine_id from authenticated peer cert")?;
+                let (r, w) = tokio::io::split(tls);
+                handle_connection(
+                    state,
+                    ByteStreamRecv(r),
+                    ByteStreamSend(w),
+                    machine_id,
+                    peer,
+                )
+                .await
             }
             .await;
             if let Err(e) = result {
@@ -579,4 +568,20 @@ pub async fn run_acceptor(
             }
         });
     }
+}
+
+/// Pull the leaf cert from a freshly-accepted rustls server stream
+/// and extract its SAN URN. The TLS handshake has already validated
+/// the cert against our `AgentClientVerifier`, so this MUST succeed —
+/// any error here would mean rustls accepted a connection without a
+/// peer cert despite the verifier being `client_auth_mandatory()`.
+fn peer_machine_id(tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>) -> Result<String> {
+    let (_io, sess) = tls.get_ref();
+    let certs = sess
+        .peer_certificates()
+        .ok_or_else(|| anyhow!("no peer certificates on authenticated TLS stream"))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow!("peer cert chain is empty"))?;
+    extract_machine_id_from_san(leaf.as_ref())
 }

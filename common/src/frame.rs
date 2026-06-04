@@ -180,8 +180,11 @@ pub enum FrameType {
     /// Keepalive reply. Stream 0. Payload is the matching Ping's payload.
     Pong = 5,
     /// Connection-level greeting, agent -> hub, sent as the FIRST frame
-    /// on stream 0. Payload is JSON: `{ "version": u32, "machine_id":
-    /// "<id>", "psk_b64": "<base64-32-bytes>" }`.
+    /// on stream 0. Payload is JSON: `{ "version": u32 }`. The agent's
+    /// identity is bound by the client certificate at TLS-handshake
+    /// time (raw transport) or by the X-Agent-Cert / X-Agent-Auth
+    /// upgrade headers (WSS-perimeter transport), so the Hello payload
+    /// no longer needs to carry it.
     Hello = 6,
     /// Begins a chunked file paste from the browser. Stream-scoped
     /// (stream_id != 0). Browser → hub → agent only. Payload:
@@ -1337,15 +1340,23 @@ pub fn is_valid_session_id(s: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// The agent's first frame to the hub. JSON-encoded into the Hello frame
-/// payload so we can add fields later without breaking the wire.
+/// The agent's first frame to the hub. JSON-encoded into the Hello
+/// frame payload so we can add fields later without breaking the wire.
+///
+/// As of `HELLO_VERSION = 2` (Phase 4.6 mTLS migration) the payload
+/// carries nothing but the protocol version. The agent's identity
+/// (`machine_id`) is bound by the client cert verified at TLS-
+/// handshake time on the raw transport, or by the `X-Agent-Cert` +
+/// `X-Agent-Auth` upgrade headers on the WSS-perimeter transport.
+/// Hubs running version 1 (PSK auth) reject version 2 and vice versa,
+/// so the bump is the wire-version signal for the auth scheme change.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HelloPayload {
     pub version: u32,
-    pub machine_id: String,
-    pub psk_b64: String,
 }
-pub const HELLO_VERSION: u32 = 1;
+/// Wire version of the Hello frame. Bumped to 2 when the codebase
+/// switched from PSK auth (v1) to mTLS / cert-based auth (v2).
+pub const HELLO_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -1424,8 +1435,6 @@ mod tests {
     fn hello_round_trip() {
         let h = HelloPayload {
             version: HELLO_VERSION,
-            machine_id: "alpha".into(),
-            psk_b64: "AAAA".into(),
         };
         let bytes = serde_json::to_vec(&h).unwrap();
         let f = Frame::hello(bytes.clone());
@@ -1436,7 +1445,7 @@ mod tests {
         match back.body {
             Body::Hello(b) => {
                 let h2: HelloPayload = serde_json::from_slice(&b).unwrap();
-                assert_eq!(h2.machine_id, "alpha");
+                assert_eq!(h2.version, HELLO_VERSION);
             }
             _ => panic!(),
         }

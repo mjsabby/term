@@ -47,10 +47,20 @@ Optional:
 
   --no-enable              don't enable/start the unit
   --force                  overwrite an existing hub.toml
+  --clean                  uninstall any previous hub first (preserves
+                           --config-dir + --data-dir + the service user
+                           unless --purge-config / --purge-data /
+                           --remove-user are passed too)
+  --purge-config           passed through to --clean: wipe --config-dir
+  --purge-data             passed through to --clean: wipe --data-dir
+                           (CA + credentials + issued-certs + ACME cache)
+                           — DESTRUCTIVE
+  --remove-user            passed through to --clean: delete --user
   -h, --help               this help
 
 After install:
   - edit any /etc/term-hub/hub.toml field if needed
+  - run \`sudo hub-admin init-ca\` to create the agent CA (one-shot)
   - add machines:  sudo scripts/add-machine.sh --id alpha --label alpha.lan
   - tail logs:     sudo journalctl -fu term-hub.service
 EOF
@@ -82,6 +92,10 @@ SERVICE_USER="term-hub"
 
 NO_ENABLE=false
 FORCE=false
+CLEAN=false
+PURGE_CONFIG=false
+PURGE_DATA=false
+REMOVE_USER=false
 
 # --- arg parse
 while [[ $# -gt 0 ]]; do
@@ -106,9 +120,13 @@ while [[ $# -gt 0 ]]; do
     --bin-dir)     BIN_DIR="$2";       shift 2 ;;
     --config-dir)  CONFIG_DIR="$2";    shift 2 ;;
     --user)        SERVICE_USER="$2";  shift 2 ;;
-    --no-enable)   NO_ENABLE=true;     shift   ;;
-    --force)       FORCE=true;         shift   ;;
-    -h|--help)     usage; exit 0 ;;
+    --no-enable)     NO_ENABLE=true;     shift   ;;
+    --force)         FORCE=true;         shift   ;;
+    --clean)         CLEAN=true;         shift   ;;
+    --purge-config)  PURGE_CONFIG=true;  shift   ;;
+    --purge-data)    PURGE_DATA=true;    shift   ;;
+    --remove-user)   REMOVE_USER=true;   shift   ;;
+    -h|--help)       usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
@@ -143,6 +161,30 @@ fi
 [[ -x "$BUILD_DIR/term-hub"  ]] || die "missing $BUILD_DIR/term-hub  (run: cargo build --release)"
 [[ -x "$BUILD_DIR/hub-admin" ]] || die "missing $BUILD_DIR/hub-admin (run: cargo build --release)"
 [[ -f "$UNIT_SRC"            ]] || die "missing $UNIT_SRC (systemd unit)"
+
+# --- optional clean-install: tear down any previous install first.
+# We KEEP the binaries (we're about to install fresh ones over them)
+# and propagate --purge-config / --purge-data / --remove-user when
+# requested. Service-user removal is opt-in because the install path
+# below would otherwise have to immediately recreate it.
+if $CLEAN; then
+  uninstall_script="$(dirname "$0")/uninstall-hub.sh"
+  if [[ ! -x "$uninstall_script" ]]; then
+    die "--clean requested but $uninstall_script not found / not executable"
+  fi
+  note "--clean: invoking $uninstall_script first"
+  uninstall_args=(
+    --bin-dir "$BIN_DIR"
+    --config-dir "$CONFIG_DIR"
+    --data-dir "$DATA_DIR"
+    --user "$SERVICE_USER"
+    --keep-binary
+  )
+  $PURGE_CONFIG && uninstall_args+=( --purge-config )
+  $PURGE_DATA   && uninstall_args+=( --purge-data )
+  $REMOVE_USER  && uninstall_args+=( --remove-user )
+  "$uninstall_script" "${uninstall_args[@]}"
+fi
 
 # --- service user
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -258,7 +300,9 @@ cat <<EOF
 
 next:
   - tail logs:  sudo journalctl -fu term-hub.service
+  - create the agent CA: sudo hub-admin init-ca
   - add a machine: sudo scripts/add-machine.sh --id alpha --label alpha.lan
+    (this issues a per-machine cert under \$PWD/alpha.crt + alpha.key)
   - then on each agent host, run:
-      sudo scripts/install-agent.sh --hub $DOMAIN:7700 --machine-id alpha --psk <PSK>
+      sudo scripts/install-agent.sh --hub $DOMAIN:7700 --cert alpha.crt --key alpha.key
 EOF

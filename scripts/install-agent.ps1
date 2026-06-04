@@ -4,7 +4,12 @@
 ## the chosen user's logon, in that user's session, with that user's
 ## token. One Windows user == one agent identity. If you want multiple
 ## users on the same machine to expose shells through term-hub, give
-## each user their own machine_id + PSK + install invocation.
+## each user their own per-machine cert + install invocation.
+##
+## As of Phase 4.6 the agent authenticates by client cert (issued via
+## `hub-admin issue-cert --id <machine_id>` on the hub host). The
+## machine_id is bound by the cert's SAN URN, so there is no
+## -MachineId / -Psk parameter anymore.
 ##
 ## Idempotent: refuses to overwrite an existing agent.toml unless
 ## -Force. Re-running with the same arguments just updates the binary
@@ -13,8 +18,12 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)] [string] $Hub,
-  [Parameter(Mandatory=$true)] [string] $MachineId,
-  [Parameter(Mandatory=$true)] [string] $Psk,
+  [Parameter(Mandatory=$true)] [string] $Cert,
+  [Parameter(Mandatory=$true)] [string] $Key,
+
+  ## Optional: PEM of the CA that signed the HUB's *server* cert.
+  ## Only needed for tls=files / self-signed hub deployments.
+  [string] $HubCa,
 
   [ValidateSet("on","off")]
   [string] $Tls = "on",
@@ -38,7 +47,12 @@ param(
   [string] $TaskName  = "term-agent",
 
   [switch] $NoEnable,
-  [switch] $Force
+  [switch] $Force,
+  ## Tear down any previous term-agent install before laying down the
+  ## new one. Preserves $ConfigDir (cert+key+agent.toml) unless
+  ## -PurgeConfig is also passed.
+  [switch] $Clean,
+  [switch] $PurgeConfig
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,18 +74,9 @@ if (-not $current.IsInRole(
   Die "must run elevated (right-click PowerShell -> Run as Administrator)"
 }
 
-if ($MachineId -notmatch '^[A-Za-z0-9_-]{1,32}$') {
-  Die "machine-id must match [A-Za-z0-9_-]{1,32}"
-}
-
-try {
-  $pskBytes = [Convert]::FromBase64String($Psk)
-  if ($pskBytes.Length -lt 16) {
-    Die "psk decodes to $($pskBytes.Length) bytes; need >= 16"
-  }
-} catch {
-  Die "psk must be valid base64: $_"
-}
+if (-not (Test-Path $Cert)) { Die "cert file not readable: $Cert" }
+if (-not (Test-Path $Key))  { Die "key file not readable: $Key" }
+if ($HubCa -and -not (Test-Path $HubCa)) { Die "hub-ca file not readable: $HubCa" }
 
 $AgentExe = Join-Path $BuildDir "term-agent.exe"
 if (-not (Test-Path $AgentExe)) {
@@ -91,6 +96,24 @@ try {
 }
 Note "agent will run as $runAsAccount (sid=$($runAsSid.Value))"
 
+# ------- optional clean install --------------------------------------
+
+if ($Clean) {
+  $uninstall = Join-Path $PSScriptRoot "uninstall-agent.ps1"
+  if (-not (Test-Path $uninstall)) {
+    Die "-Clean requested but $uninstall not found"
+  }
+  Note "-Clean: invoking $uninstall first"
+  $unArgs = @{
+    BinDir      = $BinDir
+    ConfigDir   = $ConfigDir
+    TaskName    = $TaskName
+    KeepBinary  = $true
+  }
+  if ($PurgeConfig) { $unArgs.PurgeConfig = $true }
+  & $uninstall @unArgs
+}
+
 # ------- binary -----------------------------------------------------
 
 if (-not (Test-Path $BinDir)) {
@@ -105,7 +128,7 @@ if (Test-Path $DlExe) {
   Note "skipping term-dl.exe (not built)"
 }
 
-# ------- config dir + agent.toml ------------------------------------
+# ------- config dir + cert + key + agent.toml -----------------------
 
 if (-not (Test-Path $ConfigDir)) {
   New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
@@ -113,7 +136,7 @@ if (-not (Test-Path $ConfigDir)) {
 
 # Restrict ACL: SYSTEM + Administrators full control, run-as user
 # read-only. Disable inheritance so we know exactly who can read the
-# PSK.
+# private key.
 $acl = New-Object System.Security.AccessControl.DirectorySecurity
 $acl.SetAccessRuleProtection($true, $false)   # disable inheritance, no copy
 $systemSid = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-18"
@@ -129,6 +152,19 @@ $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRul
 $acl.SetOwner($adminsSid)
 Set-Acl -Path $ConfigDir -AclObject $acl
 
+$CertDst = Join-Path $ConfigDir "agent.crt"
+$KeyDst  = Join-Path $ConfigDir "agent.key"
+$HubCaDst = ""
+Note "installing cert -> $CertDst"
+Copy-Item -Force $Cert $CertDst
+Note "installing key  -> $KeyDst"
+Copy-Item -Force $Key  $KeyDst
+if ($HubCa) {
+  $HubCaDst = Join-Path $ConfigDir "hub-server-ca.pem"
+  Note "installing hub server CA -> $HubCaDst"
+  Copy-Item -Force $HubCa $HubCaDst
+}
+
 $ConfigPath = Join-Path $ConfigDir "agent.toml"
 if ((Test-Path $ConfigPath) -and -not $Force) {
   Note "$ConfigPath exists; not overwriting (use -Force to replace)"
@@ -136,19 +172,27 @@ if ((Test-Path $ConfigPath) -and -not $Force) {
   Note "writing $ConfigPath"
   $serverNameLine = ""
   if ($ServerName) { $serverNameLine = "server_name = `"$ServerName`"" }
-  # Escape backslashes in shell path for TOML.
+  $hubCaLine = ""
+  if ($HubCaDst) {
+    $hubCaEsc = $HubCaDst -replace '\\', '\\'
+    $hubCaLine = "hub_ca_path = `"$hubCaEsc`""
+  }
+  # Escape backslashes for TOML.
   $shellEsc = $Shell -replace '\\', '\\'
+  $certEsc  = $CertDst -replace '\\', '\\'
+  $keyEsc   = $KeyDst  -replace '\\', '\\'
   $now = (Get-Date).ToString("o")
   $contents = @"
 ## generated by scripts\install-agent.ps1 on $now
 hub         = "$Hub"
-machine_id  = "$MachineId"
-psk         = "$Psk"
+cert_path   = "$certEsc"
+key_path    = "$keyEsc"
 tls         = "$Tls"
+$hubCaLine
 $serverNameLine
 shell       = "$shellEsc"
 "@
-  # Strip the blank line if server_name wasn't set.
+  # Strip multiple blank lines.
   $contents = ($contents -replace "(?ms)`r?`n`r?`n`r?`n", "`r`n`r`n")
   [System.IO.File]::WriteAllText($ConfigPath, $contents, [System.Text.Encoding]::UTF8)
 }
@@ -206,4 +250,4 @@ Write-Host "  - check task status:   Get-ScheduledTask -TaskName $TaskName | Get
 Write-Host "  - stop / start:        Stop-ScheduledTask / Start-ScheduledTask -TaskName $TaskName"
 Write-Host "  - uninstall:           Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"
 Write-Host "  - on the hub, you should see:"
-Write-Host "      agent registered machine=$MachineId peer=..."
+Write-Host "      agent registered machine=<id from cert SAN> peer=..."

@@ -1,12 +1,100 @@
 # Plan
 
+## ✅ Phase 4.6 — Drop PSK auth, switch agent ↔ hub to client certs over TLS (just shipped)
+
+Wire- AND on-disk-incompatible with PSK installs. Old `hub.toml`
+files with `psk = "..."` fail to parse (`#[serde(deny_unknown_fields)]`
+on `MachineConfig`); old agents fail at the TLS handshake (no client
+cert) or HTTP upgrade (no `X-Agent-Cert` header).
+
+### Clean-install support (just shipped)
+
+- `scripts/uninstall-{agent,hub}.{sh,ps1}` — idempotent uninstall:
+  stops + removes the systemd unit / Scheduled Task, removes
+  binaries, **preserves** config + data by default so re-installs
+  reuse them. Opt-in flags (`--purge-config`, `--purge-data`,
+  `--remove-user` / `-PurgeConfig`, `-PurgeData`) wipe state when
+  the operator really wants a fresh slate.
+- `--clean` / `-Clean` flag on all four install scripts: invokes
+  the matching uninstall script first, propagating the purge flags.
+- README has a dedicated "Uninstall / clean reinstall" section
+  before the security notes.
+
+### New CA + cert flow
+
+- `hub-admin init-ca` — explicit one-shot: writes
+  `<data_dir>/agent-ca.crt` (0644) + `agent-ca.key` (0600, root-only).
+  The hub service user never holds the CA key, so a hub-process
+  compromise cannot mint new agent certs.
+- `hub-admin issue-cert --id <machine_id>` — mints an ECDSA-P256 leaf
+  cert with `urn:term-agent:<machine_id>` SAN URN, writes
+  `<id>.crt` + `<id>.key`, AND appends an entry to
+  `<data_dir>/issued-certs.json` (flock-protected) so the hub will
+  allow this fingerprint.
+- `hub-admin list-certs` / `revoke-cert --serial <hex>` / `--id <id>`.
+- `hub-admin show-ca` — print agent-ca.crt to stdout.
+- Hub re-reads `issued-certs.json` every 30s, so revocations take
+  effect without a restart.
+
+### Custom rustls `ClientCertVerifier`
+
+`hub/src/client_verifier.rs` wraps the stock `WebPkiClientVerifier`
+and adds (a) fingerprint allow-list check against `issued-certs.json`
+and (b) SAN URN extraction + match against the entry's `machine_id`.
+All three checks run during the TLS handshake — a mismatch tears
+down the TCP connection at the TLS layer, before any application
+bytes flow. `handle_connection` only sees connections that already
+passed verification.
+
+### WSS-perimeter auth (X-Agent-Cert + X-Agent-Auth)
+
+On `wss://…/agent/connect` the perimeter terminates TLS, so the hub
+can't see the client cert. The agent attaches two HTTP upgrade
+headers carrying the equivalent assertion:
+
+- `X-Agent-Cert: <base64-no-pad of leaf cert DER>`
+- `X-Agent-Auth: <unix_secs>.<nonce_b64u>.<ECDSA-P256 sig>`
+
+Signed payload is domain-separated and includes the `Host:` header
+(defeats cross-hub replay). Hub keeps a 10-minute
+`(fingerprint, nonce)` cache (defeats same-hub replay within the
+±5-minute clock skew window).
+
+### Hello payload
+
+Bumped `HELLO_VERSION` to 2; payload is now just `{ "version": 2 }`.
+Identity is bound entirely at the transport layer.
+
+### Deps
+
+- `common`: `rcgen 0.13` (CA + leaf issuance, aws_lc_rs feature) +
+  `x509-parser 0.16` (SAN extraction). Both gated behind the `hub`
+  feature so the agent doesn't pull them in.
+- `hub`: `rustls-webpki` + `rustls-pki-types` for the WS-path chain
+  verification.
+- `agent`: explicit `ring 0.17` for the WS-path signature.
+
+### Test coverage
+
+192 tests pass workspace-wide:
+- `common::agent_pki` — init CA, issue cert, extract SAN, parse +
+  verify WS auth header (ring-sign / p256-verify round trip).
+- `common::issued_certs` — store load/save/find/remove.
+- `hub::client_verifier` — fingerprint allow-list gating, SAN /
+  machine_id mismatch rejection.
+- `hub::agent_ws` — happy path, missing header, stale ts, replayed
+  nonce, host mismatch, fingerprint-not-in-allowlist, replay-cache GC.
+- `agent::wsdial` — token cache (unchanged).
+
+---
+
 ## ✅ Phases 1–3 — paste + download + polish (shipped)
 ## ✅ Phase 4.2 — drop tmux, in-agent session manager, controller model (shipped)
 ## ✅ Phase 4.2.1 — Session admin (ListSessions / KillSession) (shipped)
 ## ✅ Phase 4.1 — Cross-platform PTY abstraction  (shipped)
 ## ✅ Phase 4.3 — Windows binary + install  (shipped)
 ## ✅ Phase 4.4 — Drop webauthn-rs + openssl, hand-roll ES256 WebAuthn  (shipped)
-## ✅ Phase 4.5 — CI + security + UX + ops batch  (just shipped)
+## ✅ Phase 4.5 — CI + security + UX + ops batch  (shipped)
 
 Nine deferred items + GitHub Actions CI for four targets.
 
