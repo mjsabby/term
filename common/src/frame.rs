@@ -1328,6 +1328,27 @@ impl Frame {
     }
 }
 
+/// Encode a `DownloadChunk` frame directly from a borrowed byte slice,
+/// without first materializing a `Vec<u8>` `Body`. The agent fans a
+/// single download out to every attached stream; going through
+/// [`Frame::download_chunk`] + [`Frame::encode`] would copy the (up to
+/// 1 MiB) chunk twice — once into the `Body` and again into the output
+/// buffer — *per stream*. This does a single allocation + copy, which
+/// matters on the bulk download path.
+///
+/// The output is byte-for-byte identical to
+/// `Frame::download_chunk(stream_id, download_id, bytes.to_vec()).encode()`.
+pub fn encode_download_chunk(stream_id: u32, download_id: u32, bytes: &[u8]) -> Vec<u8> {
+    let payload_len = 4 + bytes.len();
+    let mut out = Vec::with_capacity(HEADER_LEN + payload_len);
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    out.push(FrameType::DownloadChunk as u8);
+    out.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    out.extend_from_slice(&download_id.to_be_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
 /// Session IDs may contain only `[A-Za-z0-9_-]` and must be 1..=64 chars.
 /// Restricting to this set means we can safely pass them as a `tmux -s`
 /// argument with no quoting concerns.
@@ -1781,6 +1802,30 @@ mod tests {
                 bytes: b,
             } => {
                 assert_eq!(download_id, 7);
+                assert_eq!(b, bytes);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn encode_download_chunk_matches_frame_encode() {
+        // The direct encoder used on the agent's bulk download fan-out
+        // must produce exactly what the Frame builder would.
+        let bytes: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        let direct = super::encode_download_chunk(9, 0x1234_5678, &bytes);
+        let via_frame = Frame::download_chunk(9, 0x1234_5678, bytes.clone()).encode();
+        assert_eq!(direct, via_frame);
+        // And it round-trips back to the same Body.
+        let len = u32::from_be_bytes([direct[5], direct[6], direct[7], direct[8]]);
+        let (ty, _) = Frame::validate_header(9, direct[4], len).unwrap();
+        let back = Frame::from_payload(9, ty, direct[HEADER_LEN..].to_vec()).unwrap();
+        match back.body {
+            Body::DownloadChunk {
+                download_id,
+                bytes: b,
+            } => {
+                assert_eq!(download_id, 0x1234_5678);
                 assert_eq!(b, bytes);
             }
             _ => panic!(),

@@ -18,7 +18,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 pub struct DynamicResolver {
@@ -95,12 +95,22 @@ pub fn spawn_reloader(
             tick.tick().await;
             match load_certified_key(&cert_path, &key_path) {
                 Ok(new) => {
+                    // Only announce an actual rotation; logging every poll
+                    // tick (default hourly) at info is just noise.
+                    let changed = new.cert != resolver.current().cert;
                     resolver.replace(new);
-                    info!(
-                        "tls cert reloaded from {} (next check in {}s)",
-                        cert_path.display(),
-                        period.as_secs()
-                    );
+                    if changed {
+                        info!(
+                            "tls cert reloaded from {} (next check in {}s)",
+                            cert_path.display(),
+                            period.as_secs()
+                        );
+                    } else {
+                        debug!(
+                            "tls cert unchanged on reload check (next in {}s)",
+                            period.as_secs()
+                        );
+                    }
                 }
                 Err(e) => warn!(
                     error = ?e,

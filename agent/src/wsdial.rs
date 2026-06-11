@@ -48,8 +48,13 @@ use term_common::transport::{FrameRecv, FrameSend, frame_from_ws_payload};
 use crate::ResolvedConfig;
 
 /// Dial `cfg.hub` (a ws/wss URL) and run the agent mux over the
-/// resulting WebSocket.
-pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -> Result<()> {
+/// resulting WebSocket. `sessions` is the process-wide session manager
+/// (owned by `main`), shared across reconnects so shells persist.
+pub async fn run_ws(
+    cfg: Arc<ResolvedConfig>,
+    tls: tokio_rustls::TlsConnector,
+    sessions: Arc<crate::session::SessionManager>,
+) -> Result<()> {
     let url = url::Url::parse(&cfg.hub).with_context(|| format!("parse hub url {}", cfg.hub))?;
     let secure = match url.scheme() {
         "wss" => true,
@@ -110,22 +115,25 @@ pub async fn run_ws(cfg: Arc<ResolvedConfig>, tls: tokio_rustls::TlsConnector) -
             .await
             .context("websocket handshake")?;
         info!(host = %cfg.server_name, "agent connected over wss");
-        drive(cfg, ws).await
+        drive(ws, sessions).await
     } else {
         let (ws, _resp) = client_async_with_config(request, tcp, None)
             .await
             .context("websocket handshake")?;
         info!(host = %cfg.server_name, "agent connected over ws");
-        drive(cfg, ws).await
+        drive(ws, sessions).await
     }
 }
 
-async fn drive<S>(cfg: Arc<ResolvedConfig>, ws: WebSocketStream<S>) -> Result<()>
+async fn drive<S>(
+    ws: WebSocketStream<S>,
+    sessions: Arc<crate::session::SessionManager>,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (sink, stream) = ws.split();
-    crate::run_session(cfg, WsRecv(stream), WsSend(sink)).await
+    crate::run_session(sessions, WsRecv(stream), WsSend(sink)).await
 }
 
 /// Build the X-Agent-Cert and X-Agent-Auth header values for the WS

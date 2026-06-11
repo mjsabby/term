@@ -478,7 +478,25 @@ where
                     };
                     match tx {
                         Some(tx) => {
-                            let _ = tx.send(body).await;
+                            // Non-blocking: never let one slow/stuck browser
+                            // stream block this shared reader, which also
+                            // services Ping/Pong + admin RPCs + every OTHER
+                            // browser's stream on this agent link. A backed-up
+                            // (e.g. backgrounded or sleeping) browser would
+                            // otherwise stall the whole machine's traffic and
+                            // eventually trip the agent's idle timeout. On
+                            // overflow reset just that stream; the browser
+                            // reconnects and replays scrollback.
+                            if let Err(e) = tx.try_send(body) {
+                                use tokio::sync::mpsc::error::TrySendError;
+                                if matches!(e, TrySendError::Full(_)) {
+                                    warn!(sid, "browser stream backlogged; resetting it (head-of-line guard)");
+                                }
+                                // Dropping the sender makes the proxy's
+                                // StreamSource see EOF and tear the stream
+                                // down (which sends Close to the agent).
+                                link_for_read.streams.lock().await.remove(&sid);
+                            }
                         }
                         None => debug!(sid, "frame for unknown stream; agent should send Close"),
                     }

@@ -42,7 +42,7 @@ use anyhow::{Context, Result, bail};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use term_common::frame::{
     CONTROLLER_NONE_STREAM_ID, DOWNLOAD_STATUS_CANCEL, DOWNLOAD_STATUS_OK, MAX_PASTE_CHUNK_BYTES,
@@ -58,14 +58,28 @@ pub const DEFAULT_SCROLLBACK_CAP_BYTES: usize = 8 * 1024 * 1024;
 /// dropped by the sweeper. Used as the default when `agent.toml`
 /// doesn't override `limits.idle_ttl_secs`.
 pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Broadcast channel capacity (events). With ~16 KiB PTY reads, ~1024
-/// events ≈ 16 MiB worst-case buffer per slow subscriber.
+/// Broadcast channel capacity for terminal output + control events.
+/// With ~16 KiB PTY reads, ~1024 events ≈ 16 MiB worst-case retained
+/// if one subscriber stalls. Losing a Data event corrupts the terminal
+/// display, so this stays generous to ride out momentary stalls.
 const BROADCAST_CAP: usize = 1024;
+/// Separate, much smaller broadcast channel capacity for download
+/// frames. `DownloadChunk` carries up to `MAX_PASTE_CHUNK_BYTES` (1 MiB)
+/// per event, so keeping these out of the 1024-deep terminal channel is
+/// what bounds per-session memory: a stalled subscriber retains at most
+/// `DOWNLOAD_BROADCAST_CAP × 1 MiB` here instead of up to ~1 GiB. A
+/// lagging subscriber drops chunks and the browser detects the resulting
+/// short download and discards it (lossy-but-safe), so a small cap is
+/// fine.
+const DOWNLOAD_BROADCAST_CAP: usize = 32;
 
 pub type SessionId = String;
 pub type StreamId = u32;
 
-/// One event broadcast from a Session to every attached stream.
+/// One terminal/control event broadcast from a Session to every
+/// attached stream. Download frames ride a separate channel
+/// ([`DownloadEvent`]) so their 1 MiB chunks don't inflate this
+/// channel's retained-memory worst case.
 #[derive(Clone)]
 pub enum SessionEvent {
     /// PTY output bytes (OSC-scanned; safe to forward verbatim as Data).
@@ -74,20 +88,28 @@ pub enum SessionEvent {
     /// stream_id, or `CONTROLLER_NONE_STREAM_ID` (0) if no one
     /// currently controls.
     ControllerChanged { controller: StreamId },
+    /// The shell exited; the Session is being torn down. Subscribers
+    /// should send Close on their stream and drop their subscription.
+    Closed,
+}
+
+/// Download fan-out events, on their own bounded broadcast channel so a
+/// large in-flight download can't make a stalled subscriber retain up to
+/// ~1 GiB (the terminal channel is 1024-deep and these chunks are 1 MiB).
+/// Same chunk Arc is shared across all subscribers.
+#[derive(Clone)]
+pub enum DownloadEvent {
     /// Begin a download (agent → browser). Same on all attached streams.
-    DownloadBegin {
+    Begin {
         id: u32,
         total_size: u64,
         name: String,
     },
     /// One chunk of a download. `bytes` is Arc'd so the broadcast
     /// doesn't deep-copy the payload per subscriber.
-    DownloadChunk { id: u32, bytes: Arc<Vec<u8>> },
+    Chunk { id: u32, bytes: Arc<Vec<u8>> },
     /// Finalize a download (0 = ok, 1 = cancel).
-    DownloadEnd { id: u32, status: u8 },
-    /// The shell exited; the Session is being torn down. Subscribers
-    /// should send Close on their stream and drop their subscription.
-    Closed,
+    End { id: u32, status: u8 },
 }
 
 /// Bounded byte FIFO (drain on overflow). Used for scrollback.
@@ -108,7 +130,9 @@ impl ByteRing {
     }
 
     pub fn extend(&mut self, bytes: &[u8]) {
-        self.buf.extend(bytes.iter().copied());
+        // `VecDeque: Extend<&u8>` is specialized to a bulk copy for Copy
+        // elements, so this is not a byte-at-a-time push.
+        self.buf.extend(bytes);
         if self.buf.len() > self.cap {
             let excess = self.buf.len() - self.cap;
             self.buf.drain(..excess);
@@ -116,9 +140,15 @@ impl ByteRing {
     }
 
     /// Snapshot current contents as one contiguous Vec. Caller chunks
-    /// at MAX_DATA_LEN if needed.
+    /// at MAX_DATA_LEN if needed. Copies the ring's two contiguous
+    /// segments in bulk rather than iterating byte-by-byte (this runs
+    /// under the session lock on every attach).
     pub fn snapshot(&self) -> Vec<u8> {
-        self.buf.iter().copied().collect()
+        let (a, b) = self.buf.as_slices();
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        out
     }
 
     #[allow(dead_code)]
@@ -141,6 +171,8 @@ pub struct Session {
     /// completes. Derived from the configured `shell` at spawn time.
     pub paste_style: PasteStyle,
     broadcast_tx: broadcast::Sender<SessionEvent>,
+    /// Separate fan-out for download frames; see [`DOWNLOAD_BROADCAST_CAP`].
+    download_tx: broadcast::Sender<DownloadEvent>,
     pty: crate::pty::AsyncPty,
     inner: Mutex<SessionInner>,
     next_download_id: AtomicU32,
@@ -196,6 +228,7 @@ struct SessionInner {
 /// `ControllerChanged(self_sid)` to its browser).
 pub struct AttachResult {
     pub event_rx: broadcast::Receiver<SessionEvent>,
+    pub download_rx: broadcast::Receiver<DownloadEvent>,
     pub scrollback: Vec<u8>,
     pub became_controller: bool,
     pub current_controller: Option<StreamId>,
@@ -240,6 +273,7 @@ impl Session {
             .with_context(|| format!("spawn {program}"))?;
 
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAP);
+        let (dl_tx, _dl_rx0) = broadcast::channel(DOWNLOAD_BROADCAST_CAP);
 
         let session = Arc::new(Session {
             id: id.clone(),
@@ -247,6 +281,7 @@ impl Session {
             dl_token,
             paste_style: PasteStyle::from_shell(shell),
             broadcast_tx: tx.clone(),
+            download_tx: dl_tx,
             pty,
             next_download_id: AtomicU32::new(1),
             inner: Mutex::new(SessionInner {
@@ -278,15 +313,20 @@ impl Session {
                 let (fwd, captured) = osc.feed(&buf);
                 if !fwd.is_empty() {
                     let chunk = Arc::new(fwd);
-                    session_for_reader
-                        .inner
-                        .lock()
-                        .await
-                        .scrollback
-                        .extend(&chunk);
+                    // Append to scrollback AND broadcast under the same lock.
+                    // `attach()` takes this lock around (subscribe + snapshot),
+                    // so holding it across extend+send makes the pair atomic:
+                    // a newly-attaching stream either sees this chunk in its
+                    // replayed scrollback OR receives it live — never both
+                    // (duplicate output) and never neither (gap). The
+                    // broadcast send is synchronous, so the lock is held only
+                    // momentarily.
+                    let mut inner = session_for_reader.inner.lock().await;
+                    inner.scrollback.extend(&chunk);
                     let _ = session_for_reader
                         .broadcast_tx
                         .send(SessionEvent::Data(chunk));
+                    drop(inner);
                 }
                 for payload in captured {
                     match parse_dl_osc(&payload) {
@@ -315,7 +355,7 @@ impl Session {
                                         error = %e,
                                         "download failed",
                                     );
-                                    let _ = s.broadcast_tx.send(SessionEvent::DownloadEnd {
+                                    let _ = s.download_tx.send(DownloadEvent::End {
                                         id,
                                         status: DOWNLOAD_STATUS_CANCEL,
                                     });
@@ -345,8 +385,15 @@ impl Session {
     /// controller, this stream becomes controller and the PTY is
     /// resized to its geometry.
     pub async fn attach(self: &Arc<Self>, sid: StreamId, size: (u16, u16)) -> AttachResult {
-        let event_rx = self.broadcast_tx.subscribe();
         let mut inner = self.inner.lock().await;
+        // Subscribe and snapshot under the same lock the PTY reader holds
+        // around (scrollback.extend + broadcast send), so this attach
+        // can't both replay a chunk via the snapshot AND receive it live
+        // (duplicate) — nor miss it entirely (gap). The download channel
+        // has no snapshot, so its subscribe point doesn't matter; we take
+        // it here too for tidiness.
+        let event_rx = self.broadcast_tx.subscribe();
+        let download_rx = self.download_tx.subscribe();
         let scrollback = inner.scrollback.snapshot();
         inner.attached.insert(sid, size);
         inner.last_attached_at = Instant::now();
@@ -368,6 +415,7 @@ impl Session {
 
         AttachResult {
             event_rx,
+            download_rx,
             scrollback,
             became_controller,
             current_controller,
@@ -395,11 +443,22 @@ impl Session {
     /// Write input to the PTY, but only from the controller. Viewer
     /// input is silently dropped (the browser UI gates it too, this is
     /// belt-and-braces).
+    ///
+    /// Non-blocking on purpose: if the PTY's input buffer is full because
+    /// a program in the shell has stopped reading stdin, we DROP this
+    /// input rather than parking the caller. Parking here would wedge the
+    /// per-stream inbound task — the reader's head-of-line guard could
+    /// drop this stream's input channel, but a task blocked inside an
+    /// awaited `send` wouldn't observe that until the PTY drained, so the
+    /// stream (and its session attachment) would linger un-GC'd. Dropping
+    /// is safe: a program not reading its stdin isn't consuming these
+    /// bytes anyway, and a healthy shell drains the bridge queue
+    /// continuously so normal typing/paste never overflows it.
     pub async fn write_input_from(&self, sid: StreamId, bytes: &[u8]) {
         if self.inner.lock().await.controller != Some(sid) {
             return;
         }
-        let _ = self.pty.in_tx.send(bytes.to_vec()).await;
+        let _ = self.pty.in_tx.try_send(bytes.to_vec());
     }
 
     /// Direct PTY write (bypasses controller check). Used for
@@ -691,11 +750,24 @@ async fn stream_download(session: &Arc<Session>, id: u32, path: &Path) -> Result
     info!(session = %session.id, download_id = id, name = %name, total_size,
           "download begin");
 
-    let _ = session.broadcast_tx.send(SessionEvent::DownloadBegin {
-        id,
-        total_size,
-        name: name.clone(),
-    });
+    // If no browser is attached there's nobody to receive the file —
+    // `send` returns `Err` when the channel has zero receivers. Skip the
+    // whole read rather than streaming bytes into the void (a `term-dl`
+    // in a detached session, e.g. from a cron job, must not burn disk
+    // I/O on a download nobody is listening for).
+    if session
+        .download_tx
+        .send(DownloadEvent::Begin {
+            id,
+            total_size,
+            name: name.clone(),
+        })
+        .is_err()
+    {
+        debug!(session = %session.id, download_id = id,
+               "no attached client; skipping download read");
+        return Ok(());
+    }
 
     let mut buf = vec![0u8; MAX_PASTE_CHUNK_BYTES as usize];
     let mut sent: u64 = 0;
@@ -715,10 +787,19 @@ async fn stream_download(session: &Arc<Session>, id: u32, path: &Path) -> Result
             );
         }
         sent = sent.saturating_add(n as u64);
-        let _ = session.broadcast_tx.send(SessionEvent::DownloadChunk {
-            id,
-            bytes: Arc::new(buf[..n].to_vec()),
-        });
+        if session
+            .download_tx
+            .send(DownloadEvent::Chunk {
+                id,
+                bytes: Arc::new(buf[..n].to_vec()),
+            })
+            .is_err()
+        {
+            // Every attached client detached mid-download; stop reading.
+            debug!(session = %session.id, download_id = id,
+                   "all clients detached; aborting download read");
+            return Ok(());
+        }
     }
     if sent != total_size {
         bail!(
@@ -726,7 +807,7 @@ async fn stream_download(session: &Arc<Session>, id: u32, path: &Path) -> Result
             path.display()
         );
     }
-    let _ = session.broadcast_tx.send(SessionEvent::DownloadEnd {
+    let _ = session.download_tx.send(DownloadEvent::End {
         id,
         status: DOWNLOAD_STATUS_OK,
     });
@@ -825,13 +906,14 @@ mod tests {
     /// Stops early once an `is_done` predicate returns true on the
     /// accumulated event vector.
     #[cfg(unix)]
-    async fn drain_events_until<F>(
-        rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    async fn drain_events_until<T, F>(
+        rx: &mut tokio::sync::broadcast::Receiver<T>,
         dur: Duration,
         is_done: F,
-    ) -> Vec<SessionEvent>
+    ) -> Vec<T>
     where
-        F: Fn(&[SessionEvent]) -> bool,
+        T: Clone,
+        F: Fn(&[T]) -> bool,
     {
         let deadline = Instant::now() + dur;
         let mut out = Vec::new();
@@ -934,14 +1016,11 @@ mod tests {
         );
         session.write_input_from(1, osc_wrong.as_bytes()).await;
 
-        let evs = drain_events_until(&mut attach.event_rx, Duration::from_secs(2), |evs| {
-            evs.iter()
-                .any(|e| matches!(e, SessionEvent::DownloadBegin { .. }))
+        let evs = drain_events_until(&mut attach.download_rx, Duration::from_secs(2), |evs| {
+            evs.iter().any(|e| matches!(e, DownloadEvent::Begin { .. }))
         })
         .await;
-        let saw_dl = evs
-            .iter()
-            .any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
+        let saw_dl = evs.iter().any(|e| matches!(e, DownloadEvent::Begin { .. }));
         assert!(!saw_dl, "wrong-token OSC must NOT trigger a DownloadBegin");
 
         // Now do it with the CORRECT token: capture the session's
@@ -954,17 +1033,16 @@ mod tests {
         );
         session.write_input_from(1, osc_ok.as_bytes()).await;
 
-        let evs2 = drain_events_until(&mut attach.event_rx, Duration::from_secs(2), |evs| {
-            evs.iter()
-                .any(|e| matches!(e, SessionEvent::DownloadEnd { .. }))
+        let evs2 = drain_events_until(&mut attach.download_rx, Duration::from_secs(2), |evs| {
+            evs.iter().any(|e| matches!(e, DownloadEvent::End { .. }))
         })
         .await;
         let saw_begin = evs2
             .iter()
-            .any(|e| matches!(e, SessionEvent::DownloadBegin { .. }));
+            .any(|e| matches!(e, DownloadEvent::Begin { .. }));
         let saw_end = evs2.iter().any(|e| {
             matches!(
-                e, SessionEvent::DownloadEnd { status, .. } if *status == DOWNLOAD_STATUS_OK
+                e, DownloadEvent::End { status, .. } if *status == DOWNLOAD_STATUS_OK
             )
         });
         assert!(saw_begin, "correct-token OSC must trigger DownloadBegin");
@@ -975,6 +1053,52 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
         session.write_input_from(1, b"exit\n").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detach_clears_controller_so_reattach_can_acquire() {
+        // Guards the invariant the persistent (across-reconnect) session
+        // manager relies on: detaching a stream must clear it from both
+        // `attached` and the `controller` slot, so a later reattach (e.g.
+        // after an agent↔hub reconnect) becomes controller again instead
+        // of finding a stale ghost that wedges control hand-off.
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let session = Session::spawn(
+            "test-detach".into(),
+            "/bin/sh",
+            (24, 80),
+            crate::session::DEFAULT_SCROLLBACK_CAP_BYTES,
+        )
+        .expect("spawn");
+
+        let a1 = session.attach(1, (24, 80)).await;
+        assert!(a1.became_controller);
+        assert_eq!(session.attached_count().await, 1);
+        assert_eq!(session.controller().await, Some(1));
+
+        session.detach(1).await;
+        assert_eq!(
+            session.attached_count().await,
+            0,
+            "detach must clear attached"
+        );
+        assert_eq!(
+            session.controller().await,
+            None,
+            "detach must clear controller"
+        );
+
+        let a2 = session.attach(2, (24, 80)).await;
+        assert!(
+            a2.became_controller,
+            "reattach after detach must reacquire control"
+        );
+        assert_eq!(session.controller().await, Some(2));
+
+        session.write_input_from(2, b"exit\n").await;
     }
 
     #[cfg(unix)]

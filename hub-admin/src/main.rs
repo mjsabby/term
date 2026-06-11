@@ -206,10 +206,35 @@ fn cmd_remove(args: &[String]) -> Result<()> {
     let _guard = FileLock::acquire_exclusive(&creds::lock_path(&dir)).context("flock")?;
     let mut store = CredentialStore::load(&dir)?;
     let before = store.credentials.len();
-    store.credentials.retain(|c| {
-        let id = &c.credential_id_b64;
-        !(c.label == *target || id == target || id.starts_with(target))
-    });
+    // Prefer an exact match (full label or full credential id). Only fall
+    // back to id-prefix matching when nothing matches exactly, and then
+    // only when the prefix is unambiguous — otherwise a short prefix like
+    // `a` could silently delete several credentials at once.
+    let exact = store
+        .credentials
+        .iter()
+        .filter(|c| c.label == *target || c.credential_id_b64 == *target)
+        .count();
+    if exact > 0 {
+        store
+            .credentials
+            .retain(|c| !(c.label == *target || c.credential_id_b64 == *target));
+    } else {
+        let prefix_n = store
+            .credentials
+            .iter()
+            .filter(|c| c.credential_id_b64.starts_with(target))
+            .count();
+        if prefix_n > 1 {
+            bail!(
+                "{target:?} is an ambiguous id prefix matching {prefix_n} credentials; \
+                 pass a full credential id or an exact label"
+            );
+        }
+        store
+            .credentials
+            .retain(|c| !c.credential_id_b64.starts_with(target));
+    }
     let removed = before - store.credentials.len();
     if removed == 0 {
         bail!("no credential matched {target}");

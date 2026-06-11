@@ -185,13 +185,17 @@ impl ConfigLimits {
 
 const WRITE_HI_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_LO_BYTES: usize = 16 * 1024 * 1024;
-/// Per-stream hi-priority queue (Data, Resize, Close). Keystrokes are
-/// tiny so 8 items ≈ a few KiB.
-const STREAM_HI_CAP: usize = 8;
+/// Per-stream hi-priority queue (Data, Resize, Close). Keystrokes /
+/// resizes are tiny. Sized with headroom (64) so a legitimate burst —
+/// e.g. many Resize frames during a window drag — never trips the
+/// head-of-line backpressure guard in the reader loop, which resets a
+/// stream only when its queue stays full (a genuinely stuck consumer).
+const STREAM_HI_CAP: usize = 64;
 /// Per-stream lo-priority queue (PasteBegin/Chunk/End). PasteChunk
-/// holds up to 1 MiB; 8 items ≈ 8 MiB worst case per active paste
-/// stream. Old item-based queue of 64 was 64 MiB worst case.
-const STREAM_LO_CAP: usize = 8;
+/// holds up to 1 MiB; 16 items ≈ 16 MiB worst case per active paste
+/// stream, matching the browser's 16-chunk send high-water mark so a
+/// fast paste isn't falsely reset.
+const STREAM_LO_CAP: usize = 16;
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_DEADLINE: Duration = Duration::from_secs(90);
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
@@ -319,6 +323,32 @@ async fn main() -> Result<()> {
         resolved.limits.max_sessions,
     );
 
+    // The in-agent session manager owns PTYs + scrollback + controller
+    // state and MUST outlive any single hub connection. A transient
+    // agent↔hub drop (hub redeploy, network blip, idle timeout) tears
+    // down `run_session`, but the user's shells have to survive so a
+    // reconnect REATTACHES them instead of spawning fresh duplicates and
+    // leaking the originals (whose PTY reader tasks would otherwise keep
+    // the shells alive forever, unreachable and un-GC'd). Created once
+    // here, shared across every reconnect.
+    let sessions = session::SessionManager::new(resolved.shell.clone(), resolved.limits);
+
+    // Idle/exit sweeper: periodically drops sessions whose shells have
+    // exited OR which have been detached longer than idle_ttl. Owned by
+    // the process (not a single connection) so it keeps running — and
+    // keeps the persistent session set bounded — across reconnects.
+    {
+        let gc_sessions = sessions.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await; // skip the immediate first tick
+            loop {
+                tick.tick().await;
+                gc_sessions.gc_pass().await;
+            }
+        });
+    }
+
     // The raw and wss paths both build their TLS connector lazily —
     // they need to read `hub_ca_path` (which we want re-read on each
     // reconnect so the operator can rotate the hub CA without a
@@ -326,7 +356,7 @@ async fn main() -> Result<()> {
     let mut backoff = RECONNECT_INITIAL;
     loop {
         let started = std::time::Instant::now();
-        let result = run_once(resolved.clone()).await;
+        let result = run_once(resolved.clone(), sessions.clone()).await;
         let lasted = started.elapsed();
         match result {
             Ok(()) if lasted >= HEALTHY_SESSION => {
@@ -446,13 +476,13 @@ fn default_shell() -> String {
     }
 }
 
-async fn run_once(cfg: Arc<ResolvedConfig>) -> Result<()> {
+async fn run_once(cfg: Arc<ResolvedConfig>, sessions: Arc<session::SessionManager>) -> Result<()> {
     let tls = build_tls_connector(&cfg)?;
     // WebSocket transport (through an HTTP/WS perimeter such as a Dev
     // Tunnel) when `hub` is a ws[s] URL; raw TCP/TLS to `host:port`
     // otherwise.
     if cfg.hub.starts_with("ws://") || cfg.hub.starts_with("wss://") {
-        return wsdial::run_ws(cfg, tls).await;
+        return wsdial::run_ws(cfg, tls, sessions).await;
     }
 
     debug!("dialing {}", cfg.hub);
@@ -466,10 +496,10 @@ async fn run_once(cfg: Arc<ResolvedConfig>) -> Result<()> {
             .context("server_name must be a valid DNS name")?;
         let tls_stream = tls.connect(sn, tcp).await.context("tls handshake")?;
         let (r, w) = tokio::io::split(tls_stream);
-        run_session(cfg, ByteStreamRecv(r), ByteStreamSend(w)).await
+        run_session(sessions, ByteStreamRecv(r), ByteStreamSend(w)).await
     } else {
         let (r, w) = tcp.into_split();
-        run_session(cfg, ByteStreamRecv(r), ByteStreamSend(w)).await
+        run_session(sessions, ByteStreamRecv(r), ByteStreamSend(w)).await
     }
 }
 
@@ -477,7 +507,7 @@ async fn run_once(cfg: Arc<ResolvedConfig>) -> Result<()> {
 /// WebSocket). `reader`/`writer` come from whichever transport
 /// [`run_once`] / [`wsdial::run_ws`] selected.
 pub(crate) async fn run_session<FR, FW>(
-    cfg: Arc<ResolvedConfig>,
+    sessions: Arc<session::SessionManager>,
     mut reader: FR,
     mut writer: FW,
 ) -> Result<()>
@@ -510,21 +540,9 @@ where
         .await
         .map_err(|_| anyhow!("writer closed before hello"))?;
 
-    // In-agent session manager: drops tmux, owns PTYs + scrollback +
-    // controller state across browser tab lifecycle.
-    let sessions = session::SessionManager::new(cfg.shell.clone(), cfg.limits);
-
-    // Idle/exit sweeper: periodically drops sessions whose shells have
-    // exited OR which have been detached longer than IDLE_TTL.
-    let gc_sessions = sessions.clone();
-    let gc_task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.tick().await; // skip the immediate first tick
-        loop {
-            tick.tick().await;
-            gc_sessions.gc_pass().await;
-        }
-    });
+    // The in-agent session manager (`sessions`) is owned by `main` and
+    // shared across reconnects, so sessions survive a transient hub
+    // disconnect. The idle/exit GC sweeper lives there too.
 
     // Per-stream registry. Each stream gets a priority channel so
     // interactive Data/Resize never sit behind 1 MiB PasteChunks.
@@ -621,7 +639,28 @@ where
                     let tx = { streams.lock().await.get(&sid).cloned() };
                     if let Some(tx) = tx {
                         let ch = if half_lo { &tx.lo } else { &tx.hi };
-                        let _ = ch.send(body).await;
+                        // Non-blocking: a single stuck stream (e.g. PTY
+                        // input backpressure from a program not reading
+                        // stdin) must NOT block this shared reader and thus
+                        // every other stream + control frame (Ping/Pong,
+                        // admin RPCs) on the agent link. On overflow reset
+                        // just this stream; the browser reconnects and
+                        // replays scrollback.
+                        if let Err(e) = ch.try_send(body) {
+                            use tokio::sync::mpsc::error::TrySendError;
+                            if matches!(e, TrySendError::Full(_)) {
+                                warn!(sid, "stream input backlogged; resetting it (head-of-line guard)");
+                            }
+                            // Drop our sender so the per-stream task observes
+                            // EOF on its input channel and winds down (detach
+                            // + Close to hub). Its keystroke/Data writes to the
+                            // PTY are non-blocking (Session::write_input_from
+                            // drops input when a program has stopped reading
+                            // stdin), so a flood can't park the task mid-write —
+                            // the wind-down is prompt, not deferred until the
+                            // PTY drains.
+                            streams.lock().await.remove(&sid);
+                        }
                     } else {
                         debug!(sid, "frame for unknown stream; ignoring");
                     }
@@ -631,10 +670,13 @@ where
     }
     .await;
 
-    // Tear down everything for this connection.
-    streams.lock().await.clear(); // drops all per-stream txes -> sessions terminate
+    // Tear down everything for THIS connection. Note we intentionally do
+    // NOT touch `sessions`: the shells outlive the connection so a
+    // reconnect reattaches them. Clearing the per-stream registry drops
+    // the per-stream senders, so each per-stream task ends and detaches
+    // its stream from its session (the session itself stays alive).
+    streams.lock().await.clear();
     pinger.abort();
-    gc_task.abort();
     drop(write_tx);
     let _ = writer_task.await;
 
@@ -703,9 +745,21 @@ async fn run_session_stream(
     // Replay scrollback as Data frames before live output resumes. Cap
     // each frame at MAX_DATA_LEN so the wire is well-formed.
     for chunk in attach.scrollback.chunks(MAX_DATA_LEN as usize) {
-        send_frame_to_hub(&writer, Frame::data(sid, chunk.to_vec()))
+        if send_frame_to_hub(&writer, Frame::data(sid, chunk.to_vec()))
             .await
-            .map_err(|_| anyhow!("writer closed during scrollback replay"))?;
+            .is_err()
+        {
+            // Writer gone (connection tearing down). Stop replaying, but
+            // do NOT early-return: we must still reach `session.detach(sid)`
+            // below. With the session manager now persistent across
+            // reconnects, an early return here would leak this stream in
+            // the session's `attached` set (and possibly leave it as a
+            // stale controller, wedging control hand-off). Falling through
+            // to the select! is safe — the dead writer makes `outbound`
+            // return immediately, which completes the select! and runs
+            // detach + cleanup.
+            break;
+        }
     }
     // Tell this browser who the current controller is, in *its own*
     // reference frame (it doesn't know its hub-allocated sid).
@@ -724,82 +778,133 @@ async fn run_session_stream(
     let pending_groups: Arc<tokio::sync::Mutex<HashMap<u32, PendingGroup>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    // Outbound: forward broadcast events from the session to our writer.
+    // Outbound: forward session events to our writer. Terminal/control
+    // events and download events ride two separate broadcast channels
+    // (downloads are kept off the 1024-deep terminal channel so their
+    // 1 MiB chunks can't balloon a stalled subscriber's retained memory).
     let outbound = {
         let writer = writer.clone();
         let mut event_rx = attach.event_rx;
+        let mut download_rx = attach.download_rx;
         async move {
+            use session::{DownloadEvent, SessionEvent};
+            use tokio::sync::broadcast::error::RecvError;
             loop {
-                use session::SessionEvent::*;
-                match event_rx.recv().await {
-                    Ok(Data(bytes)) => {
-                        for chunk in bytes.chunks(MAX_DATA_LEN as usize) {
-                            if send_frame_to_hub(&writer, Frame::data(sid, chunk.to_vec()))
+                tokio::select! {
+                    ev = event_rx.recv() => match ev {
+                        Ok(SessionEvent::Data(bytes)) => {
+                            for chunk in bytes.chunks(MAX_DATA_LEN as usize) {
+                                if send_frame_to_hub(&writer, Frame::data(sid, chunk.to_vec()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(SessionEvent::ControllerChanged { controller }) => {
+                            let status = if controller
+                                == term_common::frame::CONTROLLER_NONE_STREAM_ID
+                            {
+                                CONTROLLER_STATUS_NONE
+                            } else if controller == sid {
+                                CONTROLLER_STATUS_SELF
+                            } else {
+                                CONTROLLER_STATUS_OTHER
+                            };
+                            if send_frame_to_hub(&writer, Frame::controller_changed(sid, status))
                                 .await
                                 .is_err()
                             {
                                 return;
                             }
                         }
-                    }
-                    Ok(ControllerChanged { controller }) => {
-                        let status = if controller == term_common::frame::CONTROLLER_NONE_STREAM_ID
-                        {
-                            CONTROLLER_STATUS_NONE
-                        } else if controller == sid {
-                            CONTROLLER_STATUS_SELF
-                        } else {
-                            CONTROLLER_STATUS_OTHER
-                        };
-                        if send_frame_to_hub(&writer, Frame::controller_changed(sid, status))
+                        Ok(SessionEvent::Closed) => {
+                            // Flush any download frames already queued — e.g. a
+                            // DownloadEnd for a transfer that finished at the
+                            // same instant the shell exited — before tearing the
+                            // stream down. The terminal/control and download
+                            // channels are separate, so without this drain the
+                            // Close could race ahead of a ready DownloadEnd on
+                            // the other channel and the browser would never see
+                            // it (a fully-received file that never saves).
+                            loop {
+                                match download_rx.try_recv() {
+                                    Ok(DownloadEvent::Begin {
+                                        id,
+                                        total_size,
+                                        name,
+                                    }) => {
+                                        let _ = send_frame_to_hub(
+                                            &writer,
+                                            Frame::download_begin(sid, id, total_size, name),
+                                        )
+                                        .await;
+                                    }
+                                    Ok(DownloadEvent::Chunk { id, bytes }) => {
+                                        let encoded = term_common::frame::encode_download_chunk(
+                                            sid, id, &bytes,
+                                        );
+                                        let _ = writer.lo.send(encoded).await;
+                                    }
+                                    Ok(DownloadEvent::End { id, status }) => {
+                                        let _ = send_frame_to_hub(
+                                            &writer,
+                                            Frame::download_end(sid, id, status),
+                                        )
+                                        .await;
+                                    }
+                                    // Empty / Closed / Lagged: nothing (more)
+                                    // readily flushable — stop and tear down.
+                                    Err(_) => break,
+                                }
+                            }
+                            let _ = send_frame_to_hub(&writer, Frame::close(sid)).await;
+                            return;
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(stream_id = sid, lagged = n, "terminal broadcast lagged");
+                        }
+                        Err(RecvError::Closed) => return,
+                    },
+                    dl = download_rx.recv() => match dl {
+                        Ok(DownloadEvent::Begin { id, total_size, name }) => {
+                            if send_frame_to_hub(
+                                &writer,
+                                Frame::download_begin(sid, id, total_size, name),
+                            )
                             .await
                             .is_err()
-                        {
-                            return;
+                            {
+                                return;
+                            }
                         }
-                    }
-                    Ok(DownloadBegin {
-                        id,
-                        total_size,
-                        name,
-                    }) => {
-                        if send_frame_to_hub(
-                            &writer,
-                            Frame::download_begin(sid, id, total_size, name),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
+                        Ok(DownloadEvent::Chunk { id, bytes }) => {
+                            // Encode straight from the shared Arc (all three
+                            // download frame types route to the lo half, so
+                            // bypassing send_frame_to_hub here keeps ordering)
+                            // — avoids the extra 1 MiB Vec clone Frame would
+                            // force on this per-stream fan-out.
+                            let encoded =
+                                term_common::frame::encode_download_chunk(sid, id, &bytes);
+                            if writer.lo.send(encoded).await.is_err() {
+                                return;
+                            }
                         }
-                    }
-                    Ok(DownloadChunk { id, bytes }) => {
-                        if send_frame_to_hub(
-                            &writer,
-                            Frame::download_chunk(sid, id, bytes.as_ref().clone()),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
+                        Ok(DownloadEvent::End { id, status }) => {
+                            if send_frame_to_hub(&writer, Frame::download_end(sid, id, status))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
-                    }
-                    Ok(DownloadEnd { id, status }) => {
-                        if send_frame_to_hub(&writer, Frame::download_end(sid, id, status))
-                            .await
-                            .is_err()
-                        {
-                            return;
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(stream_id = sid, lagged = n,
+                                  "download broadcast lagged; client will see a short download and discard it");
                         }
-                    }
-                    Ok(Closed) => {
-                        let _ = send_frame_to_hub(&writer, Frame::close(sid)).await;
-                        return;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(stream_id = sid, lagged = n, "broadcast lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        Err(RecvError::Closed) => return,
+                    },
                 }
             }
         }
