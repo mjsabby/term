@@ -146,6 +146,14 @@ pub async fn login_start(
     let nonce = mint_token(); // re-use the random-token helper
     let mut pending = state.pending_logins.lock().await;
     gc(&mut pending, |p| p.expires_at);
+    // Backstop against an unauthenticated flood filling the map within
+    // the TTL window. GC above already dropped expired entries.
+    if pending.len() >= crate::state::MAX_PENDING_LOGINS {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many logins in progress; retry shortly".into(),
+        ));
+    }
     pending.insert(
         nonce.clone(),
         PendingLogin {

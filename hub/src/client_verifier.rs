@@ -61,11 +61,13 @@ impl AgentClientVerifier {
         issued_certs: Arc<RwLock<IssuedCertStore>>,
     ) -> Result<Arc<dyn ClientCertVerifier>, VerifierBuilderError> {
         let mut roots = RootCertStore::empty();
-        roots.add(agent_ca).map_err(|e| {
-            // map() not in scope; just panic — feeding our own freshly
-            // loaded CA cert in shouldn't be able to fail at runtime.
-            panic!("agent CA failed to add to RootCertStore: {e:?}")
-        });
+        // Feeding our own freshly-loaded CA cert in shouldn't be able to
+        // fail at runtime; if it ever does it's a fatal misconfiguration,
+        // not something to paper over. `expect` consumes the Result (no
+        // dropped-must-use) and aborts startup with a clear message.
+        roots
+            .add(agent_ca)
+            .expect("agent CA failed to add to RootCertStore");
         let inner = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
         Ok(Arc::new(Self {
             inner,

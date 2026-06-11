@@ -20,6 +20,14 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// `/login/finish` must arrive.
 pub const PENDING_LOGIN_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// Hard cap on concurrently-pending login ceremonies. `/login/start` is
+/// reachable without a bearer (and curl-style callers send no `Origin`,
+/// so the edge check doesn't gate them), so an unauthenticated flood
+/// could otherwise grow `pending_logins` unbounded within the TTL
+/// window. Each entry is tiny; this is just a backstop. Far above any
+/// realistic number of humans logging in at once.
+pub const MAX_PENDING_LOGINS: usize = 1024;
+
 /// How long to remember a (cert_fingerprint, nonce) tuple to defeat
 /// WS-perimeter signature replays. Picked at 2× the auth timestamp
 /// skew window so any legitimate retry within tolerance is still
